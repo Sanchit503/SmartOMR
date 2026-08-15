@@ -162,9 +162,14 @@ def _check_fiducial_quiet_zones(manifest, pages, report) -> None:
         x1, y1 = mm_to_px(fid["x_mm"] + CORNER_KEEPOUT_MM, fid["y_mm"] + CORNER_KEEPOUT_MM, report.dpi)
         region = image[max(0, y0):y1, max(0, x0):x1].copy()
 
-        mx0 = round((fid["x_mm"] - half) * scale) - max(0, x0)
-        my0 = round((fid["y_mm"] - half) * scale) - max(0, y0)
-        msize = math.ceil(fid["size_mm"] * scale)
+        # Blank out the marker itself, padded by a couple of pixels: the
+        # rectangle's edges land on fractional pixel boundaries and render
+        # antialiased, and that grey fringe belongs to the marker, not to
+        # whatever else might be in the zone.
+        pad = 2
+        mx0 = math.floor((fid["x_mm"] - half) * scale) - max(0, x0) - pad
+        my0 = math.floor((fid["y_mm"] - half) * scale) - max(0, y0) - pad
+        msize = math.ceil(fid["size_mm"] * scale) + 2 * pad
         region[max(0, my0):my0 + msize, max(0, mx0):mx0 + msize] = 255
 
         darkest = int(region.min()) if region.size else 255
@@ -311,6 +316,58 @@ def _check_bubbles_do_not_crowd(manifest, report) -> None:
         )
 
 
+def _check_printer_safe_margins(manifest, pages, report) -> None:
+    """No ink at all in the border band an ordinary A4 printer can't reach.
+
+    This is a pixel check rather than a coordinate one because it has to
+    catch everything that lands on the page, including glyph overhang and
+    stroke width straddling a nominal coordinate. A clipped fiducial is the
+    failure that matters most: the surviving shape is still roughly square,
+    so detection succeeds and hands back a centroid a few millimetres off,
+    skewing every coordinate derived from it — silently, on every sheet.
+    """
+    margin_mm = manifest.get("printer_safe_margin_mm")
+    if not margin_mm:
+        return
+    scale = px_per_mm(report.dpi)
+
+    worst = None  # (clearance_mm, page, edge)
+    for page, image in sorted(pages.items()):
+        h, w = image.shape[:2]
+        ink_rows = np.flatnonzero(np.any(image < WHITE_FLOOR, axis=1))
+        ink_cols = np.flatnonzero(np.any(image < WHITE_FLOOR, axis=0))
+        if ink_rows.size == 0 or ink_cols.size == 0:
+            continue
+        for edge, clearance in (
+            ("top", ink_rows[0] / scale),
+            ("bottom", (h - 1 - ink_rows[-1]) / scale),
+            ("left", ink_cols[0] / scale),
+            ("right", (w - 1 - ink_cols[-1]) / scale),
+        ):
+            if worst is None or clearance < worst[0]:
+                worst = (clearance, page, edge)
+
+    if worst is None:
+        return
+    clearance, page, edge = worst
+    # Report the measured number, not just a verdict: printers state their
+    # unprintable border in their spec sheet, and this is the figure to
+    # compare it against.
+    report.stats["safe_area"] = (
+        f"closest ink to a page edge: {clearance:.1f}mm ({edge}, page {page}); "
+        f"safe area is {margin_mm:g}mm"
+    )
+    if clearance < margin_mm:
+        report.issues.append(
+            PreflightIssue(
+                "error",
+                "printer-safe margin",
+                f"page {page} has ink only {clearance:.1f}mm from the {edge} edge, inside the "
+                f"{margin_mm:g}mm safe area. An ordinary A4 printer will clip it at 100% scale.",
+            )
+        )
+
+
 def _check_content_stays_on_the_page(manifest, report) -> None:
     w, h = manifest["page"]["width_mm"], manifest["page"]["height_mm"]
     r = manifest["bubble_radius_mm"]
@@ -345,6 +402,7 @@ def check_sheet(pdf_path: str | Path, manifest: dict, dpi: float = PREFLIGHT_DPI
             )
         )
 
+    _check_printer_safe_margins(manifest, pages, report)
     _check_bubbles_are_empty(manifest, pages, report)
     _check_fiducial_quiet_zones(manifest, pages, report)
     _check_markers_print_solid(manifest, pages, report)

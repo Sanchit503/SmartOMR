@@ -37,6 +37,7 @@ from .layout import (
     MCQ_OPTION_PITCH_MM,
     PAGE_HEIGHT_MM,
     PAGE_WIDTH_MM,
+    PRINTER_SAFE_MARGIN_MM,
     SheetLayout,
     corner_keepouts,
 )
@@ -59,6 +60,9 @@ def build_manifest(layout: SheetLayout) -> dict:
         },
         "num_pages": layout.num_pages,
         "page": {"width_mm": PAGE_WIDTH_MM, "height_mm": PAGE_HEIGHT_MM},
+        # The region an ordinary A4 printer reproduces at 100% scale. Nothing
+        # important is placed outside it, so no borderless printing is needed.
+        "printer_safe_margin_mm": PRINTER_SAFE_MARGIN_MM,
         "bubble_radius_mm": BUBBLE_RADIUS_MM,
         "bubble_sample_radius_mm": BUBBLE_SAMPLE_RADIUS_MM,
         "mcq_option_pitch_mm": MCQ_OPTION_PITCH_MM,

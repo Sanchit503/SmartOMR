@@ -67,14 +67,39 @@ from ..contracts.geometry import A4_HEIGHT_MM, A4_WIDTH_MM
 # the reader learns it at parse time instead of sharing the constant.
 PAGE_WIDTH_MM = A4_WIDTH_MM
 PAGE_HEIGHT_MM = A4_HEIGHT_MM
-MARGIN_MM = 10.0
+
+# ---------------------------------------------------------------------------
+# Printer-safe area
+# ---------------------------------------------------------------------------
+# Ordinary A4 printers cannot print to the edge. Their unprintable border is
+# typically 4-6mm on a laser and 3-5mm at the sides on an inkjet, but the
+# BOTTOM band on many inkjets runs to 12-15mm because of the paper-feed
+# rollers. Anything placed inside that band is not merely faint — it is
+# clipped, and a clipped fiducial is worse than a missing one: the remaining
+# shape is still square-ish, so detection succeeds and returns a centroid
+# that is a few millimetres off, which silently skews every coordinate
+# derived from it.
+#
+# So the layout guarantees a safe area instead of relying on borderless
+# printing. Nothing important is placed within PRINTER_SAFE_MARGIN_MM of any
+# page edge, and the fiducials — the one element whose clipping corrupts the
+# whole sheet — get a further 2mm on top of that. Both are enforced against
+# the rasterized PDF by preflight, not merely intended here.
+PRINTER_SAFE_MARGIN_MM = 10.0
+FIDUCIAL_EDGE_CLEARANCE_MM = PRINTER_SAFE_MARGIN_MM + 2.0
+
+# Content sits 2mm inside the guaranteed safe area, which absorbs stroke
+# widths (a box border straddles its coordinate) and glyph overhang.
+MARGIN_MM = PRINTER_SAFE_MARGIN_MM + 2.0
 
 # ---------------------------------------------------------------------------
 # Fiducials and orientation (Section 4.3)
 # ---------------------------------------------------------------------------
-FIDUCIAL_INSET_MM = 11.0  # marker CENTER, from each page edge
 FIDUCIAL_SIZE_MM = 7.0
 FIDUCIAL_QUIET_MM = 3.5  # blank paper required on every side of a marker
+
+# Derived so the marker's OUTER EDGE — not its center — clears the safe area.
+FIDUCIAL_INSET_MM = FIDUCIAL_EDGE_CLEARANCE_MM + FIDUCIAL_SIZE_MM / 2
 
 # Smaller square near the top-left, used only to tell which corner is which.
 ORIENTATION_MARKER_SIZE_MM = 3.5
@@ -98,27 +123,33 @@ BUBBLE_SAMPLE_RADIUS_MM = BUBBLE_RADIUS_MM * BUBBLE_SAMPLE_RATIO
 # ---------------------------------------------------------------------------
 # Header band
 # ---------------------------------------------------------------------------
-HEADER_TITLE_Y_MM = 24.0
-HEADER_META_Y_MM = 29.5
-HEADER_INSTRUCTION_Y_MM = 34.0
-HEADER_INSTRUCTION2_Y_MM = 37.5
+# The header starts below the top corner markers' keep-out, so the title can
+# never touch a fiducial (it previously cleared one by 0.45mm).
+HEADER_TITLE_Y_MM = 27.0
+HEADER_META_Y_MM = 32.5
+HEADER_INSTRUCTION_Y_MM = 37.0
+HEADER_INSTRUCTION2_Y_MM = 40.5
 
 # ---------------------------------------------------------------------------
 # Identity block
 # ---------------------------------------------------------------------------
-NAME_FIELD_Y_MM = 47.0  # bottom rule of the "Name" write-in
+NAME_FIELD_Y_MM = 50.0  # bottom rule of the "Name" write-in
 NAME_FIELD_LABEL_W_MM = 16.0
 
 WRITE_IN_HEIGHT_MM = 7.0
 WRITE_IN_CELL_W_MM = 7.0
 
-PROGRAM_SELECTOR_Y_MM = 52.5
-ROLL_GRID_TITLE_Y_MM = 59.0
-ROLL_WRITE_IN_TOP_MM = 60.5
+# The program bubble sits on the same row as its grid's title, immediately
+# left of it — both so a student can't mistake which grid a selector belongs
+# to, and because a separate selector row cost ~6mm of a page that has to
+# fit an entire midsem.
+PROGRAM_SELECTOR_Y_MM = 55.5
+ROLL_GRID_TITLE_Y_MM = PROGRAM_SELECTOR_Y_MM
+ROLL_WRITE_IN_TOP_MM = 59.0
 
 DIGIT_COL_PITCH_MM = 10.0
 DIGIT_ROW_PITCH_MM = 6.0  # 4mm bubble + 2mm clear between rows
-ROLL_BLOCK_TOP_MM = 71.0  # center of the digit-0 row
+ROLL_BLOCK_TOP_MM = 70.0  # center of the digit-0 row
 DIGIT_ROW_LABEL_DX_MM = 7.5  # row label sits this far LEFT of column 0
 
 BTECH_GRID_X_MM = 28.0
@@ -127,7 +158,7 @@ MTECH_GRID_X_MM = 128.0
 MTECH_GRID_COLUMNS = 5
 
 # Continuation pages repeat name + roll write-in, but not the bubble grid.
-CONTINUATION_WRITE_IN_Y_MM = 42.0
+CONTINUATION_WRITE_IN_Y_MM = 45.0
 
 # ---------------------------------------------------------------------------
 # Question blocks
@@ -140,9 +171,10 @@ MCQ_LABEL_OFFSET_MM = 12.0
 
 WRITTEN_HEADER_MM = 6.0  # "Q21 [5 marks]" label above the box
 WRITTEN_LINE_MM = 6.5  # height of one ruled writing line, same for every box
-WRITTEN_GAP_MM = 6.0
+WRITTEN_GAP_MM = 5.0  # each box already has a 6mm labelled gap above it
 
-# The bottom of the usable content area: above the bottom fiducials' keep-out.
+# The bottom of the usable content area: above the bottom fiducials' keep-out,
+# which is itself already inside the printer-safe area.
 PAGE_BOTTOM_MM = PAGE_HEIGHT_MM - FIDUCIAL_INSET_MM - CORNER_KEEPOUT_MM
 
 
@@ -241,6 +273,17 @@ class SheetLayout:
 # ---------------------------------------------------------------------------
 # Keep-out geometry
 # ---------------------------------------------------------------------------
+
+def printer_safe_area() -> tuple[float, float, float, float]:
+    """(x0, y0, x1, y1) of the region an ordinary A4 printer will reproduce.
+
+    Nothing that matters — bubble, marker, box or label — is placed outside
+    this rectangle, so a sheet printed at 100% scale on a normal office
+    printer loses nothing. Preflight checks the rendered pixels against it.
+    """
+    m = PRINTER_SAFE_MARGIN_MM
+    return (m, m, PAGE_WIDTH_MM - m, PAGE_HEIGHT_MM - m)
+
 
 def corner_keepouts() -> list[tuple[float, float, float, float]]:
     """The four (x0, y0, x1, y1) squares that must stay blank so the corner

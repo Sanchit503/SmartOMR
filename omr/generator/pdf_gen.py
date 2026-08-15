@@ -30,7 +30,6 @@ from .layout import (
     NAME_FIELD_LABEL_W_MM,
     PAGE_HEIGHT_MM,
     PAGE_WIDTH_MM,
-    ROLL_GRID_TITLE_Y_MM,
     WRITTEN_HEADER_MM,
     WRITTEN_LINE_MM,
     HEADER_INSTRUCTION2_Y_MM,
@@ -149,19 +148,18 @@ def _draw_identity_block(c: canvas.Canvas, layout: SheetLayout) -> None:
     c.drawString(MARGIN_MM * mm, _y(name_field.y_mm + name_field.height_mm - 1.5), "Name")
     _draw_write_in(c, name_field)
 
-    c.setFont("Helvetica-Bold", 9)
-    for label, (x, yv) in rb.program_selector.items():
-        c.setLineWidth(1)
-        c.circle(x * mm, _y(yv), BUBBLE_RADIUS_MM * mm, stroke=1, fill=0)
-        c.drawString((x + BUBBLE_RADIUS_MM + 2.5) * mm, _y(yv) - 3, label)
-
+    # Selector bubble and grid title share a row: "(o) BTECH - BTech Roll No."
+    # so there is no doubt which grid a selector governs.
     grids = (
-        (rb.btech_digits, "BTech Roll No.  (7 digits)"),
-        (rb.mtech_digits, "MTech Roll No.  (MT + 5 digits)"),
+        (rb.btech_digits, "BTECH", "BTech Roll No.  (7 digits)"),
+        (rb.mtech_digits, "MTECH", "MTech Roll No.  (MT + 5 digits)"),
     )
-    for grid, title in grids:
-        c.setFont("Helvetica-Bold", 8)
-        c.drawString(grid.x_mm * mm, _y(ROLL_GRID_TITLE_Y_MM), title)
+    for grid, program, title in grids:
+        sx, sy = rb.program_selector[program]
+        c.setLineWidth(1)
+        c.circle(sx * mm, _y(sy), BUBBLE_RADIUS_MM * mm, stroke=1, fill=0)
+        c.setFont("Helvetica-Bold", 8.5)
+        c.drawString((sx + BUBBLE_RADIUS_MM + 2.5) * mm, _y(sy) - 3, f"{program}   {title}")
 
         # Digit labels go in a column to the LEFT of the grid, never inside a
         # bubble — one label serves the whole row, since every column of a

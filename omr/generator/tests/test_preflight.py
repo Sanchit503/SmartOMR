@@ -125,3 +125,78 @@ def test_a_bubble_off_the_page_is_an_error(sheet):
     report = check_sheet(pdf, manifest)
     assert not report.ok
     assert any("page bounds" in e.check for e in report.errors)
+
+
+# ---------------------------------------------------------------------------
+# Printer-safe area
+# ---------------------------------------------------------------------------
+
+def test_nothing_is_printed_inside_the_printer_safe_margin(sheet):
+    """Ordinary A4 printers can't reach the page edge, and the sheet must not
+    depend on borderless printing."""
+    pdf, manifest = sheet
+    report = check_sheet(pdf, manifest)
+    assert manifest["printer_safe_margin_mm"] >= 10.0
+    assert not any("safe margin" in i.check for i in report.issues), report.format()
+
+
+def test_ink_inside_the_safe_margin_is_caught(sheet):
+    """Widening the claimed safe area brings the fiducials inside it, which
+    is exactly the geometry of a printer whose unprintable border is deeper
+    than the sheet assumed — the case that clips a corner marker."""
+    pdf, manifest = sheet
+    manifest["printer_safe_margin_mm"] = 20.0
+    report = check_sheet(pdf, manifest)
+    assert not report.ok
+    violation = next(e for e in report.errors if "safe margin" in e.check)
+    assert "from the" in violation.detail and "edge" in violation.detail
+
+
+@pytest.mark.parametrize("page_count", ["single_page", "multi_page"])
+def test_measured_edge_clearance_covers_common_office_printers(sheet, page_count, tmp_path):
+    """Office lasers and MFPs — what a university actually prints exams on —
+    have a 4-6mm unprintable border. This asserts the real measured figure
+    clears that with room to spare, on every page rather than just page 1.
+
+    It is deliberately an assertion about the *measured* clearance, not about
+    the constant, because glyph overhang and stroke width both put ink
+    outside the coordinate that nominally placed it.
+    """
+    if page_count == "multi_page":
+        config = ExamConfig(
+            exam_id="PREFLIGHT_MULTI",
+            course_code="CS601",
+            exam_name="End-Semester Examination",
+            exam_type="endsem",
+            num_mcq=10,
+            written_questions=[WrittenQuestionConfig(q_no=11 + i, max_marks=5, lines=3) for i in range(10)],
+        )
+        result = generate_exam(config, tmp_path / "multi")
+        pdf, manifest = result["pdf_path"], result["manifest"]
+        assert manifest["num_pages"] > 1
+    else:
+        pdf, manifest = sheet
+
+    report = check_sheet(pdf, manifest)
+    clearance = float(report.stats["safe_area"].split("mm")[0].split(":")[1])
+    assert clearance >= 8.0, (
+        f"only {clearance:.1f}mm of clearance to the nearest page edge - too close for a "
+        f"printer with a 4-6mm unprintable border plus feed tolerance. {report.format()}"
+    )
+
+
+def test_fiducials_clear_the_safe_area_by_a_further_margin(sheet):
+    """A clipped fiducial is worse than a missing one — the remnant is still
+    square enough to detect, and returns a centroid that is quietly wrong.
+    So markers sit further in than the general guarantee."""
+    _pdf, manifest = sheet
+    safe = manifest["printer_safe_margin_mm"]
+    w, h = manifest["page"]["width_mm"], manifest["page"]["height_mm"]
+    for fid in manifest["fiducials"]:
+        half = fid["size_mm"] / 2
+        clearance = min(
+            fid["x_mm"] - half, fid["y_mm"] - half, w - (fid["x_mm"] + half), h - (fid["y_mm"] + half)
+        )
+        assert clearance >= safe + 1.5, (
+            f"{fid['corner']} outer edge is only {clearance:.1f}mm from the page edge"
+        )

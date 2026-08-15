@@ -42,6 +42,7 @@ tells you the result:
 
 ```
 Preflight (200 DPI, 1 page(s)):
+  closest ink to a page edge: 11.8mm (left, page 1); safe area is 10mm
   202 bubbles, worst pre-printed fill 0.000
   fiducial quiet zones clear (darkest pixel 255/255 at page 1 TL)
   orientation marker present and decisive on every page
@@ -49,23 +50,54 @@ Preflight (200 DPI, 1 page(s)):
   All checks passed - this sheet is ready to print.
 ```
 
-It checks that no bubble has ink in it before a student writes, that every registration marker
-prints solid with clean paper around it, that the orientation marker is decisive, that no two
-bubbles crowd each other, that the PDF's page count matches the manifest, and that nothing runs off
-the page. Anything fatal prints `DO NOT PRINT` and exits non-zero; the GUI shows the same report in
-an error dialog and won't open the PDF.
+It checks that nothing is printed inside the printer-safe margin, that no bubble has ink in it
+before a student writes, that every registration marker prints solid with clean paper around it,
+that the orientation marker is decisive, that no two bubbles crowd each other, that the PDF's page
+count matches the manifest, and that nothing runs off the page. Anything fatal prints
+`DO NOT PRINT` and exits non-zero; the GUI shows the same report in an error dialog and won't open
+the PDF.
 
 This exists because the layout engine can only check its own arithmetic. The failures that actually
 break an OMR sheet — a glyph on top of a fiducial, a label inside a bubble — pass every coordinate
 assertion and fail a printer. `--no-check` skips it, but there's rarely a reason to.
 
-### Printing
+## Printing
 
-- **Print at 100% scale.** Not "fit to page", not "shrink oversized pages".
+The sheet is laid out for **ordinary A4 printers** and never relies on borderless printing.
+
+- **Print at 100% scale.** Not "fit to page", not "shrink oversized pages". Scaling moves every
+  coordinate away from where the manifest says it is.
 - **Plain white A4**, laser or good inkjet. Avoid coloured or recycled stock with visible flecks.
 - **Single-sided.** Each page is deskewed independently and needs its own four corner markers.
-- Check one printed copy against the on-screen PDF before running 200 of them: the four corner
-  squares and the small fifth square near the top-left must all be present and solid black.
+- Check one printed copy before running 200: the four corner squares and the small fifth square
+  near the top-left must all be present and solid black, none of them clipped.
+
+### The safe area
+
+Nothing important is placed within **10mm** of any page edge (`PRINTER_SAFE_MARGIN_MM`), and the
+fiducials get a further 2mm on top of that, so their outer edges sit **12mm** in. Preflight measures
+the real figure on the rendered page and prints it — currently **11.8mm** of clearance to the
+nearest ink on any edge.
+
+Compare that number against your printer's stated unprintable border:
+
+| Printer type | Typical unprintable border | Clears 11.8mm? |
+|---|---|---|
+| Office laser / MFP (HP, Brother, Canon, Xerox) | 4–6mm all round | yes, with room to spare |
+| Inkjet, sides and top | 3–5mm | yes |
+| Inkjet, **bottom** (roller clearance) | 5mm typical, up to ~14mm on some Epson/HP models | mostly, but check yours |
+
+A university printing exam sheets in bulk is using a laser or an MFP, which this clears comfortably.
+The one case to watch is a consumer inkjet with a deep bottom margin. If your printer needs more,
+raise `PRINTER_SAFE_MARGIN_MM` in `omr/generator/layout.py` — everything else (fiducial inset,
+content margin, page bottom, header position) derives from it, and preflight will tell you whether
+the result still fits. Expect to trade page count for margin: at ~15mm the spec's 20-MCQ midsem no
+longer fits on one page.
+
+**Why a clipped fiducial is the worst case, not just a cosmetic one:** the surviving part of a
+clipped square is still roughly square, so detection succeeds and returns a centroid that is a few
+millimetres off. The homography built from it then skews every coordinate on the sheet — quietly,
+on every copy. That's why markers get the extra 2mm, and why preflight refuses rather than warns.
 
 ## Layout
 

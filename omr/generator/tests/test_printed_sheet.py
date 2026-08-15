@@ -149,10 +149,13 @@ def test_fiducial_quiet_zones_are_blank_on_every_page(config, tmp_path):
             x1, y1 = mm_to_px(fid["x_mm"] + keep, fid["y_mm"] + keep, DPI)
             region = image[max(0, y0):y1, max(0, x0):x1].astype(np.int16)
 
-            # Blank out the marker itself; whatever is left must be paper.
-            mx0 = round((fid["x_mm"] - half) * scale) - max(0, x0)
-            my0 = round((fid["y_mm"] - half) * scale) - max(0, y0)
-            msize = math.ceil(fid["size_mm"] * scale)
+            # Blank out the marker itself, padded for the antialiased fringe
+            # its fractional pixel boundary produces; whatever is left must
+            # be paper.
+            pad = 2
+            mx0 = math.floor((fid["x_mm"] - half) * scale) - max(0, x0) - pad
+            my0 = math.floor((fid["y_mm"] - half) * scale) - max(0, y0) - pad
+            msize = math.ceil(fid["size_mm"] * scale) + 2 * pad
             ring = region.copy()
             ring[max(0, my0):my0 + msize, max(0, mx0):mx0 + msize] = 255
 
