@@ -61,6 +61,45 @@ This exists because the layout engine can only check its own arithmetic. The fai
 break an OMR sheet — a glyph on top of a fiducial, a label inside a bubble — pass every coordinate
 assertion and fail a printer. `--no-check` skips it, but there's rarely a reason to.
 
+### Verify — does the grader actually read this sheet back?
+
+Preflight proves a sheet is printable and readable. This proves the whole loop closes on *your*
+exam: it fills the sheet in, grades it through the real grading path, and checks every answer came
+back as the one that went in.
+
+```bash
+python -m omr.verify data/exams/CS301_MIDSEM_2026A.manifest.json
+```
+
+```
+Round-trip verification of CS301_MIDSEM_2026A (1 page(s)):
+  answers recovered:  20/20
+  marks:              20/20 (every simulated answer was the correct one)
+  signal separation:  0.958 (faintest fill 0.958 vs darkest blank 0.000)
+  Generator and grader agree on this sheet.
+```
+
+**Signal separation** is the number to watch: the gap between the faintest deliberate fill and the
+darkest bubble left blank. That's the headroom a real scan gets to eat into. Above ~0.5 is healthy.
+
+You can make the simulated student sloppier to see where it breaks down, and save the filled-in
+sheet to look at:
+
+```bash
+python -m omr.verify <manifest> --coverage 0.45 --darkness 110   # a careless pen: still 20/20
+python -m omr.verify <manifest> --coverage 0.30 --darkness 160   # a very faint pencil: 0/20,
+                                                                  # but all 20 flagged for review
+python -m omr.verify <manifest> --save-filled filled.png --seed 7
+```
+
+That last case is the designed behaviour, not a bug: marks too faint to score are never silently
+counted as blanks — they land in the review queue.
+
+**What verification does not prove.** It fills and reads at the *same* manifest coordinates, so a
+manifest that has drifted away from the printed sheet still round-trips; catching that is
+preflight's job. And there's no perspective, lighting, or toner spread here — the thresholds are
+calibrated against clean renders and need re-checking against real scans in Phase 2.
+
 ## Printing
 
 The sheet is laid out for **ordinary A4 printers** and never relies on borderless printing.
@@ -123,6 +162,7 @@ omr/
     bubbles.py     Bubble measurement: fill_ratio (hard threshold) + ink_density (mean darkness)
     mcq.py         MCQ reading + grading — answered/blank/multiple, with confidence
     tests/         Grading correctness, plus test_mcq_confidence.py — imperfect real-world marks
+  verify.py      Round-trips a generated sheet: fills it in, grades it, checks it came back
 data/exams/      Generated PDFs + manifests (gitignored)
 SmartOMR.bat     Double-click launcher (wizard)
 SmartOMR (GUI).bat
