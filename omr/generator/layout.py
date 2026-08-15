@@ -11,6 +11,30 @@ All coordinates are millimeters measured from the TOP-LEFT of the page
 conventions so the parser can convert mm -> px with a single scale factor,
 independent of print DPI.
 
+Three properties of this layout exist specifically to make Module 2's job
+possible, and are worth not undoing by accident:
+
+*Fiducial quiet zones.* Each corner marker owns a square keep-out region
+(marker + `FIDUCIAL_QUIET_MM` of blank paper). Contour detection finds a
+marker by looking for an isolated dark square; a glyph touching one merges
+into the same blob and either fails the squareness test or drags the
+centroid off. Every content band on the page is derived from these
+keep-outs rather than hand-tuned around them, and a rasterizing test
+asserts the zones actually come out blank.
+
+*Orientation marker.* Four identical corner squares are symmetric under
+90/180/270-degree rotation, so a sheet fed in upside down reads as a valid
+upright sheet with every coordinate silently inverted. A fifth, smaller
+marker near the top-left breaks that symmetry: whichever corner marker it
+sits closest to is the true top-left, at any rotation and any scale.
+
+*Nothing printed inside a bubble.* Fill-ratio reading measures ink inside
+the bubble, so anything pre-printed there is noise subtracted from the
+signal. Option letters go in a header row above each MCQ column, and digit
+labels go in a row-label column beside each roll-number grid. On the real
+generated sheet this is the difference between an empty bubble reading
+~0.24 and reading ~0.00.
+
 Pagination: an exam is first tried on a single page (the common case for a
 typical quiz/midsem). If the MCQs and written questions don't fit together,
 the sheet spills onto as many pages as it needs: MCQs fill page(s) using the
@@ -18,17 +42,17 @@ same column-packing logic as the single-page case, then the written section
 always starts on a fresh page and greedily bin-packs its (variably sized)
 answer boxes across as many pages as it needs. Sections never interleave
 across a page break — that mirrors how a real multi-page exam paper is laid
-out (Section A complete, then Section B), and keeps parsing simple (a page
-is either an MCQ page or a written page, never a jumbled mix, except for the
-single-page case where both sections legitimately share one page).
+out (Section A complete, then Section B), and keeps parsing simple.
 
-Only page 1 carries the roll-number identity block — repeating the full
-bubble grid on every page would eat significant space for no real benefit,
-since exam pages are physically stapled together and every page still
-carries the exam name/course/page-number in its header for manual
-reassembly if pages ever get separated. Fiducials, on the other hand, are
-printed on every page (per Section 4.3) since each physical page is
-independently deskewed at scan time.
+Identity: page 1 carries the full roll-number bubble grid. Every page,
+including continuation pages, additionally carries handwritten name and
+roll-number write-in boxes. The bubble grid is what the parser reads; the
+write-in boxes are what a TA reads when the parser flags a sheet for review
+(Section 6, step 5) and what attributes a continuation page that got
+separated from its page 1. Repeating the whole bubble grid on every page
+would cost ~56mm per page and make students bubble the same number three
+times; the write-in row costs ~9mm and is legible to a human, which is who
+actually resolves the review queue.
 """
 from __future__ import annotations
 
@@ -45,32 +69,81 @@ PAGE_WIDTH_MM = A4_WIDTH_MM
 PAGE_HEIGHT_MM = A4_HEIGHT_MM
 MARGIN_MM = 10.0
 
-FIDUCIAL_INSET_MM = 10.0
-FIDUCIAL_SIZE_MM = 8.0
+# ---------------------------------------------------------------------------
+# Fiducials and orientation (Section 4.3)
+# ---------------------------------------------------------------------------
+FIDUCIAL_INSET_MM = 11.0  # marker CENTER, from each page edge
+FIDUCIAL_SIZE_MM = 7.0
+FIDUCIAL_QUIET_MM = 3.5  # blank paper required on every side of a marker
 
-BUBBLE_RADIUS_MM = 1.8
+# Smaller square near the top-left, used only to tell which corner is which.
+ORIENTATION_MARKER_SIZE_MM = 3.5
+ORIENTATION_MARKER_X_MM = FIDUCIAL_INSET_MM + 14.0
+ORIENTATION_MARKER_Y_MM = FIDUCIAL_INSET_MM
+
+# Half-width of the square keep-out each corner marker owns.
+CORNER_KEEPOUT_MM = FIDUCIAL_SIZE_MM / 2 + FIDUCIAL_QUIET_MM
+
+# ---------------------------------------------------------------------------
+# Bubbles
+# ---------------------------------------------------------------------------
+BUBBLE_RADIUS_MM = 2.0  # drawn radius (4mm across — comfortable to fill by hand)
+
+# The reader measures a smaller disc than the one printed, so the bubble's
+# own outline stroke never counts as student ink. At the default 1pt stroke
+# the outline straddles r=2.0mm; 0.72 keeps the sample well clear of it.
+BUBBLE_SAMPLE_RATIO = 0.72
+BUBBLE_SAMPLE_RADIUS_MM = BUBBLE_RADIUS_MM * BUBBLE_SAMPLE_RATIO
+
+# ---------------------------------------------------------------------------
+# Header band
+# ---------------------------------------------------------------------------
+HEADER_TITLE_Y_MM = 24.0
+HEADER_META_Y_MM = 29.5
+HEADER_INSTRUCTION_Y_MM = 34.0
+HEADER_INSTRUCTION2_Y_MM = 37.5
+
+# ---------------------------------------------------------------------------
+# Identity block
+# ---------------------------------------------------------------------------
+NAME_FIELD_Y_MM = 47.0  # bottom rule of the "Name" write-in
+NAME_FIELD_LABEL_W_MM = 16.0
+
+WRITE_IN_HEIGHT_MM = 7.0
+WRITE_IN_CELL_W_MM = 7.0
+
+PROGRAM_SELECTOR_Y_MM = 52.5
+ROLL_GRID_TITLE_Y_MM = 59.0
+ROLL_WRITE_IN_TOP_MM = 60.5
 
 DIGIT_COL_PITCH_MM = 10.0
-DIGIT_ROW_PITCH_MM = 6.0
-ROLL_BLOCK_TOP_MM = 52.0
+DIGIT_ROW_PITCH_MM = 6.0  # 4mm bubble + 2mm clear between rows
+ROLL_BLOCK_TOP_MM = 71.0  # center of the digit-0 row
+DIGIT_ROW_LABEL_DX_MM = 7.5  # row label sits this far LEFT of column 0
 
-# Page 1 carries the header + roll-number block, so its content area starts
-# lower than a continuation page, which only carries the header.
-PAGE1_CONTENT_START_MM = 126.0
-CONTINUATION_CONTENT_START_MM = 45.0
+BTECH_GRID_X_MM = 28.0
+BTECH_GRID_COLUMNS = 7
+MTECH_GRID_X_MM = 128.0
+MTECH_GRID_COLUMNS = 5
 
-SECTION_HEADER_MM = 8.0
+# Continuation pages repeat name + roll write-in, but not the bubble grid.
+CONTINUATION_WRITE_IN_Y_MM = 42.0
+
+# ---------------------------------------------------------------------------
+# Question blocks
+# ---------------------------------------------------------------------------
+SECTION_HEADER_MM = 6.0
+MCQ_OPTION_HEADER_MM = 4.5  # "A B C D" row above the first MCQ of a column
 MCQ_ROW_PITCH_MM = 8.0
 MCQ_OPTION_PITCH_MM = 8.0
 MCQ_LABEL_OFFSET_MM = 12.0
 
-WRITTEN_HEADER_MM = 6.0
-WRITTEN_LINE_MM = 6.0
-WRITTEN_BOX_PADDING_MM = 4.0
+WRITTEN_HEADER_MM = 6.0  # "Q21 [5 marks]" label above the box
+WRITTEN_LINE_MM = 6.5  # height of one ruled writing line, same for every box
 WRITTEN_GAP_MM = 6.0
 
-BOTTOM_MARGIN_MM = 16.0  # keeps content clear of the bottom fiducials
-PAGE_BOTTOM_MM = PAGE_HEIGHT_MM - BOTTOM_MARGIN_MM
+# The bottom of the usable content area: above the bottom fiducials' keep-out.
+PAGE_BOTTOM_MM = PAGE_HEIGHT_MM - FIDUCIAL_INSET_MM - CORNER_KEEPOUT_MM
 
 
 @dataclass(frozen=True)
@@ -79,6 +152,35 @@ class Fiducial:
     corner: str  # TL, TR, BL, BR
     x_mm: float
     y_mm: float
+    size_mm: float = FIDUCIAL_SIZE_MM
+
+
+@dataclass(frozen=True)
+class OrientationMarker:
+    """Breaks the four corner markers' rotational symmetry. The corner
+    square nearest this marker is the true top-left, whatever the sheet's
+    rotation or scale."""
+
+    page: int
+    x_mm: float
+    y_mm: float
+    size_mm: float = ORIENTATION_MARKER_SIZE_MM
+    marks_corner: str = "TL"
+
+
+@dataclass(frozen=True)
+class WriteInField:
+    """A handwritten field. Not machine-read — cropped and shown to a human
+    when the bubble read needs resolving (Section 6, step 5)."""
+
+    page: int
+    name: str  # "student_name" | "roll_number"
+    x_mm: float
+    y_mm: float  # top edge
+    width_mm: float
+    height_mm: float
+    cells: int = 1  # >1 draws separate character boxes
+    cell_pitch_mm: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -124,12 +226,36 @@ class SheetLayout:
     exam_id: str
     course_code: str
     exam_name: str
+    exam_type: str
+    marks_per_mcq: float
     fiducials: list[Fiducial]
+    orientation_markers: list[OrientationMarker]
+    write_in_fields: list[WriteInField]
     roll_block: RollBlockLayout
     mcq_entries: list[MCQEntry]
     written_entries: list[WrittenEntry]
     mcq_options: int = field(default=4)
     num_pages: int = field(default=1)
+
+
+# ---------------------------------------------------------------------------
+# Keep-out geometry
+# ---------------------------------------------------------------------------
+
+def corner_keepouts() -> list[tuple[float, float, float, float]]:
+    """The four (x0, y0, x1, y1) squares that must stay blank so the corner
+    markers stay individually detectable. The orientation marker sits
+    outside all of them, far enough that it can't merge with the top-left."""
+    k = CORNER_KEEPOUT_MM
+    return [
+        (FIDUCIAL_INSET_MM - k, FIDUCIAL_INSET_MM - k, FIDUCIAL_INSET_MM + k, FIDUCIAL_INSET_MM + k),
+        (PAGE_WIDTH_MM - FIDUCIAL_INSET_MM - k, FIDUCIAL_INSET_MM - k,
+         PAGE_WIDTH_MM - FIDUCIAL_INSET_MM + k, FIDUCIAL_INSET_MM + k),
+        (FIDUCIAL_INSET_MM - k, PAGE_HEIGHT_MM - FIDUCIAL_INSET_MM - k,
+         FIDUCIAL_INSET_MM + k, PAGE_HEIGHT_MM - FIDUCIAL_INSET_MM + k),
+        (PAGE_WIDTH_MM - FIDUCIAL_INSET_MM - k, PAGE_HEIGHT_MM - FIDUCIAL_INSET_MM - k,
+         PAGE_WIDTH_MM - FIDUCIAL_INSET_MM + k, PAGE_HEIGHT_MM - FIDUCIAL_INSET_MM + k),
+    ]
 
 
 def _page_fiducials(page: int) -> list[Fiducial]:
@@ -141,33 +267,141 @@ def _page_fiducials(page: int) -> list[Fiducial]:
     ]
 
 
+# ---------------------------------------------------------------------------
+# Identity block
+# ---------------------------------------------------------------------------
+
 def _build_roll_block() -> RollBlockLayout:
     return RollBlockLayout(
         page=1,
-        program_selector={"BTECH": (25.0, 42.0), "MTECH": (70.0, 42.0)},
-        btech_digits=DigitGrid(7, 25.0, ROLL_BLOCK_TOP_MM, DIGIT_COL_PITCH_MM, DIGIT_ROW_PITCH_MM),
-        mtech_digits=DigitGrid(5, 120.0, ROLL_BLOCK_TOP_MM, DIGIT_COL_PITCH_MM, DIGIT_ROW_PITCH_MM),
+        program_selector={
+            "BTECH": (BTECH_GRID_X_MM, PROGRAM_SELECTOR_Y_MM),
+            "MTECH": (MTECH_GRID_X_MM, PROGRAM_SELECTOR_Y_MM),
+        },
+        btech_digits=DigitGrid(
+            BTECH_GRID_COLUMNS, BTECH_GRID_X_MM, ROLL_BLOCK_TOP_MM, DIGIT_COL_PITCH_MM, DIGIT_ROW_PITCH_MM
+        ),
+        mtech_digits=DigitGrid(
+            MTECH_GRID_COLUMNS, MTECH_GRID_X_MM, ROLL_BLOCK_TOP_MM, DIGIT_COL_PITCH_MM, DIGIT_ROW_PITCH_MM
+        ),
     )
 
 
-def _written_box_height(lines: int) -> float:
-    return WRITTEN_HEADER_MM + lines * WRITTEN_LINE_MM + WRITTEN_BOX_PADDING_MM
+def _grid_write_in(page: int, grid: DigitGrid, name: str) -> WriteInField:
+    """A row of character cells sitting directly above a digit grid, one per
+    column, so a student writes the digit and then bubbles it underneath."""
+    return WriteInField(
+        page=page,
+        name=name,
+        x_mm=grid.x_mm - WRITE_IN_CELL_W_MM / 2,
+        y_mm=ROLL_WRITE_IN_TOP_MM,
+        width_mm=(grid.columns - 1) * grid.col_pitch_mm + WRITE_IN_CELL_W_MM,
+        height_mm=WRITE_IN_HEIGHT_MM,
+        cells=grid.columns,
+        cell_pitch_mm=grid.col_pitch_mm,
+    )
 
 
-def _min_col_width(num_options: int) -> float:
-    return MCQ_LABEL_OFFSET_MM + (num_options - 1) * MCQ_OPTION_PITCH_MM + 10.0
+def _build_write_in_fields(roll_block: RollBlockLayout, num_pages: int) -> list[WriteInField]:
+    fields = [
+        WriteInField(
+            page=1,
+            name="student_name",
+            x_mm=MARGIN_MM + NAME_FIELD_LABEL_W_MM,
+            y_mm=NAME_FIELD_Y_MM - WRITE_IN_HEIGHT_MM,  # 40.0mm, clear of the header
+            width_mm=PAGE_WIDTH_MM - MARGIN_MM - (MARGIN_MM + NAME_FIELD_LABEL_W_MM),
+            height_mm=WRITE_IN_HEIGHT_MM,
+        ),
+        _grid_write_in(1, roll_block.btech_digits, "roll_number"),
+        _grid_write_in(1, roll_block.mtech_digits, "roll_number"),
+    ]
+    for page in range(2, num_pages + 1):
+        fields.append(
+            WriteInField(
+                page=page,
+                name="student_name",
+                x_mm=MARGIN_MM + NAME_FIELD_LABEL_W_MM,
+                y_mm=CONTINUATION_WRITE_IN_Y_MM,
+                width_mm=80.0,
+                height_mm=WRITE_IN_HEIGHT_MM,
+            )
+        )
+        fields.append(
+            WriteInField(
+                page=page,
+                name="roll_number",
+                x_mm=PAGE_WIDTH_MM - MARGIN_MM - 7 * WRITE_IN_CELL_W_MM,
+                y_mm=CONTINUATION_WRITE_IN_Y_MM,
+                width_mm=7 * WRITE_IN_CELL_W_MM,
+                height_mm=WRITE_IN_HEIGHT_MM,
+                cells=7,
+                cell_pitch_mm=WRITE_IN_CELL_W_MM,
+            )
+        )
+    return fields
+
+
+def roll_block_bottom_mm() -> float:
+    """Lowest ink in page 1's identity block, bubble outline included."""
+    return ROLL_BLOCK_TOP_MM + 9 * DIGIT_ROW_PITCH_MM + BUBBLE_RADIUS_MM
+
+
+def page1_content_start_mm() -> float:
+    """Derived, not hand-tuned: page 1's question area begins below the
+    identity block. Moving `ROLL_BLOCK_TOP_MM` or the row pitch shifts this
+    automatically instead of silently overlapping the grid."""
+    return roll_block_bottom_mm() + 5.0
+
+
+def continuation_content_start_mm() -> float:
+    return CONTINUATION_WRITE_IN_Y_MM + WRITE_IN_HEIGHT_MM + 6.0
+
+
+PAGE1_CONTENT_START_MM = page1_content_start_mm()
+CONTINUATION_CONTENT_START_MM = continuation_content_start_mm()
 
 
 def _content_start(page: int) -> float:
     return PAGE1_CONTENT_START_MM if page == 1 else CONTINUATION_CONTENT_START_MM
 
 
+# ---------------------------------------------------------------------------
+# Question blocks
+# ---------------------------------------------------------------------------
+
+def _written_box_height(lines: int) -> float:
+    """The ruled box itself. Every writing line is exactly `WRITTEN_LINE_MM`
+    tall regardless of how many there are, so a 2-line box and a 6-line box
+    give a student the same amount of room per line."""
+    return lines * WRITTEN_LINE_MM
+
+
+def _written_slot_height(lines: int) -> float:
+    """Box plus the question label above it."""
+    return WRITTEN_HEADER_MM + _written_box_height(lines)
+
+
+def _min_col_width(num_options: int) -> float:
+    return MCQ_LABEL_OFFSET_MM + (num_options - 1) * MCQ_OPTION_PITCH_MM + 10.0
+
+
+def _mcq_block_height(rows: int) -> float:
+    """Option-letter header row plus the question rows underneath."""
+    return MCQ_OPTION_HEADER_MM + rows * MCQ_ROW_PITCH_MM
+
+
 def _try_single_page(config, option_letters: list[str], usable_width: float):
-    """Attempt the original all-on-page-1 layout. Returns (mcq_entries,
+    """Attempt the all-on-page-1 layout. Returns (mcq_entries,
     written_entries) on success, or None if it doesn't fit — the caller
-    falls back to pagination rather than erroring."""
-    written_box_heights = [_written_box_height(wq.lines) for wq in config.written_questions]
-    written_total_height = sum(h + WRITTEN_GAP_MM for h in written_box_heights)
+    falls back to pagination rather than erroring.
+
+    Column count is tried fewest-first on purpose: fewer columns means more
+    horizontal room per question, which keeps neighbouring bubbles further
+    apart and makes a stray pen mark less likely to land in the wrong
+    question's read region. Only take more columns when fewer won't fit.
+    """
+    written_slots = [_written_slot_height(wq.lines) for wq in config.written_questions]
+    written_total_height = sum(h + WRITTEN_GAP_MM for h in written_slots)
     if config.written_questions:
         written_total_height += SECTION_HEADER_MM
 
@@ -184,41 +418,42 @@ def _try_single_page(config, option_letters: list[str], usable_width: float):
         rows_needed = 0
         for num_columns in (2, 3, 4):
             rows_needed = math.ceil(config.num_mcq / num_columns)
-            block_height = rows_needed * MCQ_ROW_PITCH_MM
             col_width = usable_width / num_columns
-            if block_height <= mcq_available and col_width >= _min_col_width(len(option_letters)):
+            if (
+                _mcq_block_height(rows_needed) <= mcq_available
+                and col_width >= _min_col_width(len(option_letters))
+            ):
                 chosen_columns = num_columns
                 break
         if chosen_columns is None:
             return None
         col_width = usable_width / chosen_columns
-        y0 = PAGE1_CONTENT_START_MM + SECTION_HEADER_MM
+        y0 = PAGE1_CONTENT_START_MM + SECTION_HEADER_MM + MCQ_OPTION_HEADER_MM
         for i in range(config.num_mcq):
-            q_no = i + 1
             col = i // rows_needed
             row = i % rows_needed
-            x = MARGIN_MM + col * col_width
-            y = y0 + row * MCQ_ROW_PITCH_MM
-            mcq_entries.append(MCQEntry(q_no, x, y, option_letters, page=1))
+            mcq_entries.append(
+                MCQEntry(i + 1, MARGIN_MM + col * col_width, y0 + row * MCQ_ROW_PITCH_MM, option_letters, page=1)
+            )
         mcq_block_bottom = y0 + rows_needed * MCQ_ROW_PITCH_MM
 
     written_entries: list[WrittenEntry] = []
     if config.written_questions:
         y = mcq_block_bottom + SECTION_HEADER_MM
-        for wq, box_h in zip(config.written_questions, written_box_heights):
+        for wq in config.written_questions:
             written_entries.append(
                 WrittenEntry(
                     q_no=wq.q_no,
                     x_mm=MARGIN_MM,
                     y_mm=y + WRITTEN_HEADER_MM,
                     width_mm=usable_width,
-                    height_mm=box_h - WRITTEN_HEADER_MM,
+                    height_mm=_written_box_height(wq.lines),
                     max_marks=wq.max_marks,
                     lines=wq.lines,
                     page=1,
                 )
             )
-            y += box_h + WRITTEN_GAP_MM
+            y += _written_slot_height(wq.lines) + WRITTEN_GAP_MM
         if y - WRITTEN_GAP_MM > PAGE_BOTTOM_MM + 1e-6:
             return None
 
@@ -232,13 +467,12 @@ def _paginate_mcqs(num_mcq: int, option_letters: list[str], usable_width: float)
         return [], 0
 
     min_col_width = _min_col_width(len(option_letters))
-    page1_available = PAGE_BOTTOM_MM - PAGE1_CONTENT_START_MM - SECTION_HEADER_MM
-    cont_available = PAGE_BOTTOM_MM - CONTINUATION_CONTENT_START_MM - SECTION_HEADER_MM
+    page1_available = PAGE_BOTTOM_MM - PAGE1_CONTENT_START_MM - SECTION_HEADER_MM - MCQ_OPTION_HEADER_MM
+    cont_available = PAGE_BOTTOM_MM - CONTINUATION_CONTENT_START_MM - SECTION_HEADER_MM - MCQ_OPTION_HEADER_MM
 
     best = None  # (columns, pages_needed, page1_capacity, cont_capacity)
     for columns in (2, 3, 4):
-        col_width = usable_width / columns
-        if col_width < min_col_width:
+        if usable_width / columns < min_col_width:
             continue
         page1_capacity = max(0, math.floor(page1_available / MCQ_ROW_PITCH_MM)) * columns
         cont_capacity = max(1, math.floor(cont_available / MCQ_ROW_PITCH_MM)) * columns
@@ -246,9 +480,8 @@ def _paginate_mcqs(num_mcq: int, option_letters: list[str], usable_width: float)
             pages_needed = 1
         else:
             pages_needed = 1 + math.ceil((num_mcq - page1_capacity) / cont_capacity)
-        candidate = (columns, pages_needed, page1_capacity, cont_capacity)
         if best is None or pages_needed < best[1]:
-            best = candidate
+            best = (columns, pages_needed, page1_capacity, cont_capacity)
 
     if best is None:
         raise ValueError(
@@ -264,16 +497,15 @@ def _paginate_mcqs(num_mcq: int, option_letters: list[str], usable_width: float)
     page_no = 1
     while remaining:
         capacity = page1_capacity if page_no == 1 else cont_capacity
-        this_page = remaining[:capacity]
-        remaining = remaining[capacity:]
-        rows_needed = math.ceil(len(this_page) / columns)
-        y0 = _content_start(page_no) + SECTION_HEADER_MM
+        this_page, remaining = remaining[:capacity], remaining[capacity:]
+        rows_needed = math.ceil(len(this_page) / columns) if this_page else 0
+        y0 = _content_start(page_no) + SECTION_HEADER_MM + MCQ_OPTION_HEADER_MM
         for i, q_no in enumerate(this_page):
             col = i // rows_needed
             row = i % rows_needed
-            x = MARGIN_MM + col * col_width
-            y = y0 + row * MCQ_ROW_PITCH_MM
-            entries.append(MCQEntry(q_no, x, y, option_letters, page=page_no))
+            entries.append(
+                MCQEntry(q_no, MARGIN_MM + col * col_width, y0 + row * MCQ_ROW_PITCH_MM, option_letters, page=page_no)
+            )
         page_no += 1
 
     return entries, page_no - 1
@@ -290,11 +522,11 @@ def _paginate_written(written_questions, usable_width: float, start_page: int) -
     y = _content_start(page_no) + SECTION_HEADER_MM
 
     for wq in written_questions:
-        box_h = _written_box_height(wq.lines)
-        if y + box_h > PAGE_BOTTOM_MM + 1e-6:
+        slot_h = _written_slot_height(wq.lines)
+        if y + slot_h > PAGE_BOTTOM_MM + 1e-6:
             page_no += 1
             y = _content_start(page_no) + SECTION_HEADER_MM
-            if y + box_h > PAGE_BOTTOM_MM + 1e-6:
+            if y + slot_h > PAGE_BOTTOM_MM + 1e-6:
                 raise ValueError(
                     f"Written question Q{wq.q_no} needs {wq.lines} lines, which is too tall "
                     "to fit on its own page. Reduce its line count or split it into multiple "
@@ -306,13 +538,13 @@ def _paginate_written(written_questions, usable_width: float, start_page: int) -
                 x_mm=MARGIN_MM,
                 y_mm=y + WRITTEN_HEADER_MM,
                 width_mm=usable_width,
-                height_mm=box_h - WRITTEN_HEADER_MM,
+                height_mm=_written_box_height(wq.lines),
                 max_marks=wq.max_marks,
                 lines=wq.lines,
                 page=page_no,
             )
         )
-        y += box_h + WRITTEN_GAP_MM
+        y += slot_h + WRITTEN_GAP_MM
 
     return entries, page_no - start_page + 1
 
@@ -341,7 +573,14 @@ def build_layout(config) -> SheetLayout:  # config: ExamConfig, typed loosely to
         exam_id=config.exam_id,
         course_code=config.course_code,
         exam_name=config.exam_name,
+        exam_type=config.exam_type,
+        marks_per_mcq=config.marks_per_mcq,
         fiducials=[f for page in range(1, num_pages + 1) for f in _page_fiducials(page)],
+        orientation_markers=[
+            OrientationMarker(page, ORIENTATION_MARKER_X_MM, ORIENTATION_MARKER_Y_MM)
+            for page in range(1, num_pages + 1)
+        ],
+        write_in_fields=_build_write_in_fields(roll_block, num_pages),
         roll_block=roll_block,
         mcq_entries=mcq_entries,
         written_entries=written_entries,

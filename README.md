@@ -52,11 +52,12 @@ omr/
     generate.py    generate_exam(config, output_dir) -> {pdf_path, manifest_path, manifest}
     gui.py         Desktop form over the same pipeline
     configs/       Worked example exam configs — copy one and edit to make your own
-    tests/         Layout/manifest correctness, pagination, PDF page count, entry-point behaviour
+    tests/         Layout/manifest correctness, pagination, entry-point behaviour, plus
+                     test_printed_sheet.py — rasterizes the real PDF and inspects the pixels
   grading/       Modules 4/5 — everything that READS a sheet (Sections 7-8)
-    bubbles.py     Fill-ratio bubble reading (dark-pixel ratio in a circular region)
-    mcq.py         MCQ response reading + grading — distinguishes answered/blank/multiple
-    tests/         Draws filled bubbles onto manifest-sized page images and verifies grading
+    bubbles.py     Bubble measurement: fill_ratio (hard threshold) + ink_density (mean darkness)
+    mcq.py         MCQ reading + grading — answered/blank/multiple, with confidence
+    tests/         Grading correctness, plus test_mcq_confidence.py — imperfect real-world marks
 data/exams/      Generated PDFs + manifests (gitignored)
 SmartOMR.bat     Double-click launcher (wizard)
 SmartOMR (GUI).bat
@@ -76,6 +77,61 @@ makes and publishes **through the manifest**, so the reader learns it at parse t
 a constant. `pdf_gen.py` and `manifest.py` both render from the same `SheetLayout` object, and
 `grading/mcq.py` reads every coordinate it needs back out of the manifest dict. That's what lets
 Phase 2's real scan parser reuse `grading/` unchanged.
+
+## Sheet design: why it looks the way it does
+
+Four decisions on the printed sheet exist purely to make it readable by machine. They're easy to
+undo by accident, so each one has a test that fails if you do.
+
+**Nothing is ever printed inside a bubble.** Option letters go in a header row above each MCQ
+column; roll-number digits go in a label column to the left of each grid. Anything pre-printed
+inside a bubble is ink the reader can't distinguish from a student's mark. Measured on the real
+generated PDF at 200 DPI, an untouched bubble reads **0.000** against a 0.50 fill threshold. The
+earlier design — letters straddling the outline, digits centred inside — read 0.204 (MCQ) and 0.261
+(roll), giving away half the usable signal range before a student picked up a pen.
+
+**The reader measures a smaller disc than gets printed.** `bubble_sample_radius_mm` is inset to 72%
+of `bubble_radius_mm` so the bubble's own outline stroke is never counted as a fill.
+
+**Every fiducial owns a quiet zone.** A contour detector finds a marker by isolating a dark square,
+so 3.5mm of blank paper is reserved on every side and all content bands are derived from those
+keep-outs. Previously the title sat 0.45mm below the top-left marker — close enough for a detector
+to merge the two into one blob and compute a wrong corner.
+
+**A fifth marker breaks the rotational symmetry.** Four identical corner squares look the same at
+0°, 90°, 180° and 270°, so a sheet fed in upside down reads as a valid upright sheet with every
+coordinate inverted. A smaller square near the top-left resolves it: whichever corner marker it
+sits nearest is the true top-left, at any rotation and any scale.
+
+Two more, for the humans:
+
+- **Name and roll-number write-in boxes on every page.** Page 1 carries the full bubble grid; the
+  digit cells sit directly above their own bubble columns. Continuation pages carry the write-in
+  row only — repeating the whole grid would cost ~56mm a page and make students bubble the same
+  number three times, but a continuation page with *no* identity can't be attributed to anyone if
+  it gets separated, and it's a human who resolves the review queue anyway (Section 6, step 5).
+- **Print at 100% scale**, not "fit to page". The fiducials let the reader recover a uniform scale,
+  but there's no reason to make it work harder.
+
+## Grading: what a reading tells you
+
+`read_mcq_responses()` returns more than a letter, because CLAUDE.md principle 4 says a
+low-confidence step queues for a human rather than guessing:
+
+| Field | What it's for |
+|---|---|
+| `outcome` | `answered` / `blank` / `multiple` — blank and multiple stay distinct (Section 7, step 3) |
+| `fill_ratios` | Per option: fraction of pixels below the dark threshold |
+| `ink_densities` | Per option: mean darkness. Catches what the hard threshold misses |
+| `confidence` | `high` / `medium` / `low` |
+| `needs_human_review` | Travels through to the `MCQGrade`, so Module 6 won't auto-send the sheet |
+| `review_reason` | Plain-English explanation for the review queue |
+
+`ink_density` exists for one specific failure: a light pencil fill covers the whole bubble but never
+gets dark enough to cross the fill threshold, so on `fill_ratio` alone it scores 0.00 — identical to
+a student who skipped the question, and the mark is silently lost. Mean darkness still sees it, so
+the reading comes back as a flagged blank rather than a confident one. Erasure residue, a
+too-close-to-call margin, and multiple fills are flagged the same way.
 
 ## Setup
 
@@ -190,10 +246,9 @@ Worth flagging to your professor:
   answer boxes, not question text.
 - **No database** — `Exam`/`Question`/etc. (CLAUDE.md Section 3) get wired up starting Phase 2, once
   there's something that actually needs persisting.
-- **No real scanning** — MCQ grading is tested by drawing filled bubbles directly onto blank
-  canonical-size page images at manifest coordinates, per the roadmap's own Phase 1 test strategy.
-  Perspective correction from a real scan/photo is Phase 2 (Module 2).
-
-There is also an open list of **sheet-quality defects** that affect real-world read accuracy
-(bubble/label geometry, fiducial design, missing manifest fields). Those are tracked separately and
-are the next thing to fix before any sheet is printed for a real exam.
+- **No real scanning** — grading is tested against the *rendered PDF* rasterized back to pixels,
+  with simulated pen marks drawn on it. That covers print fidelity and imperfect marks, but not
+  perspective, lighting, or paper texture. Perspective correction from a real scan/photo is Phase 2
+  (Module 2), and the fill/ink thresholds should be re-calibrated against real scans then.
+- **No roll-number reading yet** — the bubble grid is printed and its coordinates are in the
+  manifest, but `grading/` only reads MCQs so far. Identity resolution is Module 3 (Phase 2).

@@ -15,21 +15,59 @@ import numpy as np
 
 from ..contracts.geometry import MM_PER_INCH, canonical_size_px, mm_to_px, px_per_mm
 
-__all__ = ["MM_PER_INCH", "canonical_size_px", "fill_ratio", "mm_to_px", "px_per_mm"]
+__all__ = [
+    "MM_PER_INCH",
+    "canonical_size_px",
+    "fill_ratio",
+    "ink_density",
+    "mm_to_px",
+    "px_per_mm",
+]
+
+DARK_THRESHOLD = 150
 
 
-def fill_ratio(gray: np.ndarray, cx_px: int, cy_px: int, radius_px: int, dark_threshold: int = 150) -> float:
-    """Fraction of pixels darker than `dark_threshold` within a circular bubble region."""
+def _disc(gray: np.ndarray, cx_px: int, cy_px: int, radius_px: int) -> np.ndarray | None:
+    """The pixels inside a circular bubble region, or None if it's off-image."""
     h, w = gray.shape[:2]
     x0, x1 = max(0, cx_px - radius_px), min(w, cx_px + radius_px + 1)
     y0, y1 = max(0, cy_px - radius_px), min(h, cy_px + radius_px + 1)
     if x0 >= x1 or y0 >= y1:
-        return 0.0
-    patch = gray[y0:y1, x0:x1]
+        return None
     yy, xx = np.ogrid[y0:y1, x0:x1]
     mask = (xx - cx_px) ** 2 + (yy - cy_px) ** 2 <= radius_px ** 2
-    total = int(mask.sum())
-    if total == 0:
+    if not mask.any():
+        return None
+    return gray[y0:y1, x0:x1][mask]
+
+
+def fill_ratio(
+    gray: np.ndarray, cx_px: int, cy_px: int, radius_px: int, dark_threshold: int = DARK_THRESHOLD
+) -> float:
+    """Fraction of pixels darker than `dark_threshold` within a bubble region.
+
+    This is the primary fill signal and it is deliberately a hard threshold:
+    it is stable across scanner exposure and ignores the grey haze a phone
+    photo puts on white paper. Its blind spot is a fill that covers the
+    whole bubble but never gets dark — see `ink_density`.
+    """
+    pixels = _disc(gray, cx_px, cy_px, radius_px)
+    if pixels is None:
         return 0.0
-    dark = int((patch[mask] < dark_threshold).sum())
-    return dark / total
+    return float((pixels < dark_threshold).sum()) / pixels.size
+
+
+def ink_density(gray: np.ndarray, cx_px: int, cy_px: int, radius_px: int) -> float:
+    """Mean darkness in a bubble region: 0.0 is blank paper, 1.0 solid black.
+
+    Complements `fill_ratio` rather than replacing it. A light pencil fill
+    covering the entire bubble can sit at grey ~170 and never cross the hard
+    dark threshold, so `fill_ratio` reports 0.0 — indistinguishable from a
+    student who skipped the question. `ink_density` reports ~0.33 for the
+    same bubble, which is what lets the reader say "something was written
+    here, a human should look" instead of silently scoring it zero.
+    """
+    pixels = _disc(gray, cx_px, cy_px, radius_px)
+    if pixels is None:
+        return 0.0
+    return float((255.0 - pixels.astype(np.float32)).mean()) / 255.0
