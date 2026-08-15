@@ -1,0 +1,9 @@
+# Phase 1 (generator + MCQ grading) dependencies.
+# OpenCV will be added in Phase 2 once real scan/photo canonicalization
+# (perspective correction) is implemented — not needed before that.
+reportlab>=4.1
+numpy>=1.26
+pillow>=10.2
+pydantic>=2.6
+pytest>=8.0
+pypdf>=4.0

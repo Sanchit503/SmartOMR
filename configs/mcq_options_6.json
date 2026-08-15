@@ -1,0 +1,10 @@
+{
+  "exam_id": "CS410_QUIZ1_2026",
+  "course_code": "CS410",
+  "exam_name": "Quiz 1 (6-option MCQs)",
+  "exam_type": "quiz",
+  "num_mcq": 15,
+  "mcq_options": 6,
+  "marks_per_mcq": 1,
+  "written_questions": []
+}

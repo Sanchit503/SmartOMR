@@ -1,0 +1,14 @@
+{
+  "exam_id": "CS301_MIDSEM_2026A",
+  "course_code": "CS301",
+  "exam_name": "Mid-Semester Examination",
+  "exam_type": "midsem",
+  "num_mcq": 20,
+  "mcq_options": 4,
+  "marks_per_mcq": 1,
+  "written_questions": [
+    { "q_no": 21, "max_marks": 5, "lines": 2 },
+    { "q_no": 22, "max_marks": 5, "lines": 2 },
+    { "q_no": 23, "max_marks": 10, "lines": 4 }
+  ]
+}

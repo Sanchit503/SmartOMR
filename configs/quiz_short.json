@@ -1,0 +1,10 @@
+{
+  "exam_id": "CS201_QUIZ3_2026",
+  "course_code": "CS201",
+  "exam_name": "Quiz 3",
+  "exam_type": "quiz",
+  "num_mcq": 10,
+  "mcq_options": 4,
+  "marks_per_mcq": 2,
+  "written_questions": []
+}

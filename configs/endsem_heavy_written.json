@@ -1,0 +1,15 @@
+{
+  "exam_id": "CS501_ENDSEM_2026",
+  "course_code": "CS501",
+  "exam_name": "End-Semester Examination",
+  "exam_type": "endsem",
+  "num_mcq": 8,
+  "mcq_options": 4,
+  "marks_per_mcq": 1,
+  "written_questions": [
+    { "q_no": 9, "max_marks": 4, "lines": 2 },
+    { "q_no": 10, "max_marks": 4, "lines": 2 },
+    { "q_no": 11, "max_marks": 6, "lines": 3 },
+    { "q_no": 12, "max_marks": 4, "lines": 2 }
+  ]
+}

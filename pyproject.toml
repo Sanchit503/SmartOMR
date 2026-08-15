@@ -1,0 +1,9 @@
+[project]
+name = "omr-system"
+version = "0.1.0"
+description = "OMR-based assessment pipeline (BTP, IIIT Delhi)"
+requires-python = ">=3.11"
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]

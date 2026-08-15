@@ -1,0 +1,12 @@
+{
+  "exam_id": "CS999_IMPOSSIBLE_EXAMPLE",
+  "course_code": "CS999",
+  "exam_name": "Example: a single question too tall for any page",
+  "exam_type": "quiz",
+  "num_mcq": 0,
+  "mcq_options": 4,
+  "marks_per_mcq": 1,
+  "written_questions": [
+    { "q_no": 1, "max_marks": 20, "lines": 60 }
+  ]
+}

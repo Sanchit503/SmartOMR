@@ -1,0 +1,43 @@
+{
+  "version": "0.2.0",
+  "inputs": [
+    {
+      "id": "configPath",
+      "type": "promptString",
+      "description": "Path to an exam config JSON (relative to project root)",
+      "default": "configs/midsem_cs301.json"
+    }
+  ],
+  "configurations": [
+    {
+      "name": "GUI: OMR Generator",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/scripts/gui.py",
+      "console": "internalConsole"
+    },
+    {
+      "name": "CLI: Interactive Generator (wizard)",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/scripts/interactive_generate.py",
+      "console": "integratedTerminal"
+    },
+    {
+      "name": "CLI: Generate Exam from Config",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/scripts/generate_exam.py",
+      "args": ["${input:configPath}"],
+      "console": "integratedTerminal"
+    },
+    {
+      "name": "Run All Tests (pytest)",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "pytest",
+      "args": ["-q"],
+      "console": "integratedTerminal"
+    }
+  ]
+}
