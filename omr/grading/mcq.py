@@ -12,7 +12,8 @@ from enum import Enum
 
 import numpy as np
 
-from .bubbles import fill_ratio, mm_to_px
+from ..contracts.geometry import mm_to_px, px_per_mm
+from .bubbles import fill_ratio
 
 DEFAULT_FILL_THRESHOLD = 0.5
 
@@ -54,8 +55,7 @@ def read_mcq_responses(
     radius_mm = manifest["bubble_radius_mm"]
     label_offset_mm = manifest["mcq_label_offset_mm"]
     option_pitch_mm = manifest["mcq_option_pitch_mm"]
-    scale = dpi / 25.4
-    radius_px = max(1, round(radius_mm * scale))
+    radius_px = max(1, round(radius_mm * px_per_mm(dpi)))
 
     readings: list[MCQReading] = []
     for entry in manifest["mcq_block"]:

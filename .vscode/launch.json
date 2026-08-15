@@ -5,31 +5,32 @@
       "id": "configPath",
       "type": "promptString",
       "description": "Path to an exam config JSON (relative to project root)",
-      "default": "configs/midsem_cs301.json"
+      "default": "omr/generator/configs/midsem_cs301.json"
     }
   ],
   "configurations": [
     {
-      "name": "GUI: OMR Generator",
+      "name": "SmartOMR: Generate (wizard)",
       "type": "debugpy",
       "request": "launch",
-      "program": "${workspaceFolder}/scripts/gui.py",
+      "module": "omr.generator.main",
+      "console": "integratedTerminal"
+    },
+    {
+      "name": "SmartOMR: Generate from config",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "omr.generator.main",
+      "args": ["--config", "${input:configPath}"],
+      "console": "integratedTerminal"
+    },
+    {
+      "name": "SmartOMR: Generate (GUI)",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "omr.generator.main",
+      "args": ["--gui"],
       "console": "internalConsole"
-    },
-    {
-      "name": "CLI: Interactive Generator (wizard)",
-      "type": "debugpy",
-      "request": "launch",
-      "program": "${workspaceFolder}/scripts/interactive_generate.py",
-      "console": "integratedTerminal"
-    },
-    {
-      "name": "CLI: Generate Exam from Config",
-      "type": "debugpy",
-      "request": "launch",
-      "program": "${workspaceFolder}/scripts/generate_exam.py",
-      "args": ["${input:configPath}"],
-      "console": "integratedTerminal"
     },
     {
       "name": "Run All Tests (pytest)",

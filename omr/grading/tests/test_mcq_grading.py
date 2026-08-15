@@ -7,10 +7,10 @@ from __future__ import annotations
 import numpy as np
 from PIL import Image, ImageDraw
 
+from omr.contracts.geometry import canonical_size_px, mm_to_px
 from omr.generator.config import ExamConfig, WrittenQuestionConfig
 from omr.generator.layout import build_layout
 from omr.generator.manifest import build_manifest
-from omr.grading.bubbles import canonical_size_px, mm_to_px
 from omr.grading.mcq import MCQOutcome, grade_mcq_responses, read_mcq_responses
 
 DPI = 200

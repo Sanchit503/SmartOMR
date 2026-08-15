@@ -1,13 +1,11 @@
 """Desktop GUI for generating OMR sheets — fill in a form, click Generate.
 
-No terminal typing required. Launch it by double-clicking
-`Run OMR Generator.bat` in the project root (which runs this windowless via
-pythonw.exe), or directly with:
+The same `generate_exam()` pipeline as the wizard, just a form around it,
+so a sheet made here is identical to one made in the terminal. Reached via:
 
-    python scripts/gui.py
+    python -m omr.generator.main --gui
 
-Wraps the exact same `generate_exam()` pipeline used by the CLI scripts —
-this is just a friendlier front end over `omr/generator/`.
+or by double-clicking `SmartOMR (GUI).bat` in the project root.
 """
 from __future__ import annotations
 
@@ -27,14 +25,12 @@ from tkinter import (
     messagebox,
 )
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from pydantic import ValidationError
 
-from pydantic import ValidationError  # noqa: E402
+from .config import ExamConfig, WrittenQuestionConfig
+from .generate import generate_exam
 
-from omr.generator.config import ExamConfig, WrittenQuestionConfig  # noqa: E402
-from omr.generator.generate import generate_exam  # noqa: E402
-
-DEFAULT_OUTPUT_DIR = Path(__file__).resolve().parent.parent / "data" / "exams"
+DEFAULT_OUTPUT_DIR = Path(__file__).resolve().parents[2] / "data" / "exams"
 
 
 class WrittenQuestionRow(Frame):
@@ -60,7 +56,7 @@ class WrittenQuestionRow(Frame):
 class OMRGeneratorApp:
     def __init__(self, root: Tk):
         self.root = root
-        root.title("OMR Sheet Generator")
+        root.title("SmartOMR — Sheet Generator")
         root.geometry("620x640")
         root.minsize(560, 480)
 
@@ -212,4 +208,12 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    # Support `python omr/generator/gui.py` as well as the packaged
+    # `python -m omr.generator.main --gui` route.
+    if __package__ in (None, ""):
+        sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+        from omr.generator.gui import main as _main
+
+        _main()
+    else:
+        main()

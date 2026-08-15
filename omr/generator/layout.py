@@ -36,8 +36,13 @@ import math
 import string
 from dataclasses import dataclass, field
 
-PAGE_WIDTH_MM = 210.0
-PAGE_HEIGHT_MM = 297.0
+from ..contracts.geometry import A4_HEIGHT_MM, A4_WIDTH_MM
+
+# Page size comes from the shared contract; every other constant below is a
+# layout *decision* this module owns and publishes through the manifest, so
+# the reader learns it at parse time instead of sharing the constant.
+PAGE_WIDTH_MM = A4_WIDTH_MM
+PAGE_HEIGHT_MM = A4_HEIGHT_MM
 MARGIN_MM = 10.0
 
 FIDUCIAL_INSET_MM = 10.0

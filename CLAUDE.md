@@ -1,4 +1,4 @@
-# OMR-Based Assessment System — Project Specification
+# SmartOMR — OMR-Based Assessment System — Project Specification
 
 **Context:** BTP project, IIIT Delhi. Covers BTech and MTech students only (no PhD).
 **Purpose of this document:** hand this to Claude Code (or any coding assistant) as persistent project context. Read the whole thing before writing any code — the module boundaries and shared schemas in Sections 3–4 are what make the rest of the pipeline work.
@@ -276,6 +276,29 @@ Architecture above is language-agnostic, but for a BTP with this CV + ML surface
 - **LLM grading:** Anthropic/OpenAI/Google Python SDK behind the provider-agnostic interface from Section 8.
 - **Email:** use a transactional email API (e.g., SES, SendGrid) or the institute's SMTP relay if one exists, rather than a personal Gmail account — you'll be sending to many `@iiitd.ac.in` addresses in a short window, and personal-account bulk sending gets rate-limited or spam-flagged fast. Rate-limit your own sends regardless.
 - **Admin panel frontend:** a simple React/Next.js app, or even a server-rendered admin UI if you want to move faster — this is the lowest-risk part of the system to build with the plainest tools available.
+
+### 11.1 As-built code layout
+
+The repo is organized by pipeline module, so code is findable by the section number above:
+
+```
+omr/
+  contracts/   The ONLY thing the generator and the reader share: page geometry,
+               mm<->px conversion, and the manifest schema (Sections 4.4, principle 1).
+               Nothing here imports from generator/ or grading/ — that direction is
+               enforced by a test, so the Phase 2 scan reader never has to depend on
+               the PDF-generation stack.
+  generator/   Module 1 (Section 4). Self-contained: entry point (main.py), layout
+               engine, PDF renderer, manifest builder, GUI, example configs, tests.
+               Run it with `python -m omr.generator.main`.
+  grading/     Modules 4/5 (Sections 7-8). Bubble reading + MCQ grading; written-answer
+               LLM grading lands here in Phase 3.
+  reader/      Module 2/3 (Sections 5-6). Phase 2 — does not exist yet.
+```
+
+Bubble radius, option pitch, and block positions are **layout decisions the generator owns**
+and publishes through the manifest — they are deliberately NOT in `contracts/`, so the reader
+learns them at parse time rather than sharing a constant that could drift.
 
 ---
 
