@@ -191,6 +191,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Don't open the generated PDF in a viewer afterwards",
     )
+    parser.add_argument(
+        "--no-check",
+        action="store_true",
+        help="Skip the preflight readability check (not recommended before printing)",
+    )
     return parser
 
 
@@ -236,6 +241,18 @@ def main(argv: list[str] | None = None) -> int:
     print(f"\nGenerated {num_pages} page{'s' if num_pages != 1 else ''}:")
     print(f"  PDF:      {result['pdf_path']}")
     print(f"  Manifest: {result['manifest_path']}")
+
+    if not args.no_check:
+        from .preflight import check_sheet
+
+        report = check_sheet(result["pdf_path"], result["manifest"])
+        print()
+        print(report.format())
+        if not report.ok:
+            # The sheet exists, but printing it would produce answer sheets
+            # that can't be graded reliably — say so with a failing exit code
+            # rather than letting it look like a clean run.
+            return 1
 
     if not args.no_open:
         _open_pdf(result["pdf_path"])

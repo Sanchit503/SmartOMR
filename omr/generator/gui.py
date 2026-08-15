@@ -189,11 +189,24 @@ class OMRGeneratorApp:
             return
 
         num_pages = result["manifest"]["num_pages"]
-        self.status.config(text=f"Generated ({num_pages} page{'s' if num_pages != 1 else ''}): {result['pdf_path']}")
-        messagebox.showinfo(
-            "Done",
-            f"Generated {num_pages} page(s).\n\nPDF: {result['pdf_path']}\nManifest: {result['manifest_path']}",
-        )
+        summary = f"Generated {num_pages} page(s).\n\nPDF: {result['pdf_path']}\nManifest: {result['manifest_path']}"
+
+        # Same readability check the command line runs — a sheet generated
+        # by clicking a button is no less likely to be printed 200 times.
+        from .preflight import check_sheet
+
+        report = check_sheet(result["pdf_path"], result["manifest"])
+        if report.ok:
+            self.status.config(text=f"Generated ({num_pages} page(s)), preflight passed: {result['pdf_path']}")
+            messagebox.showinfo("Done", f"{summary}\n\n{report.format()}")
+        else:
+            self.status.config(text=f"Generated, but PREFLIGHT FAILED: {result['pdf_path']}")
+            messagebox.showerror(
+                "Preflight failed - do not print",
+                f"{summary}\n\n{report.format()}",
+            )
+            return
+
         if sys.platform == "win32":
             try:
                 os.startfile(result["pdf_path"])

@@ -81,7 +81,7 @@ def validate_manifest(manifest: dict) -> dict:
     if not 0 < manifest["bubble_sample_radius_mm"] < manifest["bubble_radius_mm"]:
         raise ManifestError(
             f"bubble_sample_radius_mm ({manifest['bubble_sample_radius_mm']}) must be greater than "
-            f"zero and smaller than bubble_radius_mm ({manifest['bubble_radius_mm']}) — otherwise "
+            f"zero and smaller than bubble_radius_mm ({manifest['bubble_radius_mm']}), otherwise "
             "the printed outline is counted as a fill."
         )
 

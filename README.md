@@ -35,6 +35,38 @@ python -m omr.generator.main --gui                                              
 through any of the three routes is byte-identical to the same sheet produced through the others —
 there's a test that pins that down.
 
+### Preflight — how you know the sheet is actually good
+
+Every generation rasterizes the PDF it just wrote and measures it the way the grader will, then
+tells you the result:
+
+```
+Preflight (200 DPI, 1 page(s)):
+  202 bubbles, worst pre-printed fill 0.000
+  fiducial quiet zones clear (darkest pixel 255/255 at page 1 TL)
+  orientation marker present and decisive on every page
+  tightest bubble gap 3.1mm (BT-col1-0 / BT-col1-1)
+  All checks passed - this sheet is ready to print.
+```
+
+It checks that no bubble has ink in it before a student writes, that every registration marker
+prints solid with clean paper around it, that the orientation marker is decisive, that no two
+bubbles crowd each other, that the PDF's page count matches the manifest, and that nothing runs off
+the page. Anything fatal prints `DO NOT PRINT` and exits non-zero; the GUI shows the same report in
+an error dialog and won't open the PDF.
+
+This exists because the layout engine can only check its own arithmetic. The failures that actually
+break an OMR sheet — a glyph on top of a fiducial, a label inside a bubble — pass every coordinate
+assertion and fail a printer. `--no-check` skips it, but there's rarely a reason to.
+
+### Printing
+
+- **Print at 100% scale.** Not "fit to page", not "shrink oversized pages".
+- **Plain white A4**, laser or good inkjet. Avoid coloured or recycled stock with visible flecks.
+- **Single-sided.** Each page is deskewed independently and needs its own four corner markers.
+- Check one printed copy against the on-screen PDF before running 200 of them: the four corner
+  squares and the small fifth square near the top-left must all be present and solid black.
+
 ## Layout
 
 ```
@@ -50,6 +82,7 @@ omr/
     pdf_gen.py     Renders the printable PDF from a SheetLayout (ReportLab)
     manifest.py    Builds/saves the template manifest from the same SheetLayout
     generate.py    generate_exam(config, output_dir) -> {pdf_path, manifest_path, manifest}
+    preflight.py   Rasterizes the generated PDF and verifies it is machine-readable
     gui.py         Desktop form over the same pipeline
     configs/       Worked example exam configs — copy one and edit to make your own
     tests/         Layout/manifest correctness, pagination, entry-point behaviour, plus
