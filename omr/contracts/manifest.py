@@ -22,7 +22,12 @@ from pathlib import Path
 #           generated under v1 have no orientation marker printed on them,
 #           so they genuinely cannot be read by a v2 reader — hence a bump
 #           rather than an optional field.
-MANIFEST_SCHEMA_VERSION = 2
+# v3 added: page_marks (pre-printed page-index bars) and
+#           write_in_fields[].cell_width_mm. Again a print change, not just a
+#           metadata one: a v2 sheet has no bars on it, so a v3 reader looking
+#           for them would find blank paper and conclude the page index is
+#           unreadable.
+MANIFEST_SCHEMA_VERSION = 3
 
 _TOP_LEVEL_KEYS = (
     "exam_id",
@@ -36,6 +41,7 @@ _TOP_LEVEL_KEYS = (
     "fiducial_size_mm",
     "fiducials",
     "orientation_marker",
+    "page_marks",
     "write_in_fields",
     "roll_number_block",
     "mcq_block",
@@ -46,6 +52,67 @@ _TOP_LEVEL_KEYS = (
 class ManifestError(ValueError):
     """A manifest is missing required structure, or is a version this code
     can't safely read."""
+
+
+def _validate_page_marks(manifest: dict, page: int, num_pages: int) -> None:
+    """The page-index bars must say what page they are on, unambiguously.
+
+    A scan batch arrives as a pile of images. Grouping them back into
+    per-student sheets means knowing which page each image is, and the bars
+    are the only pre-printed thing that says so. Exactly one filled bar, at
+    the index matching the page, is what makes that read self-checking rather
+    than a guess (Section 2, principle 4).
+    """
+    marks = [m for m in manifest["page_marks"] if m.get("page", 1) == page]
+    if len(marks) != num_pages:
+        raise ManifestError(
+            f"page {page} has {len(marks)} page-index bars but the sheet has {num_pages} page(s); "
+            "every page prints one bar per page so the reader can count them"
+        )
+    filled = [m for m in marks if m.get("filled")]
+    if len(filled) != 1:
+        raise ManifestError(
+            f"page {page} has {len(filled)} filled page-index bars, expected exactly 1 — "
+            "the reader uses 'exactly one is dark' as its checksum"
+        )
+    if filled[0].get("index") != page:
+        raise ManifestError(
+            f"page {page}'s filled page-index bar claims index {filled[0].get('index')}; "
+            "a page that misreports its own number puts answers on the wrong question"
+        )
+
+
+def _validate_page_identity(manifest: dict, page: int) -> None:
+    """Every page must carry something that ties it to a student.
+
+    Page 1 has the bubbled roll-number grid; continuation pages have the
+    handwritten roll-number strip. Either way a page that gets separated from
+    the rest of its sheet must not be anonymous, because the alternative is
+    attributing an answer by scan order — a guess.
+    """
+    has_write_in = any(
+        w.get("page", 1) == page and w.get("name") == "roll_number"
+        for w in manifest["write_in_fields"]
+    )
+    has_grid = manifest["roll_number_block"].get("page", 1) == page
+    if not (has_write_in or has_grid):
+        raise ManifestError(
+            f"page {page} carries no roll-number field at all — a page separated from its sheet "
+            "would be unattributable to any student"
+        )
+
+
+def _validate_page_has_content(manifest: dict, page: int) -> None:
+    """No blank pages. A page with no question on it is a layout bug, and in a
+    scan batch it is indistinguishable from a page the feeder pulled twice."""
+    if any(e.get("page", 1) == page for e in manifest["mcq_block"]):
+        return
+    if any(e.get("page", 1) == page for e in manifest["written_block"]):
+        return
+    raise ManifestError(
+        f"page {page} has no questions on it. A blank page in a scan batch cannot be told apart "
+        "from a misfeed, so the layout must not produce one."
+    )
 
 
 def validate_manifest(manifest: dict) -> dict:
@@ -86,7 +153,8 @@ def validate_manifest(manifest: dict) -> dict:
         )
 
     # Every physical page is deskewed independently, so every page needs its
-    # own full set of registration marks (Section 4.3).
+    # own full set of registration marks (Section 4.3), its own way to say
+    # which page it is, and its own way to say which student it belongs to.
     for page in range(1, num_pages + 1):
         corners = {f["corner"] for f in manifest["fiducials"] if f.get("page", 1) == page}
         if corners != {"TL", "TR", "BL", "BR"}:
@@ -98,6 +166,9 @@ def validate_manifest(manifest: dict) -> dict:
                 f"page {page} needs exactly one orientation marker — without it a sheet fed in "
                 "rotated reads as a valid upright sheet with inverted coordinates"
             )
+        _validate_page_marks(manifest, page, num_pages)
+        _validate_page_identity(manifest, page)
+        _validate_page_has_content(manifest, page)
 
     for entry in manifest["mcq_block"]:
         for key in ("q_no", "x_mm", "y_mm", "options"):

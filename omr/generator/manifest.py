@@ -14,10 +14,14 @@ more than the example in CLAUDE.md spells out:
                            candidate contours
   orientation_marker       which corner is really the top-left, so a sheet fed
                            in rotated can't be read upside down
+  page_marks               the pre-printed page-index bars: which page a sheet
+                           in a scan batch actually is, read with the same
+                           ink-measuring primitive as a bubble
   write_in_fields          handwritten name/roll regions to crop for the
-                           review queue when a bubble read is ambiguous
+                           review queue when a bubble read is ambiguous, and to
+                           reattach a continuation page to its page 1
   written_block[].lines    the LLM grading prompt interpolates it (Section 8)
-  exam                     course/name/type/marks_per_mcq, so a grader has the
+  exam                     course/name/type/marks/total, so a grader has the
                            exam's own metadata without a second file
 
 The schema itself (what fields exist, how to load and validate one) lives
@@ -30,16 +34,18 @@ import json
 from pathlib import Path
 
 from ..contracts.manifest import MANIFEST_SCHEMA_VERSION, validate_manifest
-from .layout import (
+from .layout import SheetLayout
+from .metrics import (
     BUBBLE_RADIUS_MM,
     BUBBLE_SAMPLE_RADIUS_MM,
     MCQ_LABEL_OFFSET_MM,
     MCQ_OPTION_PITCH_MM,
+    ORIENTATION_KEEPOUT_MM,
     PAGE_HEIGHT_MM,
     PAGE_WIDTH_MM,
     PRINTER_SAFE_MARGIN_MM,
-    SheetLayout,
     corner_keepouts,
+    orientation_keepout,
 )
 
 
@@ -48,6 +54,7 @@ def build_manifest(layout: SheetLayout) -> dict:
     bubble grid is the one exception, since it only ever appears on page 1
     (see layout.py's module docstring for why)."""
     rb = layout.roll_block
+    ox0, oy0, ox1, oy1 = orientation_keepout()
     manifest = {
         "schema_version": MANIFEST_SCHEMA_VERSION,
         "exam_id": layout.exam_id,
@@ -57,6 +64,8 @@ def build_manifest(layout: SheetLayout) -> dict:
             "exam_type": layout.exam_type,
             "marks_per_mcq": layout.marks_per_mcq,
             "mcq_options": layout.mcq_options,
+            "mcq_columns": layout.mcq_columns,
+            "total_marks": layout.total_marks,
         },
         "num_pages": layout.num_pages,
         "page": {"width_mm": PAGE_WIDTH_MM, "height_mm": PAGE_HEIGHT_MM},
@@ -72,6 +81,15 @@ def build_manifest(layout: SheetLayout) -> dict:
             {"x0_mm": x0, "y0_mm": y0, "x1_mm": x1, "y1_mm": y1}
             for (x0, y0, x1, y1) in corner_keepouts()
         ],
+        # The orientation marker is detected the same way the corner markers
+        # are, so it needs — and gets — its own clean surround.
+        "orientation_keepout_mm": {
+            "half_width_mm": ORIENTATION_KEEPOUT_MM,
+            "x0_mm": ox0,
+            "y0_mm": oy0,
+            "x1_mm": ox1,
+            "y1_mm": oy1,
+        },
         "fiducials": [
             {"page": f.page, "corner": f.corner, "x_mm": f.x_mm, "y_mm": f.y_mm, "size_mm": f.size_mm}
             for f in layout.fiducials
@@ -86,6 +104,21 @@ def build_manifest(layout: SheetLayout) -> dict:
             }
             for om in layout.orientation_markers
         ],
+        # Exactly one bar per page reads dark, and its index is that page's own
+        # number: enough for the reader to confirm a scan batch is a complete
+        # sheet in the right order instead of trusting the feeder.
+        "page_marks": [
+            {
+                "page": m.page,
+                "index": m.index,
+                "x_mm": m.x_mm,
+                "y_mm": m.y_mm,
+                "width_mm": m.width_mm,
+                "height_mm": m.height_mm,
+                "filled": m.filled,
+            }
+            for m in layout.page_marks
+        ],
         "write_in_fields": [
             {
                 "page": w.page,
@@ -96,6 +129,7 @@ def build_manifest(layout: SheetLayout) -> dict:
                 "height_mm": w.height_mm,
                 "cells": w.cells,
                 "cell_pitch_mm": w.cell_pitch_mm,
+                "cell_width_mm": w.cell_width_mm,
             }
             for w in layout.write_in_fields
         ],

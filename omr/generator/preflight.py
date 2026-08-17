@@ -24,8 +24,8 @@ from pathlib import Path
 import numpy as np
 
 from ..contracts.geometry import mm_to_px, px_per_mm
-from ..grading.bubbles import fill_ratio
-from .layout import CORNER_KEEPOUT_MM
+from ..grading.bubbles import fill_ratio, ink_density
+from .metrics import CORNER_KEEPOUT_MM, ORIENTATION_KEEPOUT_MM
 
 # The DPI a Phase 2 canonical image is expected to land at. Preflight
 # measures at the same resolution the reader will, so a bubble that looks
@@ -36,6 +36,8 @@ MAX_EMPTY_BUBBLE_FILL = 0.05  # an unmarked bubble should read ~0.00
 MIN_MARKER_SOLIDITY = 0.98
 WHITE_FLOOR = 250  # below this is ink, not paper
 MIN_BUBBLE_GAP_MM = 1.5  # clear paper required between two sample discs
+MIN_PAGE_MARK_CONTRAST = 0.5  # gap between a filled bar and an outlined one
+RULE_MASK_MM = 0.8  # how much of a printed rule/border counts as that rule
 
 
 @dataclass(frozen=True)
@@ -146,50 +148,64 @@ def _check_bubbles_are_empty(manifest, pages, report) -> None:
         )
 
 
-def _check_fiducial_quiet_zones(manifest, pages, report) -> None:
+def _darkest_outside_marker(image, marker, keepout_mm: float, dpi: float) -> int:
+    """The darkest pixel in a marker's quiet zone, with the marker itself
+    masked out."""
+    scale = px_per_mm(dpi)
+    half = marker["size_mm"] / 2
+    x0, y0 = mm_to_px(marker["x_mm"] - keepout_mm, marker["y_mm"] - keepout_mm, dpi)
+    x1, y1 = mm_to_px(marker["x_mm"] + keepout_mm, marker["y_mm"] + keepout_mm, dpi)
+    region = image[max(0, y0):y1, max(0, x0):x1].copy()
+    if not region.size:
+        return 255
+
+    # Blank out the marker itself, padded by a couple of pixels: the
+    # rectangle's edges land on fractional pixel boundaries and render
+    # antialiased, and that grey fringe belongs to the marker, not to
+    # whatever else might be in the zone.
+    pad = 2
+    mx0 = math.floor((marker["x_mm"] - half) * scale) - max(0, x0) - pad
+    my0 = math.floor((marker["y_mm"] - half) * scale) - max(0, y0) - pad
+    msize = math.ceil(marker["size_mm"] * scale) + 2 * pad
+    region[max(0, my0):my0 + msize, max(0, mx0):mx0 + msize] = 255
+    return int(region.min())
+
+
+def _check_marker_quiet_zones(manifest, pages, report) -> None:
     """A contour detector isolates a marker by finding a dark square with
     clean paper around it. Ink inside the quiet zone merges into the same
-    blob and drags the computed corner off."""
-    scale = px_per_mm(report.dpi)
+    blob and drags the computed corner off.
+
+    This covers the orientation marker too, not just the four corners: it is
+    found the same way, and if it merges with a glyph the sheet loses its only
+    defence against being read upside down.
+    """
+    checked = [(f, CORNER_KEEPOUT_MM, f["corner"]) for f in manifest["fiducials"]]
+    checked += [(m, ORIENTATION_KEEPOUT_MM, "orientation") for m in manifest["orientation_marker"]]
+
     dirtiest = None
-    for fid in manifest["fiducials"]:
-        page = fid.get("page", 1)
+    for marker, keepout, name in checked:
+        page = marker.get("page", 1)
         if page not in pages:
             continue
-        image = pages[page]
-        half = fid["size_mm"] / 2
-        x0, y0 = mm_to_px(fid["x_mm"] - CORNER_KEEPOUT_MM, fid["y_mm"] - CORNER_KEEPOUT_MM, report.dpi)
-        x1, y1 = mm_to_px(fid["x_mm"] + CORNER_KEEPOUT_MM, fid["y_mm"] + CORNER_KEEPOUT_MM, report.dpi)
-        region = image[max(0, y0):y1, max(0, x0):x1].copy()
-
-        # Blank out the marker itself, padded by a couple of pixels: the
-        # rectangle's edges land on fractional pixel boundaries and render
-        # antialiased, and that grey fringe belongs to the marker, not to
-        # whatever else might be in the zone.
-        pad = 2
-        mx0 = math.floor((fid["x_mm"] - half) * scale) - max(0, x0) - pad
-        my0 = math.floor((fid["y_mm"] - half) * scale) - max(0, y0) - pad
-        msize = math.ceil(fid["size_mm"] * scale) + 2 * pad
-        region[max(0, my0):my0 + msize, max(0, mx0):mx0 + msize] = 255
-
-        darkest = int(region.min()) if region.size else 255
+        darkest = _darkest_outside_marker(pages[page], marker, keepout, report.dpi)
         if dirtiest is None or darkest < dirtiest[1]:
-            dirtiest = (f"page {page} {fid['corner']}", darkest)
+            dirtiest = (f"page {page} {name}", darkest, keepout)
 
     if dirtiest is None:
         return
-    verdict = "clear" if dirtiest[1] >= WHITE_FLOOR else "NOT clear"
+    where, darkest, keepout = dirtiest
+    verdict = "clear" if darkest >= WHITE_FLOOR else "NOT clear"
     report.stats["quiet_zones"] = (
-        f"fiducial quiet zones {verdict} (darkest pixel {dirtiest[1]}/255 at {dirtiest[0]})"
+        f"marker quiet zones {verdict} (darkest pixel {darkest}/255 at {where})"
     )
-    if dirtiest[1] < WHITE_FLOOR:
+    if darkest < WHITE_FLOOR:
         report.issues.append(
             PreflightIssue(
                 "error",
                 "fiducial quiet zone",
-                f"{dirtiest[0]} has ink at brightness {dirtiest[1]} inside its "
-                f"{CORNER_KEEPOUT_MM}mm quiet zone. Marker detection may merge that ink into "
-                "the marker and compute the wrong corner.",
+                f"{where} has ink at brightness {darkest} inside its {keepout}mm quiet zone. "
+                "Marker detection may merge that ink into the marker and compute the wrong corner.",
             )
         )
 
@@ -368,6 +384,120 @@ def _check_printer_safe_margins(manifest, pages, report) -> None:
         )
 
 
+def _check_page_bars_identify_their_page(manifest, pages, report) -> None:
+    """Every page must be able to say which page it is, from ink alone.
+
+    The manifest already asserts the arithmetic (exactly one bar filled, at
+    the right index). This checks the pixels actually came out that way, and
+    that a filled bar is separable from an outlined one by a wide margin —
+    if the two read close together, a slightly grey scan turns page 3 into
+    page 1 and puts a student's answers on the wrong questions.
+    """
+    scale = px_per_mm(report.dpi)
+    worst = None  # (contrast, page)
+    for page in sorted(pages):
+        marks = [m for m in manifest["page_marks"] if m.get("page", 1) == page]
+        if not marks:
+            continue
+        readings = {}
+        for m in marks:
+            cx, cy = mm_to_px(m["x_mm"], m["y_mm"], report.dpi)
+            # Sample inside the bar's short axis so its own outline is excluded.
+            r = max(1, round(m["height_mm"] / 2 * scale) - 2)
+            readings[m["index"]] = ink_density(pages[page], cx, cy, r)
+
+        dark = [i for i, v in readings.items() if v > 0.5]
+        if dark != [page]:
+            report.issues.append(
+                PreflightIssue(
+                    "error",
+                    "page index",
+                    f"page {page}'s bars read as {dark or 'nothing'} filled, expected exactly "
+                    f"[{page}]. The reader could not tell which page this is.",
+                )
+            )
+            continue
+        others = [v for i, v in readings.items() if i != page]
+        contrast = readings[page] - (max(others) if others else 0.0)
+        if worst is None or contrast < worst[0]:
+            worst = (contrast, page)
+
+    if worst is None:
+        return
+    contrast, page = worst
+    report.stats["page_index"] = f"page-index bars readable, weakest contrast {contrast:.2f} (page {page})"
+    if contrast < MIN_PAGE_MARK_CONTRAST:
+        report.issues.append(
+            PreflightIssue(
+                "warning",
+                "page index",
+                f"page {page}'s filled bar is only {contrast:.2f} darker than an empty one "
+                f"(prefer {MIN_PAGE_MARK_CONTRAST:.2f}) - a grey scan could confuse them.",
+            )
+        )
+
+
+def _check_written_boxes_are_clean(manifest, pages, report) -> None:
+    """A written box is the crop that gets sent to a vision LLM (Section 8).
+    It should hold the student's handwriting and the box's own ruled lines, and
+    nothing else — a stray label, bubble or section header inside the crop is
+    noise competing with the answer.
+
+    Mean darkness would not catch that: a whole row of MCQ bubbles inside a
+    186x14mm box is under 1% of its area. So this masks out the border and the
+    rule rows the box is *supposed* to have, and asserts what is left is bare
+    paper — the same technique as the fiducial quiet-zone check.
+    """
+    scale = px_per_mm(report.dpi)
+    pad = max(2, round(RULE_MASK_MM * scale))
+    dirtiest = None  # (darkest, q_no, page)
+
+    for e in manifest["written_block"]:
+        page = e.get("page", 1)
+        if page not in pages:
+            continue
+        x0, y0 = mm_to_px(e["x_mm"], e["y_mm"], report.dpi)
+        x1 = x0 + max(1, round(e["width_mm"] * scale))
+        y1 = y0 + max(1, round(e["height_mm"] * scale))
+        region = pages[page][max(0, y0):y1 + 1, max(0, x0):x1 + 1].copy()
+        if region.size == 0:
+            continue
+
+        # Mask the box's own border...
+        region[:pad, :] = 255
+        region[-pad:, :] = 255
+        region[:, :pad] = 255
+        region[:, -pad:] = 255
+        # ...and each writing rule it is supposed to have inside it.
+        pitch_px = (e["height_mm"] / e["lines"]) * scale
+        for i in range(1, e["lines"]):
+            ry = round(i * pitch_px)
+            region[max(0, ry - pad):ry + pad, :] = 255
+
+        darkest = int(region.min())
+        if dirtiest is None or darkest < dirtiest[0]:
+            dirtiest = (darkest, e["q_no"], page)
+
+    if dirtiest is None:
+        return
+    darkest, q_no, page = dirtiest
+    verdict = "clean" if darkest >= WHITE_FLOOR else "NOT clean"
+    report.stats["written_boxes"] = (
+        f"{len(manifest['written_block'])} answer boxes {verdict} "
+        f"(darkest non-rule pixel {darkest}/255 in Q{q_no})"
+    )
+    if darkest < WHITE_FLOOR:
+        report.issues.append(
+            PreflightIssue(
+                "error",
+                "answer box must be blank",
+                f"page {page}: Q{q_no}'s answer box already contains ink at brightness {darkest} "
+                "that is not one of its writing rules. Whatever that is will be cropped and sent "
+                "to the grader alongside the student's handwriting.",
+            )
+        )
+
+
 def _check_content_stays_on_the_page(manifest, report) -> None:
     w, h = manifest["page"]["width_mm"], manifest["page"]["height_mm"]
     r = manifest["bubble_radius_mm"]
@@ -404,9 +534,11 @@ def check_sheet(pdf_path: str | Path, manifest: dict, dpi: float = PREFLIGHT_DPI
 
     _check_printer_safe_margins(manifest, pages, report)
     _check_bubbles_are_empty(manifest, pages, report)
-    _check_fiducial_quiet_zones(manifest, pages, report)
+    _check_written_boxes_are_clean(manifest, pages, report)
+    _check_marker_quiet_zones(manifest, pages, report)
     _check_markers_print_solid(manifest, pages, report)
     _check_orientation_is_recoverable(manifest, report)
+    _check_page_bars_identify_their_page(manifest, pages, report)
     _check_bubbles_do_not_crowd(manifest, report)
     _check_content_stays_on_the_page(manifest, report)
     return report

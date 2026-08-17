@@ -1,0 +1,61 @@
+{
+  "exam_id": "CS301_QUIZ1_2026",
+  "course_code": "CS301",
+  "exam_name": "Quiz 1",
+  "exam_type": "quiz",
+  "num_mcq": 10,
+  "mcq_options": 4,
+  "marks_per_mcq": 1,
+  "written_questions": [
+    {
+      "q_no": 11,
+      "max_marks": 5,
+      "lines": 2
+    },
+    {
+      "q_no": 12,
+      "max_marks": 5,
+      "lines": 2
+    },
+    {
+      "q_no": 13,
+      "max_marks": 5,
+      "lines": 2
+    },
+    {
+      "q_no": 14,
+      "max_marks": 5,
+      "lines": 2
+    },
+    {
+      "q_no": 15,
+      "max_marks": 5,
+      "lines": 2
+    },
+    {
+      "q_no": 16,
+      "max_marks": 5,
+      "lines": 2
+    },
+    {
+      "q_no": 17,
+      "max_marks": 5,
+      "lines": 2
+    },
+    {
+      "q_no": 18,
+      "max_marks": 5,
+      "lines": 2
+    },
+    {
+      "q_no": 19,
+      "max_marks": 5,
+      "lines": 2
+    },
+    {
+      "q_no": 20,
+      "max_marks": 5,
+      "lines": 2
+    }
+  ]
+}

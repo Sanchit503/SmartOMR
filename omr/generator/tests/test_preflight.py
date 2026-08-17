@@ -128,6 +128,91 @@ def test_a_bubble_off_the_page_is_an_error(sheet):
 
 
 # ---------------------------------------------------------------------------
+# Answer boxes, orientation, page index
+# ---------------------------------------------------------------------------
+
+def test_something_printed_inside_an_answer_box_is_caught(sheet):
+    """The box is the crop that goes to the vision grader. Anything in it other
+    than its own writing rules competes with the student's handwriting.
+
+    A mean-darkness test could not catch this: a whole row of MCQ bubbles
+    inside a 186x14mm box is under 1% of its area. So the check masks the rules
+    the box is supposed to have and asserts the rest is bare paper.
+    """
+    pdf, manifest = sheet
+    manifest["written_block"][0]["y_mm"] = 70.0  # onto the roll-number grid
+    report = check_sheet(pdf, manifest)
+    assert not report.ok
+    assert any("answer box must be blank" in e.check for e in report.errors), report.format()
+
+
+def test_a_row_of_bubbles_inside_an_answer_box_is_caught(sheet):
+    """The specific case mean darkness would miss."""
+    pdf, manifest = sheet
+    first_mcq = manifest["mcq_block"][0]
+    box = manifest["written_block"][0]
+    box["y_mm"] = first_mcq["y_mm"] - box["height_mm"] / 2
+    report = check_sheet(pdf, manifest)
+    assert not report.ok
+    assert any("answer box must be blank" in e.check for e in report.errors), report.format()
+
+
+def test_ink_in_the_orientation_markers_quiet_zone_is_caught(sheet):
+    """The orientation marker is found the same way the corner markers are. If
+    a glyph merges with it, the sheet loses its only defence against being read
+    upside down — so it gets a quiet zone too, and that zone is checked."""
+    pdf, manifest = sheet
+    om = manifest["orientation_marker"][0]
+    om["x_mm"] = manifest["mcq_block"][0]["x_mm"] + 14
+    om["y_mm"] = manifest["mcq_block"][0]["y_mm"]
+    report = check_sheet(pdf, manifest)
+    assert not report.ok
+    quiet = [e for e in report.errors if "quiet zone" in e.check]
+    assert quiet and "orientation" in quiet[0].detail, report.format()
+
+
+def test_a_sheet_that_prints_the_wrong_page_bar_is_caught(tmp_path):
+    """End-to-end: render a PDF whose page 2 fills page 1's bar, then check it
+    against the honest manifest. A page that misreports its own number puts a
+    student's answers on the wrong questions."""
+    import dataclasses
+
+    from omr.generator.layout import build_layout
+    from omr.generator.manifest import build_manifest
+    from omr.generator.pdf_gen import render_pdf
+
+    config = ExamConfig(
+        exam_id="PREFLIGHT_BARS",
+        course_code="CS301",
+        exam_name="Mid-Semester Examination",
+        exam_type="midsem",
+        num_mcq=10,
+        written_questions=[WrittenQuestionConfig(q_no=11 + i, max_marks=5, lines=2) for i in range(10)],
+    )
+    layout = build_layout(config)
+    manifest = build_manifest(layout)
+    assert manifest["num_pages"] > 1
+
+    mislabelled = [
+        dataclasses.replace(m, filled=(m.index == 1)) if m.page == 2 else m for m in layout.page_marks
+    ]
+    pdf = render_pdf(dataclasses.replace(layout, page_marks=mislabelled), tmp_path / "bars.pdf")
+
+    report = check_sheet(pdf, manifest)
+    assert not report.ok
+    assert any("page index" in e.check for e in report.errors), report.format()
+
+
+def test_bars_looked_for_where_they_were_not_printed_are_caught(sheet):
+    pdf, manifest = sheet
+    for m in manifest["page_marks"]:
+        m["x_mm"] -= 25.0
+    report = check_sheet(pdf, manifest)
+    assert not report.ok
+    assert any("page index" in e.check for e in report.errors), report.format()
+
+
+# ---------------------------------------------------------------------------
 # Printer-safe area
 # ---------------------------------------------------------------------------
 

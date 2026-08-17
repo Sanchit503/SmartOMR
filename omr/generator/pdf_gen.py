@@ -2,9 +2,8 @@
 
 Draws exactly what `manifest.build_manifest` describes, from the same
 `SheetLayout` object, so print output and manifest coordinates can't drift
-apart (Section 2, principle 1). Loops over `layout.num_pages`, drawing only
-the fiducials/entries tagged for each page (see layout.py's module
-docstring for the pagination and identity rules).
+apart (Section 2, principle 1). Every measurement comes from `metrics.py`;
+this file decides only fonts, stroke weights and wording.
 
 The one rule this file must never break: **nothing is ever drawn inside a
 bubble**. Every bubble leaves the printer as an empty outline, because the
@@ -20,9 +19,14 @@ from reportlab.lib.pagesizes import A4
 from reportlab.lib.units import mm
 from reportlab.pdfgen import canvas
 
-from .layout import (
+from .layout import SheetLayout
+from .metrics import (
     BUBBLE_RADIUS_MM,
     DIGIT_ROW_LABEL_DX_MM,
+    HEADER_INSTRUCTION2_Y_MM,
+    HEADER_INSTRUCTION_Y_MM,
+    HEADER_META_Y_MM,
+    HEADER_TITLE_Y_MM,
     MARGIN_MM,
     MCQ_LABEL_OFFSET_MM,
     MCQ_OPTION_HEADER_MM,
@@ -32,16 +36,24 @@ from .layout import (
     PAGE_WIDTH_MM,
     WRITTEN_HEADER_MM,
     WRITTEN_LINE_MM,
-    HEADER_INSTRUCTION2_Y_MM,
-    HEADER_INSTRUCTION_Y_MM,
-    HEADER_META_Y_MM,
-    HEADER_TITLE_Y_MM,
-    SheetLayout,
+    identity_box,
 )
 
 # ReportLab measures from the bottom-left; the manifest measures from the
 # top-left. That flip is confined to this module — see `_y`.
 HAIRLINE_PT = 0.7
+BOX_RULE_PT = 0.9
+
+MIN_FONT_PT = 5.5  # floor for the auto-shrink below
+
+INSTRUCTION_LINE_1 = (
+    "Fill each bubble completely with a dark pen or pencil. Do not fold or tear the sheet, "
+    "and keep all marks away from the black corner squares."
+)
+INSTRUCTION_LINE_2 = (
+    "Bubble your program, then write and bubble your roll number in THAT program's grid only. "
+    "Write your name and roll number on every page of this sheet."
+)
 
 
 def _y(y_mm: float) -> float:
@@ -49,17 +61,40 @@ def _y(y_mm: float) -> float:
     return (PAGE_HEIGHT_MM - y_mm) * mm
 
 
+def _marks(value: float) -> str:
+    return f"{int(value)}" if float(value).is_integer() else f"{value:g}"
+
+
+def _draw_fitted(
+    c: canvas.Canvas, x_mm: float, y_mm: float, text: str, font: str, size: float, max_width_mm: float
+) -> None:
+    """Draw `text`, shrinking the font if it would run past `max_width_mm`.
+
+    Header strings carry professor-supplied values — an exam name or exam id
+    can be any length — and text that overflows the right margin is exactly
+    the kind of defect that survives every coordinate assertion and then
+    prints into the page edge. Measuring it here is cheaper than hoping the
+    string is short.
+    """
+    limit = max_width_mm * mm
+    width = c.stringWidth(text, font, size)
+    if width > limit:
+        size = max(MIN_FONT_PT, size * limit / width)
+    c.setFont(font, size)
+    c.drawString(x_mm * mm, _y(y_mm), text)
+
+
 def render_pdf(layout: SheetLayout, output_path: str | Path) -> Path:
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     c = canvas.Canvas(str(output_path), pagesize=A4)
-    c.setTitle(f"{layout.exam_id} — OMR answer sheet")
+    c.setTitle(f"{layout.exam_id} - OMR answer sheet")
 
     mcq_pages = sorted({e.page for e in layout.mcq_entries})
     written_pages = sorted({e.page for e in layout.written_entries})
 
     for page_no in range(1, layout.num_pages + 1):
-        _draw_fiducials(c, layout, page_no)
+        _draw_registration_marks(c, layout, page_no)
         _draw_header(c, layout, page_no)
         if page_no == 1:
             _draw_identity_block(c, layout)
@@ -77,7 +112,7 @@ def render_pdf(layout: SheetLayout, output_path: str | Path) -> Path:
 # Registration marks
 # ---------------------------------------------------------------------------
 
-def _draw_fiducials(c: canvas.Canvas, layout: SheetLayout, page_no: int) -> None:
+def _draw_registration_marks(c: canvas.Canvas, layout: SheetLayout, page_no: int) -> None:
     c.setFillColorRGB(0, 0, 0)
     for f in layout.fiducials:
         if f.page != page_no:
@@ -91,37 +126,70 @@ def _draw_fiducials(c: canvas.Canvas, layout: SheetLayout, page_no: int) -> None
         half = om.size_mm / 2
         c.rect((om.x_mm - half) * mm, _y(om.y_mm + half), om.size_mm * mm, om.size_mm * mm, fill=1, stroke=0)
 
-
-def _draw_header(c: canvas.Canvas, layout: SheetLayout, page_no: int) -> None:
-    c.setFillColorRGB(0, 0, 0)
-    c.setFont("Helvetica-Bold", 13)
-    c.drawString(MARGIN_MM * mm, _y(HEADER_TITLE_Y_MM), layout.exam_name)
-
-    c.setFont("Helvetica", 9.5)
-    c.drawString(MARGIN_MM * mm, _y(HEADER_META_Y_MM), f"{layout.course_code}  |  Exam ID: {layout.exam_id}")
-    if layout.num_pages > 1:
-        c.drawRightString(
-            (PAGE_WIDTH_MM - MARGIN_MM) * mm, _y(HEADER_META_Y_MM), f"Page {page_no} of {layout.num_pages}"
+    # Page-index bars: this page's own bar solid, the rest outlined so a human
+    # can count them too. Wide-and-thin on purpose — a marker detector's
+    # squareness filter must never mistake one for the orientation marker
+    # sitting on the same row.
+    c.setLineWidth(HAIRLINE_PT)
+    for pm in layout.page_marks:
+        if pm.page != page_no:
+            continue
+        c.rect(
+            (pm.x_mm - pm.width_mm / 2) * mm,
+            _y(pm.y_mm + pm.height_mm / 2),
+            pm.width_mm * mm,
+            pm.height_mm * mm,
+            fill=1 if pm.filled else 0,
+            stroke=0 if pm.filled else 1,
         )
 
-    c.setFont("Helvetica", 7.5)
-    c.drawString(
-        MARGIN_MM * mm,
-        _y(HEADER_INSTRUCTION_Y_MM),
-        "Fill each bubble completely with a dark pen or pencil. Do not fold or tear the sheet, and "
-        "keep all marks away from the black corner squares.",
-    )
-    second_line = (
-        "Bubble your program, then write and bubble your roll number in THAT program's grid only."
-        if page_no == 1
-        else "Write your name and roll number on every page."
-    )
-    c.drawString(MARGIN_MM * mm, _y(HEADER_INSTRUCTION2_Y_MM), second_line)
+
+def _draw_header(c: canvas.Canvas, layout: SheetLayout, page_no: int) -> None:
+    """Page 1 gets a full masthead. Continuation pages compress it to a single
+    line, because every millimetre spent here is a millimetre of answer space
+    — and the identity strip immediately below starts at 31mm.
+    """
+    c.setFillColorRGB(0, 0, 0)
+    usable = PAGE_WIDTH_MM - 2 * MARGIN_MM
+    total = _marks(layout.total_marks)
+
+    # Right-aligned page counter, on the same line as the leftmost header text.
+    page_label = f"Page {page_no} of {layout.num_pages}" if layout.num_pages > 1 else ""
+    counter_y = HEADER_META_Y_MM if page_no == 1 else HEADER_TITLE_Y_MM
+    reserved = 0.0
+    if page_label:
+        reserved = c.stringWidth(page_label, "Helvetica", 9.5) / mm + 6.0
+        c.setFont("Helvetica", 9.5)
+        c.drawRightString((PAGE_WIDTH_MM - MARGIN_MM) * mm, _y(counter_y), page_label)
+
+    if page_no > 1:
+        one_line = f"{layout.exam_name}   |   {layout.course_code}   |   {layout.exam_id}   |   {total} marks"
+        _draw_fitted(c, MARGIN_MM, HEADER_TITLE_Y_MM, one_line, "Helvetica-Bold", 10.5, usable - reserved)
+        return
+
+    _draw_fitted(c, MARGIN_MM, HEADER_TITLE_Y_MM, layout.exam_name, "Helvetica-Bold", 13, usable)
+    meta = f"{layout.course_code}  |  Exam ID: {layout.exam_id}  |  Total: {total} marks"
+    _draw_fitted(c, MARGIN_MM, HEADER_META_Y_MM, meta, "Helvetica", 9.5, usable - reserved)
+    _draw_fitted(c, MARGIN_MM, HEADER_INSTRUCTION_Y_MM, INSTRUCTION_LINE_1, "Helvetica", 7.5, usable)
+    _draw_fitted(c, MARGIN_MM, HEADER_INSTRUCTION2_Y_MM, INSTRUCTION_LINE_2, "Helvetica", 7.5, usable)
 
 
 # ---------------------------------------------------------------------------
 # Identity
 # ---------------------------------------------------------------------------
+
+def _draw_identity_border(c: canvas.Canvas, page_no: int) -> None:
+    top, bottom = identity_box(page_no)
+    c.setLineWidth(HAIRLINE_PT)
+    c.rect(
+        MARGIN_MM * mm,
+        _y(bottom),
+        (PAGE_WIDTH_MM - 2 * MARGIN_MM) * mm,
+        (bottom - top) * mm,
+        stroke=1,
+        fill=0,
+    )
+
 
 def _draw_write_in(c: canvas.Canvas, fld) -> None:
     """A ruled line for free text, or a row of character cells."""
@@ -130,20 +198,18 @@ def _draw_write_in(c: canvas.Canvas, fld) -> None:
         c.line(fld.x_mm * mm, _y(fld.y_mm + fld.height_mm),
                (fld.x_mm + fld.width_mm) * mm, _y(fld.y_mm + fld.height_mm))
         return
-    cell_w = fld.width_mm / fld.cells if not fld.cell_pitch_mm else fld.cell_pitch_mm
-    box_w = min(cell_w - 1.0, fld.width_mm / fld.cells)
     for i in range(fld.cells):
-        x = fld.x_mm + i * cell_w
-        c.rect(x * mm, _y(fld.y_mm + fld.height_mm), box_w * mm, fld.height_mm * mm, stroke=1, fill=0)
+        x = fld.x_mm + i * fld.cell_pitch_mm
+        c.rect(x * mm, _y(fld.y_mm + fld.height_mm), fld.cell_width_mm * mm, fld.height_mm * mm,
+               stroke=1, fill=0)
 
 
 def _draw_identity_block(c: canvas.Canvas, layout: SheetLayout) -> None:
     rb = layout.roll_block
     c.setFillColorRGB(0, 0, 0)
+    _draw_identity_border(c, 1)
 
-    name_field = next(
-        f for f in layout.write_in_fields if f.page == 1 and f.name == "student_name"
-    )
+    name_field = next(f for f in layout.write_in_fields if f.page == 1 and f.name == "student_name")
     c.setFont("Helvetica-Bold", 9)
     c.drawString(MARGIN_MM * mm, _y(name_field.y_mm + name_field.height_mm - 1.5), "Name")
     _draw_write_in(c, name_field)
@@ -186,13 +252,17 @@ def _draw_continuation_identity(c: canvas.Canvas, layout: SheetLayout, page_no: 
     handwritten name and roll number — a page that gets separated from its
     page 1 is otherwise unattributable to any student."""
     c.setFillColorRGB(0, 0, 0)
+    _draw_identity_border(c, page_no)
+
     for fld in layout.write_in_fields:
         if fld.page != page_no:
             continue
-        c.setFont("Helvetica-Bold", 9)
-        label = "Name" if fld.name == "student_name" else "Roll No."
-        label_w = NAME_FIELD_LABEL_W_MM if fld.name == "student_name" else 15.0
-        c.drawString((fld.x_mm - label_w) * mm, _y(fld.y_mm + fld.height_mm - 1.5), label)
+        c.setFont("Helvetica-Bold", 8.5)
+        baseline = _y(fld.y_mm + fld.height_mm - 1.5)
+        if fld.name == "student_name":
+            c.drawString((fld.x_mm - NAME_FIELD_LABEL_W_MM) * mm, baseline, "Name")
+        else:
+            c.drawRightString((fld.x_mm - 2.5) * mm, baseline, "Roll No.")
         _draw_write_in(c, fld)
 
 
@@ -208,8 +278,13 @@ def _draw_mcq_block(c: canvas.Canvas, layout: SheetLayout, page_no: int, is_firs
 
     top_y = min(e.y_mm for e in entries)
     c.setFont("Helvetica-Bold", 10)
-    label = "Section A - MCQs" if is_first else "Section A - MCQs (continued)"
-    c.drawString(MARGIN_MM * mm, _y(top_y - MCQ_OPTION_HEADER_MM - 4), label)
+    suffix = "" if is_first else "  (continued)"
+    marks = _marks(layout.marks_per_mcq)
+    c.drawString(
+        MARGIN_MM * mm,
+        _y(top_y - MCQ_OPTION_HEADER_MM - 4),
+        f"Section A - Multiple Choice  [{marks} mark each]{suffix}",
+    )
 
     # One option-letter header per column, above that column's first row.
     # This is what keeps the bubbles themselves empty.
@@ -234,15 +309,21 @@ def _draw_written_block(c: canvas.Canvas, layout: SheetLayout, page_no: int, is_
         return
     c.setFillColorRGB(0, 0, 0)
     c.setFont("Helvetica-Bold", 10)
-    label = "Section B - Written Answers" if is_first else "Section B - Written Answers (continued)"
-    c.drawString(MARGIN_MM * mm, _y(entries[0].y_mm - WRITTEN_HEADER_MM - 4), label)
+    suffix = "" if is_first else "  (continued)"
+    c.drawString(
+        MARGIN_MM * mm, _y(entries[0].y_mm - WRITTEN_HEADER_MM - 4), f"Section B - Written Answers{suffix}"
+    )
 
     for entry in entries:
         c.setFont("Helvetica", 8)
-        marks = int(entry.max_marks) if float(entry.max_marks).is_integer() else entry.max_marks
-        c.drawString(entry.x_mm * mm, _y(entry.y_mm - 2), f"Q{entry.q_no}  [{marks} marks]")
+        c.drawString(
+            entry.x_mm * mm,
+            _y(entry.y_mm - 2),
+            f"Q{entry.q_no}  [{_marks(entry.max_marks)} marks]  -  answer in {entry.lines} line"
+            f"{'s' if entry.lines != 1 else ''}",
+        )
 
-        c.setLineWidth(HAIRLINE_PT)
+        c.setLineWidth(BOX_RULE_PT)
         c.rect(
             entry.x_mm * mm,
             _y(entry.y_mm + entry.height_mm),
@@ -253,6 +334,7 @@ def _draw_written_block(c: canvas.Canvas, layout: SheetLayout, page_no: int, is_
         )
         # Uniform writing lines: every ruled row is exactly WRITTEN_LINE_MM,
         # so a 2-line box and a 6-line box give the same room per line.
+        c.setLineWidth(HAIRLINE_PT)
         for li in range(1, entry.lines):
             ly = entry.y_mm + li * WRITTEN_LINE_MM
             c.line(entry.x_mm * mm, _y(ly), (entry.x_mm + entry.width_mm) * mm, _y(ly))

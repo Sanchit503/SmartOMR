@@ -44,18 +44,21 @@ tells you the result:
 Preflight (200 DPI, 1 page(s)):
   closest ink to a page edge: 11.8mm (left, page 1); safe area is 10mm
   202 bubbles, worst pre-printed fill 0.000
-  fiducial quiet zones clear (darkest pixel 255/255 at page 1 TL)
+  3 answer boxes clean (darkest non-rule pixel 255/255 in Q21)
+  marker quiet zones clear (darkest pixel 255/255 at page 1 TL)
   orientation marker present and decisive on every page
+  page-index bars readable, weakest contrast 1.00 (page 1)
   tightest bubble gap 3.1mm (BT-col1-0 / BT-col1-1)
   All checks passed - this sheet is ready to print.
 ```
 
 It checks that nothing is printed inside the printer-safe margin, that no bubble has ink in it
-before a student writes, that every registration marker prints solid with clean paper around it,
-that the orientation marker is decisive, that no two bubbles crowd each other, that the PDF's page
-count matches the manifest, and that nothing runs off the page. Anything fatal prints
-`DO NOT PRINT` and exits non-zero; the GUI shows the same report in an error dialog and won't open
-the PDF.
+before a student writes, that every answer box contains nothing but its own writing rules, that
+every registration marker (the four corners *and* the orientation marker) prints solid with clean
+paper around it, that the orientation marker is decisive, that each page's index bars identify that
+page and nothing else, that no two bubbles crowd each other, that the PDF's page count matches the
+manifest, and that nothing runs off the page. Anything fatal prints `DO NOT PRINT` and exits
+non-zero; the GUI shows the same report in an error dialog and won't open the PDF.
 
 This exists because the layout engine can only check its own arithmetic. The failures that actually
 break an OMR sheet — a glyph on top of a fiducial, a label inside a bubble — pass every coordinate
@@ -128,10 +131,9 @@ Compare that number against your printer's stated unprintable border:
 
 A university printing exam sheets in bulk is using a laser or an MFP, which this clears comfortably.
 The one case to watch is a consumer inkjet with a deep bottom margin. If your printer needs more,
-raise `PRINTER_SAFE_MARGIN_MM` in `omr/generator/layout.py` — everything else (fiducial inset,
+raise `PRINTER_SAFE_MARGIN_MM` in `omr/generator/metrics.py` — everything else (fiducial inset,
 content margin, page bottom, header position) derives from it, and preflight will tell you whether
-the result still fits. Expect to trade page count for margin: at ~15mm the spec's 20-MCQ midsem no
-longer fits on one page.
+the result still fits. Expect to trade page count for margin.
 
 **Why a clipped fiducial is the worst case, not just a cosmetic one:** the surviving part of a
 clipped square is still roughly square, so detection succeeds and returns a centroid that is a few
@@ -148,16 +150,21 @@ omr/
   generator/     Module 1 — everything that MAKES a sheet (Section 4)
     main.py        Entry point: wizard / --config / --gui
     config.py      ExamConfig / WrittenQuestionConfig — the professor-facing input (Section 4.1)
-    layout.py      Manifest-driven layout engine — single source of truth for every
-                     fiducial/bubble/box position, in mm (Sections 4.2-4.4)
+    metrics.py     Every millimetre of the sheet, and the geometry derived from it.
+                     Edit this to change how the sheet looks; nothing else hardcodes a size.
+    flow.py        Which question lands on which page, and where. One continuous
+                     placement algorithm for every exam (Sections 4.2-4.4)
+    layout.py      Assembles a SheetLayout: the flow, plus markers and identity fields
     pdf_gen.py     Renders the printable PDF from a SheetLayout (ReportLab)
     manifest.py    Builds/saves the template manifest from the same SheetLayout
     generate.py    generate_exam(config, output_dir) -> {pdf_path, manifest_path, manifest}
     preflight.py   Rasterizes the generated PDF and verifies it is machine-readable
     gui.py         Desktop form over the same pipeline
     configs/       Worked example exam configs — copy one and edit to make your own
-    tests/         Layout/manifest correctness, pagination, entry-point behaviour, plus
-                     test_printed_sheet.py — rasterizes the real PDF and inspects the pixels
+    tests/         test_flow.py (pagination behaviour), test_page_identity.py (per-page
+                     identity + page bars), test_preflight.py, test_generator.py,
+                     test_main.py, plus test_printed_sheet.py — which rasterizes the
+                     real PDF and inspects the pixels
   grading/       Modules 4/5 — everything that READS a sheet (Sections 7-8)
     bubbles.py     Bubble measurement: fill_ratio (hard threshold) + ink_density (mean darkness)
     mcq.py         MCQ reading + grading — answered/blank/multiple, with confidence
@@ -198,23 +205,44 @@ earlier design — letters straddling the outline, digits centred inside — rea
 **The reader measures a smaller disc than gets printed.** `bubble_sample_radius_mm` is inset to 72%
 of `bubble_radius_mm` so the bubble's own outline stroke is never counted as a fill.
 
-**Every fiducial owns a quiet zone.** A contour detector finds a marker by isolating a dark square,
+**Every marker owns a quiet zone.** A contour detector finds a marker by isolating a dark square,
 so 3.5mm of blank paper is reserved on every side and all content bands are derived from those
 keep-outs. Previously the title sat 0.45mm below the top-left marker — close enough for a detector
-to merge the two into one blob and compute a wrong corner.
+to merge the two into one blob and compute a wrong corner. The orientation marker gets one too.
 
 **A fifth marker breaks the rotational symmetry.** Four identical corner squares look the same at
 0°, 90°, 180° and 270°, so a sheet fed in upside down reads as a valid upright sheet with every
 coordinate inverted. A smaller square near the top-left resolves it: whichever corner marker it
 sits nearest is the true top-left, at any rotation and any scale.
 
-Two more, for the humans:
+### Identity on every page
 
-- **Name and roll-number write-in boxes on every page.** Page 1 carries the full bubble grid; the
-  digit cells sit directly above their own bubble columns. Continuation pages carry the write-in
-  row only — repeating the whole grid would cost ~56mm a page and make students bubble the same
-  number three times, but a continuation page with *no* identity can't be attributed to anyone if
-  it gets separated, and it's a human who resolves the review queue anyway (Section 6, step 5).
+A multi-page sheet is scanned as a loose batch, so every page has to say who it belongs to and
+which page it is. Attributing a page by its position in the scan queue is a guess, and principle 4
+says a guess doesn't get to produce a grade.
+
+| On every page | Read by | What it's for |
+|---|---|---|
+| Handwritten **Name** + 7-cell **Roll No.** strip | a human | Reattaching a page that got separated; resolving a flagged bubble read (Section 6, step 5) |
+| **Page-index bars** — one per page, this page's filled solid | the machine | Confirming a batch is a complete sheet in the right order |
+| Bubbled roll-number grid (**page 1 only**) | the machine | Roster lookup (Module 3) |
+
+The strip is 7 cells because both roll-number formats are exactly 7 characters: `2024503` for BTech,
+`MT25001` for MTech (Section 4.2).
+
+The bubble grid is **not** repeated on continuation pages. It would cost ~85mm of every page, and it
+would ask a student to bubble the same seven digits two or three more times — each repeat being a
+fresh chance to produce a page that *contradicts* page 1, which is a review-queue item rather than
+an improvement.
+
+The page-index bars are deliberately **bars**, not squares: a marker detector rejects candidates by
+squareness, so a 4.0 × 1.8mm rectangle can never be mistaken for the 3.5mm orientation marker
+sitting on the same row. The reader measures ink at each bar's coordinate with the same primitive it
+uses for a bubble — no new decoder — and "exactly one bar is dark" is the checksum that says the
+read is trustworthy.
+
+One more, for the humans:
+
 - **Print at 100% scale**, not "fit to page". The fiducials let the reader recover a uniform scale,
   but there's no reason to make it work harder.
 
@@ -298,32 +326,52 @@ There's no fixed number of written questions. The layout engine packs the MCQ bl
 (auto-picking however many columns are needed), then stacks the written-answer boxes underneath in
 order, each sized to its own `lines` value.
 
-### Multi-page exams
+### Multi-page exams — how the flow works
 
-Everything is tried on a single A4 page first (the common case for a normal quiz/midsem). If the
-MCQs and written questions don't fit together, the sheet automatically spills onto as many pages as
-it needs — MCQs fill page(s) using the same column-packing logic, then the written section always
-starts fresh on a new page and bin-packs its answer boxes across however many pages it needs.
-Sections never interleave mid-page: Section A (MCQs) finishes, then Section B (Written) starts,
-exactly like a real multi-page exam paper.
+**One continuous flow, always.** A cursor walks down page 1, then page 2, and so on. Section A
+(MCQs) is placed first; Section B (written answers) continues from wherever Section A ended — on the
+same page if there's room, on the next page only if there isn't. A page break happens only when the
+next question genuinely doesn't fit, which makes a half-empty page structurally impossible rather
+than something to remember not to produce.
 
-Every page gets its own 4 fiducial markers (Section 4.3 requires this on every physical sheet, since
-each page is deskewed independently at scan time) and repeats the header with a "Page X of N" label.
-Only page 1 carries the roll-number identity block — see `omr/generator/configs/multi_page_20q.json`
-(10 MCQs + 10 written questions, 3 lines each) for a worked example: it comes out to 3 pages.
-
-The manifest reflects this: every fiducial/MCQ/written entry carries a `"page"` field, and there's a
-top-level `"num_pages"`. Grading (`grading/mcq.py`) takes one canonical image *per page*
-(`{page_no: image}`) rather than a single image, precisely so a multi-page sheet can never get graded
-against the wrong page's image by accident.
-
-A single written question whose box is taller than one whole page (e.g. 60 ruled lines) can't be
-placed anywhere, and the generator refuses to guess — see
-`omr/generator/configs/example_impossible_question.json`:
+So a 10-MCQ + 10-two-liner quiz comes out as:
 
 ```
-Layout error: Written question Q1 needs 60 lines, which is too tall to fit on its own page.
-Reduce its line count or split it into multiple questions.
+page 1   Section A: Q1-Q10 (two columns)   then Section B: Q11, Q12, Q13
+page 2   Section B (continued): Q14-Q20
+```
+
+This used to be **three** pages. There were two layout code paths — a "fits on one page" one and a
+paginating one — and the paginating one always started the written section on a fresh page. The MCQs
+took page 1 and left 101mm of it blank, Section B started on page 2, and Q19–Q20 spilled onto page 3.
+Every coordinate assertion passed; what was wrong was *which page* things went on. `flow.py` is now
+the only placement algorithm, and `test_flow.py` asserts the two properties that catch that class of
+bug: a page break happens only when the next question doesn't fit, and no page is ever empty.
+
+Sections still never interleave — all of Section A precedes all of Section B, exactly like a real
+exam paper, and a page break never splits a single answer box.
+
+**MCQ column count** (2, 3, or 4) is chosen once for the whole sheet, by running the real flow for
+each candidate and keeping the one that needs the fewest pages. Ties go to the *fewest* columns:
+more horizontal room per question means more paper between neighbouring bubbles, so a stray pen mark
+is less likely to land in another question's read region. 40 MCQs fit on one page in three columns
+but not in two, so three wins there.
+
+Every page gets its own four fiducial markers plus an orientation marker (Section 4.3 requires this
+on every physical sheet, since each page is deskewed independently at scan time), its own
+page-index bars, its own name and roll-number strip, and a "Page X of N" label.
+
+The manifest reflects all of it: every fiducial / MCQ / written / page-mark / write-in entry carries
+a `"page"` field, and there's a top-level `"num_pages"`. Grading (`grading/mcq.py`) takes one
+canonical image *per page* (`{page_no: image}`) rather than a single image, precisely so a multi-page
+sheet can never get graded against the wrong page's image by accident.
+
+A single written question whose box is taller than one whole page can't be placed anywhere, and the
+generator refuses to guess — see `omr/generator/configs/example_impossible_question.json`:
+
+```
+Layout error: written question Q1 asks for 60 lines, but at most 30 fit on an A4 page.
+Reduce its line count, or split it into two questions.
 ```
 
 That's the one case where you should expect a hard stop (Section 2, principle 4 — flag rather than
@@ -333,11 +381,13 @@ guess); everything else paginates instead of failing.
 
 All under `omr/generator/configs/`:
 
+- `mcq_then_written_flow.json` — 10 MCQs + 10 two-line written questions -> 2 pages, with Section B
+  continuing on page 1 directly under the MCQs. The canonical shape for this generator
 - `midsem_cs301.json` — the Section 4.1 example from the spec (20 MCQs + 3 written, 1 page)
 - `quiz_short.json` — a bare 10-MCQ quiz, no written section
 - `endsem_heavy_written.json` — 8 MCQs + 4 written questions with varying line counts, 1 page
 - `mcq_options_6.json` — 15 MCQs with 6 options each (A–F) instead of the usual 4
-- `multi_page_20q.json` — 10 MCQs + 10 written questions -> auto-paginates to 3 pages
+- `multi_page_20q.json` — 10 MCQs + 10 written questions at 3 lines each -> 2 pages
 - `example_impossible_question.json` — a single question too tall for any page, to show the hard-stop case
 
 ## Known Phase 1 limitations

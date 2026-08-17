@@ -18,16 +18,23 @@ import pytest
 from omr.contracts.geometry import mm_to_px, px_per_mm
 from omr.generator.config import ExamConfig, WrittenQuestionConfig
 from omr.generator.generate import generate_exam
-from omr.generator.layout import (
+from omr.generator.metrics import (
     CORNER_KEEPOUT_MM,
+    MARGIN_MM,
     PAGE_HEIGHT_MM,
     PAGE_WIDTH_MM,
     corner_keepouts,
+    identity_box,
 )
-from omr.grading.bubbles import fill_ratio
+from omr.grading.bubbles import fill_ratio, ink_density
 
 DPI = 200
 WHITE_FLOOR = 250  # anything above this is blank paper
+
+# A stroke lands on fractional pixel boundaries and renders antialiased, so a
+# few pixels either side of a drawn line belong to that line. Ignoring this is
+# how a check ends up measuring its own target.
+STROKE_PAD_PX = 3
 
 
 def render(tmp_path, config) -> tuple[dict, dict[int, np.ndarray]]:
@@ -225,6 +232,116 @@ def test_orientation_marker_is_distinguishable_from_a_corner_marker(tmp_path):
 # ---------------------------------------------------------------------------
 # Content stays out of the corners
 # ---------------------------------------------------------------------------
+
+MULTI_PAGE = a_config(
+    exam_id="PRINT_MULTI",
+    num_mcq=10,
+    written_questions=[WrittenQuestionConfig(q_no=11 + i, max_marks=5, lines=2) for i in range(10)],
+)
+
+
+@pytest.mark.parametrize("config", [a_config(), MULTI_PAGE], ids=["single_page", "multi_page"])
+def test_the_header_never_collides_with_the_identity_block(config, tmp_path):
+    """The header sits directly above the identity block on every page, and the
+    two bands are positioned independently. On continuation pages they once
+    overlapped by 1.5mm, so the box outline printed straight through the middle
+    of the course/exam-id line — legible enough to miss in a thumbnail, wrong
+    enough to look broken on paper.
+
+    The assertion is on the MEASURED clearance rather than on the constants,
+    because a glyph's descender reaches below the baseline the constant names.
+    """
+    manifest, pages = render(tmp_path, config)
+    scale = px_per_mm(DPI)
+
+    for page_no, image in pages.items():
+        top, _bottom = identity_box(page_no)
+        _, border_row = mm_to_px(0, top, DPI)
+        band = range(max(0, border_row - int(9 * scale)), border_row - STROKE_PAD_PX)
+        inked = [y for y in band if image[y].min() < WHITE_FLOOR]
+        assert inked, f"page {page_no}: expected header text above the identity block"
+        clearance = (border_row - max(inked)) / scale
+        assert clearance >= 1.0, (
+            f"page {page_no}: header ink is only {clearance:.2f}mm above the identity block's "
+            "border - one font change from printing through it"
+        )
+
+
+@pytest.mark.parametrize("config", [a_config(), MULTI_PAGE], ids=["single_page", "multi_page"])
+def test_every_page_prints_a_roll_number_strip_a_human_can_read(config, tmp_path):
+    """"Roll number on every page" has to be true of the paper, not just the
+    manifest. Each cell must print as an empty box: visible border, blank
+    middle."""
+    manifest, pages = render(tmp_path, config)
+    scale = px_per_mm(DPI)
+
+    for page_no in pages:
+        strips = [
+            f for f in manifest["write_in_fields"]
+            if f["page"] == page_no and f["name"] == "roll_number"
+        ]
+        assert strips, f"page {page_no} printed no roll-number strip"
+        for strip in strips:
+            for i in range(strip["cells"]):
+                cx = strip["x_mm"] + i * strip["cell_pitch_mm"] + strip["cell_width_mm"] / 2
+                cy = strip["y_mm"] + strip["height_mm"] / 2
+                px, py = mm_to_px(cx, cy, DPI)
+                inside = ink_density(pages[page_no], px, py, max(1, round(1.5 * scale)))
+                assert inside < 0.02, f"page {page_no} roll cell {i} is not blank ({inside:.3f})"
+                # ...and the cell's own border really is there to write inside.
+                x0, y0 = mm_to_px(strip["x_mm"] + i * strip["cell_pitch_mm"], strip["y_mm"], DPI)
+                x1 = x0 + round(strip["cell_width_mm"] * scale)
+                y1 = y0 + round(strip["height_mm"] * scale)
+                assert pages[page_no][y0:y1 + 1, x0:x1 + 1].min() < WHITE_FLOOR
+
+
+@pytest.mark.parametrize("config", [a_config(), MULTI_PAGE], ids=["single_page", "multi_page"])
+def test_each_page_prints_exactly_one_solid_page_index_bar(config, tmp_path):
+    """The reader recovers a page's own index from these bars. Exactly one dark
+    per page is also the checksum that says the read is trustworthy."""
+    manifest, pages = render(tmp_path, config)
+    scale = px_per_mm(DPI)
+
+    for page_no, image in pages.items():
+        bars = [m for m in manifest["page_marks"] if m["page"] == page_no]
+        dark = []
+        for m in bars:
+            cx, cy = mm_to_px(m["x_mm"], m["y_mm"], DPI)
+            r = max(1, round(m["height_mm"] / 2 * scale) - 2)
+            if ink_density(image, cx, cy, r) > 0.5:
+                dark.append(m["index"])
+        assert dark == [page_no], f"page {page_no}'s bars read as {dark}"
+
+
+@pytest.mark.parametrize("config", [a_config(), MULTI_PAGE], ids=["single_page", "multi_page"])
+def test_header_text_never_runs_past_the_content_margin(config, tmp_path):
+    """Header strings interpolate professor-supplied values, so their width is
+    not knowable from the layout. `pdf_gen` shrinks them to fit; this proves
+    the shrink actually happens on the page."""
+    long_config = config.model_copy(
+        update={
+            "exam_id": "CS301_MIDSEM_MONSOON_2026_SECTION_A_SET_2_REVISED",
+            "exam_name": "Mid-Semester Examination in Advanced Topics in Computer Systems and Networks",
+        }
+    )
+    _manifest, pages = render(tmp_path, long_config)
+    scale = px_per_mm(DPI)
+    right_limit = round((PAGE_WIDTH_MM - MARGIN_MM) * scale) + STROKE_PAD_PX
+
+    for page_no, image in pages.items():
+        header = image[: round(42 * scale), :]
+        cols = np.flatnonzero(np.any(header < WHITE_FLOOR, axis=0))
+        # The corner markers and page bars legitimately sit outside the content
+        # margin; text must not.
+        text = image[round(24 * scale): round(42 * scale), :]
+        text_cols = np.flatnonzero(np.any(text < WHITE_FLOOR, axis=0))
+        assert cols.size and text_cols.size
+        assert text_cols[-1] <= right_limit, (
+            f"page {page_no}: header text reaches {text_cols[-1] / scale:.1f}mm, past the "
+            f"{PAGE_WIDTH_MM - MARGIN_MM:g}mm content margin"
+        )
+        assert text_cols[0] >= round(MARGIN_MM * scale) - STROKE_PAD_PX
+
 
 def test_no_layout_element_is_placed_inside_a_corner_keepout(tmp_path):
     manifest, _pages = render(tmp_path, a_config(num_mcq=60, written_questions=[]))

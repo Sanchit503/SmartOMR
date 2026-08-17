@@ -6,7 +6,8 @@ import pytest
 
 from omr.generator.config import ExamConfig, WrittenQuestionConfig
 from omr.generator.generate import generate_exam
-from omr.generator.layout import PAGE_HEIGHT_MM, PAGE_WIDTH_MM, build_layout
+from omr.generator.layout import build_layout
+from omr.generator.metrics import PAGE_HEIGHT_MM, PAGE_WIDTH_MM
 from omr.generator.manifest import build_manifest
 
 

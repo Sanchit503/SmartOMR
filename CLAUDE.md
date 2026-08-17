@@ -288,8 +288,16 @@ omr/
                Nothing here imports from generator/ or grading/ — that direction is
                enforced by a test, so the Phase 2 scan reader never has to depend on
                the PDF-generation stack.
-  generator/   Module 1 (Section 4). Self-contained: entry point (main.py), layout
-               engine, PDF renderer, manifest builder, GUI, example configs, tests.
+  generator/   Module 1 (Section 4). Self-contained, and split by responsibility:
+                 config.py     what a professor supplies (Section 4.1)
+                 metrics.py    every millimetre of the sheet + derived keep-out
+                               geometry. The file to edit to change how it looks.
+                 flow.py       which question lands on which page, and where
+                 layout.py     assembles a SheetLayout from the flow + markers +
+                               identity fields
+                 pdf_gen.py    what gets printed        manifest.py  what's published
+                 preflight.py  rasterizes the result and proves it is readable
+                 main.py       entry point (wizard / --config / --gui)
                Run it with `python -m omr.generator.main`.
   grading/     Modules 4/5 (Sections 7-8). Bubble reading + MCQ grading; written-answer
                LLM grading lands here in Phase 3.
@@ -299,6 +307,17 @@ omr/
 Bubble radius, option pitch, and block positions are **layout decisions the generator owns**
 and publishes through the manifest — they are deliberately NOT in `contracts/`, so the reader
 learns them at parse time rather than sharing a constant that could drift.
+
+**Sheet flow (settled, don't undo):** questions flow continuously — Section A (MCQs) first,
+then Section B (written) starting in whatever space is left on the same page, breaking to a
+new page only when the next question does not fit. There is exactly one placement algorithm
+(`flow.py`) for every exam, because two of them disagreed and produced half-empty pages.
+
+**Identity per page (settled):** every page carries a handwritten name + 7-cell roll-number
+strip and a row of page-index bars with its own index printed solid. The *bubbled* roll-number
+grid is on page 1 only — repeating it costs ~85mm a page and invites a continuation page that
+contradicts page 1. The manifest schema enforces both (every page must have a roll-number
+field, exactly one filled page bar at its own index, and at least one question).
 
 ---
 

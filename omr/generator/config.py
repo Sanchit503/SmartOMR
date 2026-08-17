@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 ExamType = Literal["quiz", "midsem", "endsem"]
 
@@ -45,3 +45,15 @@ class ExamConfig(BaseModel):
                         f"(num_mcq={num_mcq}); written q_no must be > num_mcq"
                     )
         return v
+
+    @model_validator(mode="after")
+    def _has_at_least_one_question(self) -> ExamConfig:
+        """An answer sheet with nothing to answer is always a mistake, and it
+        would otherwise generate a valid-looking single page of identity
+        fields — the kind of output that gets printed 200 times before anyone
+        notices."""
+        if self.num_mcq == 0 and not self.written_questions:
+            raise ValueError(
+                "this exam has no questions: num_mcq is 0 and written_questions is empty"
+            )
+        return self

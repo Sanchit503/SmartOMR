@@ -11,4 +11,4 @@ from them, which is what lets the Phase 2 scan reader stay independent of
 the PDF-generation stack (Section 2, principle 1).
 """
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
