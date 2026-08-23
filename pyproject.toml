@@ -11,4 +11,4 @@ smartomr-generate = "omr.generator.main:main"
 pythonpath = ["."]
 # Tests live beside the module they cover, so the generator folder is
 # genuinely self-contained (omr/generator/tests, omr/grading/tests).
-testpaths = ["omr"]
+testpaths = ["omr", "prototype_eval"]

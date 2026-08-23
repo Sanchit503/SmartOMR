@@ -17,7 +17,11 @@ more than the example in CLAUDE.md spells out:
   page_marks               the pre-printed page-index bars: which page a sheet
                            in a scan batch actually is, read with the same
                            ink-measuring primitive as a bubble
-  write_in_fields          handwritten name/roll regions to crop for the
+  continuation_program_choices
+                           compact BTECH/MTECH selectors on continuation
+                           pages, paired with write-in boxes instead of the
+                           full digit grid
+  write_in_fields          handwritten roll-number regions to crop for the
                            review queue when a bubble read is ambiguous, and to
                            reattach a continuation page to its page 1
   written_block[].lines    the LLM grading prompt interpolates it (Section 8)
@@ -59,6 +63,7 @@ def build_manifest(layout: SheetLayout) -> dict:
         "schema_version": MANIFEST_SCHEMA_VERSION,
         "exam_id": layout.exam_id,
         "exam": {
+            "university_name": layout.university_name,
             "course_code": layout.course_code,
             "exam_name": layout.exam_name,
             "exam_type": layout.exam_type,
@@ -119,10 +124,21 @@ def build_manifest(layout: SheetLayout) -> dict:
             }
             for m in layout.page_marks
         ],
+        "continuation_program_choices": [
+            {
+                "page": c.page,
+                "program": c.program,
+                "x_mm": c.x_mm,
+                "y_mm": c.y_mm,
+                "radius_mm": c.radius_mm,
+            }
+            for c in layout.continuation_program_choices
+        ],
         "write_in_fields": [
             {
                 "page": w.page,
                 "name": w.name,
+                "program": w.program,
                 "x_mm": w.x_mm,
                 "y_mm": w.y_mm,
                 "width_mm": w.width_mm,

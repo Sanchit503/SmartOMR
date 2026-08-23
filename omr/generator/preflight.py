@@ -104,6 +104,8 @@ def _all_bubbles(manifest: dict):
     page = rb.get("page", 1)
     for label, pos in rb["program_selector"].items():
         yield page, f"program-{label}", pos["x_mm"], pos["y_mm"]
+    for choice in manifest.get("continuation_program_choices", []):
+        yield choice.get("page", 1), f"continuation-program-{choice['program']}", choice["x_mm"], choice["y_mm"]
     for key, short in (("btech_digits", "BT"), ("mtech_digits", "MT")):
         grid = rb[key]
         for col in range(grid["columns"]):

@@ -21,7 +21,7 @@ from pathlib import Path
 
 from pydantic import ValidationError
 
-from .config import ExamConfig, WrittenQuestionConfig
+from .config import DEFAULT_UNIVERSITY_NAME, ExamConfig, WrittenQuestionConfig
 from .generate import generate_exam
 
 DEFAULT_OUTPUT_DIR = Path(__file__).resolve().parents[2] / "data" / "exams"
@@ -94,6 +94,7 @@ def prompt_for_config() -> ExamConfig:
     print("Answer the prompts. Press Enter to accept a default.\n")
 
     print("-- Exam details --")
+    university_name = ask("University name", default=DEFAULT_UNIVERSITY_NAME)
     course_code = ask("Course code (e.g. CS301)")
     exam_name = ask("Exam name (e.g. Mid-Semester Examination)")
     exam_type = ask_choice("Exam type", ["quiz", "midsem", "endsem"], "quiz")
@@ -134,6 +135,7 @@ def prompt_for_config() -> ExamConfig:
 
     return ExamConfig(
         exam_id=exam_id,
+        university_name=university_name,
         course_code=course_code,
         exam_name=exam_name,
         exam_type=exam_type,

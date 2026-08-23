@@ -20,8 +20,8 @@ Double-click **`SmartOMR.bat`**, or:
 python -m omr.generator.main
 ```
 
-It asks for the exam requirements one at a time — course code, exam name, how many MCQs, how many
-options each, how many written questions and how many lines each — then writes the printable PDF and
+It asks for the exam requirements one at a time — university name, course code, exam name, how many
+MCQs, how many options each, how many written questions and how many lines each — then writes the printable PDF and
 its template manifest into `data/exams/` and opens the PDF.
 
 Two other ways in, same generator underneath:
@@ -223,17 +223,18 @@ says a guess doesn't get to produce a grade.
 
 | On every page | Read by | What it's for |
 |---|---|---|
-| Handwritten **Name** + 7-cell **Roll No.** strip | a human | Reattaching a page that got separated; resolving a flagged bubble read (Section 6, step 5) |
+| **BTECH** choice + 7 boxes, **MTECH** choice + 5 boxes | a human | Reattaching a page that got separated; resolving a flagged bubble read (Section 6, step 5) |
 | **Page-index bars** — one per page, this page's filled solid | the machine | Confirming a batch is a complete sheet in the right order |
 | Bubbled roll-number grid (**page 1 only**) | the machine | Roster lookup (Module 3) |
 
-The strip is 7 cells because both roll-number formats are exactly 7 characters: `2024503` for BTech,
-`MT25001` for MTech (Section 4.2).
+The BTech write-in row is 7 boxes (`2024503`). The MTech row is 5 boxes because the `MT` prefix is
+implied by the MTECH choice (`MT25001` becomes `25001` in the boxes).
 
-The bubble grid is **not** repeated on continuation pages. It would cost ~85mm of every page, and it
+The full 0-9 bubble grid is **not** repeated on continuation pages. It would cost ~85mm of every page, and it
 would ask a student to bubble the same seven digits two or three more times — each repeat being a
 fresh chance to produce a page that *contradicts* page 1, which is a review-queue item rather than
-an improvement.
+an improvement. Continuation pages repeat only the compact BTECH/MTECH choices and their write-in
+boxes.
 
 The page-index bars are deliberately **bars**, not squares: a marker detector rejects candidates by
 squareness, so a 4.0 × 1.8mm rectangle can never be mistaken for the 3.5mm orientation marker
@@ -288,6 +289,7 @@ Tests live beside the code they cover (`omr/generator/tests/`, `omr/grading/test
 ```json
 {
   "exam_id": "CS301_MIDSEM_2026A",
+  "university_name": "IIIT Delhi",
   "course_code": "CS301",
   "exam_name": "Mid-Semester Examination",
   "exam_type": "midsem",
@@ -305,6 +307,7 @@ Tests live beside the code they cover (`omr/generator/tests/`, `omr/grading/test
 | Field | Customizable range | What it changes |
 |---|---|---|
 | `exam_id` | any string | Output filename, printed in the header |
+| `university_name` | any string | Printed centered at the top of the sheet |
 | `course_code` | any string | Printed in the header |
 | `exam_name` | any string | Printed as the sheet title |
 | `exam_type` | `quiz` \| `midsem` \| `endsem` | Metadata only right now — doesn't change layout |
@@ -359,7 +362,7 @@ but not in two, so three wins there.
 
 Every page gets its own four fiducial markers plus an orientation marker (Section 4.3 requires this
 on every physical sheet, since each page is deskewed independently at scan time), its own
-page-index bars, its own name and roll-number strip, and a "Page X of N" label.
+page-index bars, its own compact BTECH/MTECH write-in blocks, and a "Page X of N" label.
 
 The manifest reflects all of it: every fiducial / MCQ / written / page-mark / write-in entry carries
 a `"page"` field, and there's a top-level `"num_pages"`. Grading (`grading/mcq.py`) takes one

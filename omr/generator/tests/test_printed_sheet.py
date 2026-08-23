@@ -19,7 +19,11 @@ from omr.contracts.geometry import mm_to_px, px_per_mm
 from omr.generator.config import ExamConfig, WrittenQuestionConfig
 from omr.generator.generate import generate_exam
 from omr.generator.metrics import (
+    BUBBLE_RADIUS_MM,
     CORNER_KEEPOUT_MM,
+    CONT_BTECH_SELECTOR_X_MM,
+    CONT_MTECH_SELECTOR_X_MM,
+    CONT_PROGRAM_SELECTOR_Y_MM,
     MARGIN_MM,
     PAGE_HEIGHT_MM,
     PAGE_WIDTH_MM,
@@ -267,6 +271,23 @@ def test_the_header_never_collides_with_the_identity_block(config, tmp_path):
         )
 
 
+def test_university_name_prints_centered_in_the_header(tmp_path):
+    university = "Indraprastha Institute of Information Technology Delhi"
+    result = generate_exam(a_config(university_name=university), tmp_path)
+    doc = pymupdf.open(result["pdf_path"])
+    page = doc[0]
+    spans = [
+        span
+        for block in page.get_text("dict")["blocks"]
+        for line in block.get("lines", [])
+        for span in line.get("spans", [])
+        if university in span["text"]
+    ]
+    assert spans, "university name was not printed"
+    x0, _y0, x1, _y1 = spans[0]["bbox"]
+    assert abs(((x0 + x1) / 2) - (page.rect.width / 2)) < 1.0
+
+
 @pytest.mark.parametrize("config", [a_config(), MULTI_PAGE], ids=["single_page", "multi_page"])
 def test_every_page_prints_a_roll_number_strip_a_human_can_read(config, tmp_path):
     """"Roll number on every page" has to be true of the paper, not just the
@@ -293,6 +314,26 @@ def test_every_page_prints_a_roll_number_strip_a_human_can_read(config, tmp_path
                 x1 = x0 + round(strip["cell_width_mm"] * scale)
                 y1 = y0 + round(strip["height_mm"] * scale)
                 assert pages[page_no][y0:y1 + 1, x0:x1 + 1].min() < WHITE_FLOOR
+
+
+def test_continuation_pages_print_program_choices_without_digit_grid(tmp_path):
+    manifest, pages = render(tmp_path, MULTI_PAGE)
+    if manifest["num_pages"] < 2:
+        pytest.skip("needs a continuation page")
+    scale = px_per_mm(DPI)
+
+    for page_no in range(2, manifest["num_pages"] + 1):
+        for label, x_mm in (
+            ("BTECH", CONT_BTECH_SELECTOR_X_MM),
+            ("MTECH", CONT_MTECH_SELECTOR_X_MM),
+        ):
+            cx, cy = mm_to_px(x_mm, CONT_PROGRAM_SELECTOR_Y_MM, DPI)
+            inside = fill_ratio(pages[page_no], cx, cy, max(1, round(BUBBLE_RADIUS_MM * 0.6 * scale)))
+            through_outline = fill_ratio(pages[page_no], cx, cy, round(BUBBLE_RADIUS_MM * scale) + 2)
+            assert inside == pytest.approx(0.0, abs=0.02), (
+                f"page {page_no} {label} selector has ink inside it"
+            )
+            assert through_outline > 0.1, f"page {page_no} {label} selector outline did not print"
 
 
 @pytest.mark.parametrize("config", [a_config(), MULTI_PAGE], ids=["single_page", "multi_page"])

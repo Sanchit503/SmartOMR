@@ -37,10 +37,11 @@ reading ~0.00.
 
 *Identity on every page.* Page 1 carries the bubbled roll-number grid the
 parser reads. EVERY page — page 1 included — additionally carries a
-handwritten name and roll-number strip, and a row of page-index bars with
-its own index printed solid. So a continuation page that gets separated from
-its page 1 is attributable by a human from the strip, and verifiable by the
-machine from the bars ("this is page 2 of 3, and exactly one bar is filled").
+compact BTECH/MTECH identity blocks with write-in boxes, and a row of
+page-index bars with its own index printed solid. So a continuation page
+that gets separated from its page 1 is attributable by a human from those
+blocks, and verifiable by the machine from the bars ("this is page 2 of 3,
+and exactly one bar is filled").
 See `metrics.py` for why the bubble grid itself is not repeated.
 """
 from __future__ import annotations
@@ -52,10 +53,13 @@ from .flow import FlowResult, LayoutTooTight, MCQEntry, WrittenEntry, flow_sheet
 from .metrics import (
     BTECH_GRID_COLUMNS,
     BTECH_GRID_X_MM,
+    BUBBLE_RADIUS_MM,
+    CONT_BTECH_SELECTOR_X_MM,
+    CONT_MTECH_SELECTOR_X_MM,
+    CONT_PROGRAM_SELECTOR_Y_MM,
+    CONT_BTECH_ROLL_X_MM,
+    CONT_MTECH_ROLL_X_MM,
     CONT_ROLL_CELL_PITCH_MM,
-    CONT_ROLL_CELLS,
-    CONT_ROLL_RIGHT_MM,
-    CONT_NAME_RULE_X_MM,
     CONT_WRITE_IN_TOP_MM,
     DIGIT_COL_PITCH_MM,
     DIGIT_ROW_PITCH_MM,
@@ -64,8 +68,6 @@ from .metrics import (
     MARGIN_MM,
     MTECH_GRID_COLUMNS,
     MTECH_GRID_X_MM,
-    NAME_FIELD_LABEL_W_MM,
-    NAME_FIELD_TOP_MM,
     ORIENTATION_MARKER_SIZE_MM,
     ORIENTATION_MARKER_X_MM,
     ORIENTATION_MARKER_Y_MM,
@@ -89,6 +91,7 @@ __all__ = [
     "MCQEntry",
     "OrientationMarker",
     "PageMark",
+    "ProgramChoice",
     "RollBlockLayout",
     "SheetLayout",
     "WriteInField",
@@ -141,7 +144,8 @@ class WriteInField:
     continuation page has to be reattached to its page 1."""
 
     page: int
-    name: str  # "student_name" | "roll_number"
+    name: str  # "roll_number"
+    program: str | None
     x_mm: float
     y_mm: float  # top edge
     width_mm: float
@@ -149,6 +153,19 @@ class WriteInField:
     cells: int = 1  # >1 draws separate character boxes
     cell_pitch_mm: float = 0.0
     cell_width_mm: float = 0.0
+
+
+@dataclass(frozen=True)
+class ProgramChoice:
+    """Program selector printed on continuation pages. Page 1's selector is
+    part of the machine-read roll block; these compact choices are a human
+    fallback beside the handwritten roll-number boxes."""
+
+    page: int
+    program: str
+    x_mm: float
+    y_mm: float
+    radius_mm: float = BUBBLE_RADIUS_MM
 
 
 @dataclass(frozen=True)
@@ -171,6 +188,7 @@ class RollBlockLayout:
 @dataclass(frozen=True)
 class SheetLayout:
     exam_id: str
+    university_name: str
     course_code: str
     exam_name: str
     exam_type: str
@@ -179,6 +197,7 @@ class SheetLayout:
     fiducials: list[Fiducial]
     orientation_markers: list[OrientationMarker]
     page_marks: list[PageMark]
+    continuation_program_choices: list[ProgramChoice]
     write_in_fields: list[WriteInField]
     roll_block: RollBlockLayout
     mcq_entries: list[MCQEntry]
@@ -238,13 +257,14 @@ def _build_roll_block() -> RollBlockLayout:
     )
 
 
-def _grid_write_in(grid: DigitGrid) -> WriteInField:
+def _grid_write_in(grid: DigitGrid, program: str) -> WriteInField:
     """A row of character cells sitting directly above a digit grid, one per
     column and centered on it, so a student writes the digit and then bubbles
     that same digit in the column underneath."""
     return WriteInField(
         page=1,
         name="roll_number",
+        program=program,
         x_mm=grid.x_mm - WRITE_IN_CELL_W_MM / 2,
         y_mm=ROLL_WRITE_IN_TOP_MM,
         width_mm=(grid.columns - 1) * grid.col_pitch_mm + WRITE_IN_CELL_W_MM,
@@ -256,43 +276,45 @@ def _grid_write_in(grid: DigitGrid) -> WriteInField:
 
 
 def _continuation_write_ins(page: int) -> list[WriteInField]:
-    roll_x = CONT_ROLL_RIGHT_MM - WRITE_IN_CELL_W_MM - (CONT_ROLL_CELLS - 1) * CONT_ROLL_CELL_PITCH_MM
     return [
         WriteInField(
             page=page,
-            name="student_name",
-            x_mm=CONT_NAME_RULE_X_MM,
+            name="roll_number",
+            program="BTECH",
+            x_mm=CONT_BTECH_ROLL_X_MM,
             y_mm=CONT_WRITE_IN_TOP_MM,
-            # Stop well short of the roll cells so the two labels can't collide.
-            width_mm=roll_x - 26.0 - CONT_NAME_RULE_X_MM,
+            width_mm=(BTECH_GRID_COLUMNS - 1) * CONT_ROLL_CELL_PITCH_MM + WRITE_IN_CELL_W_MM,
             height_mm=WRITE_IN_HEIGHT_MM,
+            cells=BTECH_GRID_COLUMNS,
+            cell_pitch_mm=CONT_ROLL_CELL_PITCH_MM,
+            cell_width_mm=WRITE_IN_CELL_W_MM,
         ),
         WriteInField(
             page=page,
             name="roll_number",
-            x_mm=roll_x,
+            program="MTECH",
+            x_mm=CONT_MTECH_ROLL_X_MM,
             y_mm=CONT_WRITE_IN_TOP_MM,
-            width_mm=(CONT_ROLL_CELLS - 1) * CONT_ROLL_CELL_PITCH_MM + WRITE_IN_CELL_W_MM,
+            width_mm=(MTECH_GRID_COLUMNS - 1) * CONT_ROLL_CELL_PITCH_MM + WRITE_IN_CELL_W_MM,
             height_mm=WRITE_IN_HEIGHT_MM,
-            cells=CONT_ROLL_CELLS,
+            cells=MTECH_GRID_COLUMNS,
             cell_pitch_mm=CONT_ROLL_CELL_PITCH_MM,
             cell_width_mm=WRITE_IN_CELL_W_MM,
         ),
     ]
 
 
+def _continuation_program_choices(page: int) -> list[ProgramChoice]:
+    return [
+        ProgramChoice(page=page, program="BTECH", x_mm=CONT_BTECH_SELECTOR_X_MM, y_mm=CONT_PROGRAM_SELECTOR_Y_MM),
+        ProgramChoice(page=page, program="MTECH", x_mm=CONT_MTECH_SELECTOR_X_MM, y_mm=CONT_PROGRAM_SELECTOR_Y_MM),
+    ]
+
+
 def _build_write_in_fields(roll_block: RollBlockLayout, num_pages: int) -> list[WriteInField]:
     fields = [
-        WriteInField(
-            page=1,
-            name="student_name",
-            x_mm=MARGIN_MM + NAME_FIELD_LABEL_W_MM,
-            y_mm=NAME_FIELD_TOP_MM,
-            width_mm=PAGE_WIDTH_MM - MARGIN_MM - (MARGIN_MM + NAME_FIELD_LABEL_W_MM),
-            height_mm=WRITE_IN_HEIGHT_MM,
-        ),
-        _grid_write_in(roll_block.btech_digits),
-        _grid_write_in(roll_block.mtech_digits),
+        _grid_write_in(roll_block.btech_digits, "BTECH"),
+        _grid_write_in(roll_block.mtech_digits, "MTECH"),
     ]
     for page in range(2, num_pages + 1):
         fields.extend(_continuation_write_ins(page))
@@ -313,6 +335,7 @@ def build_layout(config) -> SheetLayout:  # config: ExamConfig, typed loosely to
 
     return SheetLayout(
         exam_id=config.exam_id,
+        university_name=config.university_name,
         course_code=config.course_code,
         exam_name=config.exam_name,
         exam_type=config.exam_type,
@@ -323,6 +346,9 @@ def build_layout(config) -> SheetLayout:  # config: ExamConfig, typed loosely to
             OrientationMarker(page, ORIENTATION_MARKER_X_MM, ORIENTATION_MARKER_Y_MM) for page in pages
         ],
         page_marks=[m for page in pages for m in _page_marks(page, flow.num_pages)],
+        continuation_program_choices=[
+            choice for page in range(2, flow.num_pages + 1) for choice in _continuation_program_choices(page)
+        ],
         write_in_fields=_build_write_in_fields(roll_block, flow.num_pages),
         roll_block=roll_block,
         mcq_entries=flow.mcq_entries,

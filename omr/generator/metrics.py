@@ -17,17 +17,17 @@ Vertical structure of a page, top to bottom:
          title / course / exam id / total marks / page x of y
          instructions
     ---- IDENTITY_BOX_TOP  bordered identity block
-         page 1:  name rule, program bubbles, roll write-in cells,
-                  the two 0-9 digit grids            (ends ~127mm)
-         page 2+: name rule + roll write-in cells    (ends 43mm)
+         page 1:  program bubbles, roll write-in cells,
+                  the two 0-9 digit grids            (ends ~120mm)
+         page 2+: compact program + roll boxes       (ends 50mm)
     ---- content_top_mm()   questions start here, and flow down
          Section A MCQs, then Section B written answers, continuously
     ---- PAGE_BOTTOM_MM --  top of the bottom markers' quiet zones (274.5mm)
     ---- 287mm -----------  printer-safe margin: no ink at all below here
 
 The two identity bands are why page 1 holds fewer questions than a
-continuation page: 132.5mm of page 1 is spent on the bubbled roll-number
-grid, versus 48mm on a continuation page's write-in strip.
+continuation page: 124.5mm of page 1 is spent on the bubbled roll-number
+grid, versus 55mm on a continuation page's write-in strip.
 """
 from __future__ import annotations
 
@@ -119,14 +119,16 @@ BUBBLE_SAMPLE_RATIO = 0.72
 BUBBLE_SAMPLE_RADIUS_MM = BUBBLE_RADIUS_MM * BUBBLE_SAMPLE_RATIO
 
 # ---------------------------------------------------------------------------
-# Header band (both page kinds)
+# Header band
 # ---------------------------------------------------------------------------
-# 27.0 is the highest a left-aligned 13pt title can sit: its cap height
-# reaches 22.4mm, and the top-left marker's quiet zone ends at 22.5mm.
-HEADER_TITLE_Y_MM = 27.0
-HEADER_META_Y_MM = 32.5
-HEADER_INSTRUCTION_Y_MM = 37.0
-HEADER_INSTRUCTION2_Y_MM = 40.5
+# 25.8 is the highest a 10pt centered university line can sit: it clears the
+# top marker quiet zone while still leaving room for the exam title below.
+HEADER_UNIVERSITY_Y_MM = 25.8
+HEADER_TITLE_Y_MM = 30.0
+HEADER_META_Y_MM = 34.0
+HEADER_INSTRUCTION_Y_MM = 37.4
+HEADER_INSTRUCTION2_Y_MM = 40.3
+CONT_HEADER_Y_MM = 27.0
 
 # ---------------------------------------------------------------------------
 # Identity block — page 1 (the machine-read one)
@@ -137,20 +139,17 @@ WRITE_IN_CELL_W_MM = 7.0
 IDENTITY_BOX_TOP_MM = 42.5  # border around the whole identity block
 IDENTITY_BOX_PAD_MM = 1.5  # blank paper between the last bubble row and the border
 
-NAME_FIELD_TOP_MM = 44.0
-NAME_FIELD_LABEL_W_MM = 16.0
-
 # The program bubble sits on the same row as its grid's title, immediately
 # left of it — both so a student can't mistake which grid a selector belongs
 # to, and because a separate selector row cost ~6mm of a page that has to
 # fit an entire midsem.
-PROGRAM_SELECTOR_Y_MM = 55.5
+PROGRAM_SELECTOR_Y_MM = 47.5
 ROLL_GRID_TITLE_Y_MM = PROGRAM_SELECTOR_Y_MM
-ROLL_WRITE_IN_TOP_MM = 59.0
+ROLL_WRITE_IN_TOP_MM = 51.0
 
 DIGIT_COL_PITCH_MM = 10.0
 DIGIT_ROW_PITCH_MM = 6.0  # 4mm bubble + 2mm clear between rows
-ROLL_BLOCK_TOP_MM = 70.0  # center of the digit-0 row
+ROLL_BLOCK_TOP_MM = 62.0  # center of the digit-0 row
 DIGIT_ROW_LABEL_DX_MM = 7.5  # row label sits this far LEFT of column 0
 
 BTECH_GRID_X_MM = 28.0
@@ -161,7 +160,7 @@ MTECH_GRID_COLUMNS = 5
 # ---------------------------------------------------------------------------
 # Identity block — pages 2+ (the human-read one)
 # ---------------------------------------------------------------------------
-# Continuation pages carry a name and roll-number write-in strip, not a
+# Continuation pages carry a roll-number write-in strip, not a
 # second bubble grid. Repeating the grid would cost ~85mm of every page and
 # ask a student to bubble the same seven digits two or three more times —
 # and every extra bubbling is another chance to produce a page that
@@ -170,12 +169,14 @@ MTECH_GRID_COLUMNS = 5
 # (CLAUDE.md Section 6, step 5), and the page-index bars above are what let
 # the reader verify a page group mechanically.
 CONT_IDENTITY_TOP_MM = 31.0
-CONT_IDENTITY_HEIGHT_MM = 12.0
-CONT_WRITE_IN_TOP_MM = 33.0
-CONT_ROLL_CELLS = 7  # "MT" + 5 digits is also exactly 7 characters
-CONT_ROLL_CELL_PITCH_MM = 8.5
-CONT_ROLL_RIGHT_MM = PAGE_WIDTH_MM - MARGIN_MM - 3.5
-CONT_NAME_RULE_X_MM = MARGIN_MM + 20.0
+CONT_IDENTITY_HEIGHT_MM = 19.0
+CONT_PROGRAM_SELECTOR_Y_MM = 35.0
+CONT_WRITE_IN_TOP_MM = 39.5
+CONT_ROLL_CELL_PITCH_MM = 12.0
+CONT_BTECH_ROLL_X_MM = MARGIN_MM + 6.0
+CONT_MTECH_ROLL_X_MM = MARGIN_MM + 120.0
+CONT_BTECH_SELECTOR_X_MM = CONT_BTECH_ROLL_X_MM + BUBBLE_RADIUS_MM
+CONT_MTECH_SELECTOR_X_MM = CONT_MTECH_ROLL_X_MM + BUBBLE_RADIUS_MM
 
 # ---------------------------------------------------------------------------
 # Question blocks

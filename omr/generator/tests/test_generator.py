@@ -40,6 +40,7 @@ def test_generate_exam_writes_pdf_and_manifest(tmp_path):
 
     manifest = json.loads(result["manifest_path"].read_text())
     assert manifest["exam_id"] == config.exam_id
+    assert manifest["exam"]["university_name"] == config.university_name
     assert manifest["num_pages"] == 1
     assert manifest["page"] == {"width_mm": PAGE_WIDTH_MM, "height_mm": PAGE_HEIGHT_MM}
     assert len(manifest["mcq_block"]) == 20

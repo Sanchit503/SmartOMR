@@ -5,6 +5,7 @@ reportlab>=4.1
 numpy>=1.26
 pillow>=10.2
 pydantic>=2.6
+opencv-python>=4.10
 
 # Testing / verification. pymupdf rasterizes a generated PDF back to an
 # image so tests can check what actually prints, not just what the layout

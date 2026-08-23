@@ -68,22 +68,51 @@ def test_every_page_carries_a_roll_number_field(sheet):
         assert fields, f"page {page} has no roll-number field"
 
 
-def test_every_page_carries_a_name_field(sheet):
-    layout, _manifest = sheet
-    for page in range(1, layout.num_pages + 1):
-        assert any(
-            f.page == page and f.name == "student_name" for f in layout.write_in_fields
-        ), f"page {page} has no name field"
+def test_no_page_carries_a_name_field(sheet):
+    layout, manifest = sheet
+    assert all(f.name != "student_name" for f in layout.write_in_fields)
+    assert all(f["name"] != "student_name" for f in manifest["write_in_fields"])
 
 
 def test_the_roll_strip_holds_a_btech_and_an_mtech_roll_number(sheet):
-    """BTech is 7 digits; MTech is "MT" + 5 digits, which is also 7 characters.
-    One 7-cell strip serves both, which is why it is 7 and not 5."""
-    layout, _manifest = sheet
-    assert len(BTECH_EXAMPLE) == len(MTECH_EXAMPLE) == 7
+    """BTech gets 7 digit boxes; MTech gets 5 because the MT prefix is chosen
+    by the program bubble."""
+    layout, manifest = sheet
+    assert len(BTECH_EXAMPLE) == 7
+    assert len(MTECH_EXAMPLE.removeprefix("MT")) == 5
     for page in range(2, layout.num_pages + 1):
-        strip = next(f for f in layout.write_in_fields if f.page == page and f.name == "roll_number")
-        assert strip.cells >= 7, f"page {page}'s roll strip has only {strip.cells} cells"
+        strips = {
+            f.program: f for f in layout.write_in_fields if f.page == page and f.name == "roll_number"
+        }
+        assert strips["BTECH"].cells == 7
+        assert strips["MTECH"].cells == 5
+        assert strips["BTECH"].cell_pitch_mm - strips["BTECH"].cell_width_mm >= 4.5
+        assert strips["MTECH"].cell_pitch_mm - strips["MTECH"].cell_width_mm >= 4.5
+        gap = strips["MTECH"].x_mm - (strips["BTECH"].x_mm + strips["BTECH"].width_mm)
+        assert gap >= 25.0
+        manifest_strips = {
+            f["program"]: f for f in manifest["write_in_fields"] if f["page"] == page and f["name"] == "roll_number"
+        }
+        assert manifest_strips["BTECH"]["cells"] == 7
+        assert manifest_strips["MTECH"]["cells"] == 5
+
+
+def test_continuation_pages_carry_btech_and_mtech_choices(sheet):
+    layout, manifest = sheet
+    for page in range(2, layout.num_pages + 1):
+        choices_by_program = {
+            c.program: c for c in layout.continuation_program_choices if c.page == page
+        }
+        assert sorted(choices_by_program) == ["BTECH", "MTECH"]
+        manifest_choices = sorted(
+            c["program"] for c in manifest["continuation_program_choices"] if c["page"] == page
+        )
+        assert manifest_choices == ["BTECH", "MTECH"]
+        top, bottom = identity_box(page)
+        strips = [f for f in layout.write_in_fields if f.page == page and f.name == "roll_number"]
+        assert min(c.y_mm - c.radius_mm for c in choices_by_program.values()) >= top + 1.5
+        assert min(f.y_mm for f in strips) - max(c.y_mm + c.radius_mm for c in choices_by_program.values()) >= 2.0
+        assert max(f.y_mm + f.height_mm for f in strips) <= bottom - 1.5
 
 
 def test_only_page_one_carries_the_bubbled_grid(sheet):
@@ -106,6 +135,8 @@ def test_the_identity_block_never_reaches_into_the_question_area(sheet):
             assert e.y_mm > bottom
         for f in (f for f in layout.write_in_fields if f.page == page):
             assert f.y_mm + f.height_mm <= bottom + 1e-6
+        for c in (c for c in layout.continuation_program_choices if c.page == page):
+            assert c.y_mm + c.radius_mm <= bottom + 1e-6
 
 
 # ---------------------------------------------------------------------------
@@ -176,6 +207,18 @@ def test_a_page_with_no_roll_field_is_rejected(sheet):
         f for f in manifest["write_in_fields"] if not (f["page"] == 2 and f["name"] == "roll_number")
     ]
     with pytest.raises(ManifestError, match="unattributable"):
+        validate_manifest(manifest)
+
+
+def test_a_continuation_page_missing_a_program_choice_is_rejected(sheet):
+    _layout, manifest = sheet
+    if manifest["num_pages"] < 2:
+        pytest.skip("needs a continuation page")
+    manifest["continuation_program_choices"] = [
+        c for c in manifest["continuation_program_choices"]
+        if not (c["page"] == 2 and c["program"] == "MTECH")
+    ]
+    with pytest.raises(ManifestError, match="program choices"):
         validate_manifest(manifest)
 
 

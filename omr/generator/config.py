@@ -6,6 +6,7 @@ from typing import Literal
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 ExamType = Literal["quiz", "midsem", "endsem"]
+DEFAULT_UNIVERSITY_NAME = "IIIT Delhi"
 
 
 class WrittenQuestionConfig(BaseModel):
@@ -16,6 +17,7 @@ class WrittenQuestionConfig(BaseModel):
 
 class ExamConfig(BaseModel):
     exam_id: str
+    university_name: str = DEFAULT_UNIVERSITY_NAME
     course_code: str
     exam_name: str
     exam_type: ExamType

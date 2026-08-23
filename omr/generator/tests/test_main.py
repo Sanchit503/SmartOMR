@@ -55,6 +55,7 @@ def test_wizard_asks_once_when_written_questions_are_uniform(monkeypatch):
     feed(
         monkeypatch,
         [
+            "",                           # university name defaults to IIIT Delhi
             "CS301",                      # course code
             "Mid-Semester Examination",   # exam name
             "midsem",                     # exam type
@@ -69,6 +70,7 @@ def test_wizard_asks_once_when_written_questions_are_uniform(monkeypatch):
         ],
     )
     config = prompt_for_config()
+    assert config.university_name == "IIIT Delhi"
     assert config.num_mcq == 20
     assert [(w.q_no, w.max_marks, w.lines) for w in config.written_questions] == [
         (21, 5, 2),
@@ -81,7 +83,7 @@ def test_wizard_asks_per_question_when_they_differ(monkeypatch):
     feed(
         monkeypatch,
         [
-            "CS301", "Mid-Semester Examination", "midsem", "CS301_MIDSEM_2026A",
+            "", "CS301", "Mid-Semester Examination", "midsem", "CS301_MIDSEM_2026A",
             "20", "4", "1",
             "3",                          # how many written questions
             "n",                          # they differ
@@ -107,7 +109,7 @@ def test_wizard_and_config_file_produce_identical_sheets(monkeypatch, tmp_path):
     feed(
         monkeypatch,
         [
-            "CS301", "Mid-Semester Examination", "midsem", "CS301_MIDSEM_2026A",
+            "", "CS301", "Mid-Semester Examination", "midsem", "CS301_MIDSEM_2026A",
             "20", "4", "1",
             "3", "n", "5", "2", "5", "2", "10", "4",
         ],
@@ -122,6 +124,7 @@ def test_defaults_keep_a_bare_mcq_only_quiz_to_one_page(monkeypatch, tmp_path):
     feed(
         monkeypatch,
         [
+            "",                       # university name defaults to IIIT Delhi
             "CS201", "Quiz 3", "",   # exam type defaults to quiz
             "",                       # exam id defaults to CS201_QUIZ
             "10", "", "2",            # 10 MCQs, default 4 options, 2 marks each

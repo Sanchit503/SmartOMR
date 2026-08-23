@@ -11,6 +11,7 @@ import pytest
 
 from omr.generator.config import ExamConfig, WrittenQuestionConfig
 from omr.generator.generate import generate_exam
+from omr.generator.metrics import HEADER_UNIVERSITY_Y_MM
 from omr.generator.preflight import PREFLIGHT_DPI, check_sheet
 
 
@@ -53,7 +54,8 @@ def test_a_bubble_moved_onto_printed_text_is_caught(sheet):
     parks a bubble on top of something already inked. Every arithmetic
     assertion in the suite still passes; only the pixels disagree."""
     pdf, manifest = sheet
-    manifest["mcq_block"][0]["y_mm"] = 24.0  # onto the title text
+    manifest["mcq_block"][0]["x_mm"] = manifest["page"]["width_mm"] / 2 - manifest["mcq_label_offset_mm"]
+    manifest["mcq_block"][0]["y_mm"] = HEADER_UNIVERSITY_Y_MM  # onto the centered university text
     report = check_sheet(pdf, manifest)
     assert not report.ok
     assert any("print empty" in e.check for e in report.errors), report.format()

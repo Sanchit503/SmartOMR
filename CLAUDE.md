@@ -103,6 +103,7 @@ ReEvalRequest
 ```json
 {
   "exam_id": "CS301_MIDSEM_2026A",
+  "university_name": "IIIT Delhi",
   "course_code": "CS301",
   "exam_name": "Mid-Semester Examination",
   "exam_type": "midsem",
@@ -313,8 +314,9 @@ then Section B (written) starting in whatever space is left on the same page, br
 new page only when the next question does not fit. There is exactly one placement algorithm
 (`flow.py`) for every exam, because two of them disagreed and produced half-empty pages.
 
-**Identity per page (settled):** every page carries a handwritten name + 7-cell roll-number
-strip and a row of page-index bars with its own index printed solid. The *bubbled* roll-number
+**Identity per page (settled):** every page carries compact BTECH and MTECH identity blocks:
+BTECH has 7 write-in boxes; MTECH has 5 because the `MT` prefix is implied by the selector. It also
+has a row of page-index bars with its own index printed solid. The *bubbled* roll-number
 grid is on page 1 only — repeating it costs ~85mm a page and invites a continuation page that
 contradicts page 1. The manifest schema enforces both (every page must have a roll-number
 field, exactly one filled page bar at its own index, and at least one question).

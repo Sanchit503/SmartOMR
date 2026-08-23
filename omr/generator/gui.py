@@ -27,7 +27,7 @@ from tkinter import (
 
 from pydantic import ValidationError
 
-from .config import ExamConfig, WrittenQuestionConfig
+from .config import DEFAULT_UNIVERSITY_NAME, ExamConfig, WrittenQuestionConfig
 from .generate import generate_exam
 
 DEFAULT_OUTPUT_DIR = Path(__file__).resolve().parents[2] / "data" / "exams"
@@ -57,7 +57,7 @@ class OMRGeneratorApp:
     def __init__(self, root: Tk):
         self.root = root
         root.title("SmartOMR — Sheet Generator")
-        root.geometry("620x640")
+        root.geometry("620x670")
         root.minsize(560, 480)
 
         self.written_rows: list[WrittenQuestionRow] = []
@@ -66,16 +66,17 @@ class OMRGeneratorApp:
         form.pack(fill="x")
 
         self.exam_id = self._field(form, 0, "Exam ID", "CS301_MIDSEM_2026A")
-        self.course_code = self._field(form, 1, "Course Code", "CS301")
-        self.exam_name = self._field(form, 2, "Exam Name", "Mid-Semester Examination")
+        self.university_name = self._field(form, 1, "University Name", DEFAULT_UNIVERSITY_NAME)
+        self.course_code = self._field(form, 2, "Course Code", "CS301")
+        self.exam_name = self._field(form, 3, "Exam Name", "Mid-Semester Examination")
 
-        Label(form, text="Exam Type").grid(row=3, column=0, sticky="w", pady=4)
+        Label(form, text="Exam Type").grid(row=4, column=0, sticky="w", pady=4)
         self.exam_type = StringVar(value="quiz")
-        OptionMenu(form, self.exam_type, "quiz", "midsem", "endsem").grid(row=3, column=1, sticky="w")
+        OptionMenu(form, self.exam_type, "quiz", "midsem", "endsem").grid(row=4, column=1, sticky="w")
 
-        self.num_mcq = self._field(form, 4, "Number of MCQs", "20")
-        self.mcq_options = self._field(form, 5, "Options per MCQ (2-6)", "4")
-        self.marks_per_mcq = self._field(form, 6, "Marks per MCQ", "1")
+        self.num_mcq = self._field(form, 5, "Number of MCQs", "20")
+        self.mcq_options = self._field(form, 6, "Options per MCQ (2-6)", "4")
+        self.marks_per_mcq = self._field(form, 7, "Marks per MCQ", "1")
 
         section_label = Frame(root, padx=14)
         section_label.pack(fill="x")
@@ -167,6 +168,7 @@ class OMRGeneratorApp:
         try:
             config = ExamConfig(
                 exam_id=self.exam_id.get().strip(),
+                university_name=self.university_name.get().strip(),
                 course_code=self.course_code.get().strip(),
                 exam_name=self.exam_name.get().strip(),
                 exam_type=self.exam_type.get(),

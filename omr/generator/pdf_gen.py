@@ -22,16 +22,17 @@ from reportlab.pdfgen import canvas
 from .layout import SheetLayout
 from .metrics import (
     BUBBLE_RADIUS_MM,
+    CONT_HEADER_Y_MM,
     DIGIT_ROW_LABEL_DX_MM,
     HEADER_INSTRUCTION2_Y_MM,
     HEADER_INSTRUCTION_Y_MM,
     HEADER_META_Y_MM,
     HEADER_TITLE_Y_MM,
+    HEADER_UNIVERSITY_Y_MM,
     MARGIN_MM,
     MCQ_LABEL_OFFSET_MM,
     MCQ_OPTION_HEADER_MM,
     MCQ_OPTION_PITCH_MM,
-    NAME_FIELD_LABEL_W_MM,
     PAGE_HEIGHT_MM,
     PAGE_WIDTH_MM,
     WRITTEN_HEADER_MM,
@@ -52,7 +53,7 @@ INSTRUCTION_LINE_1 = (
 )
 INSTRUCTION_LINE_2 = (
     "Bubble your program, then write and bubble your roll number in THAT program's grid only. "
-    "Write your name and roll number on every page of this sheet."
+    "Write your roll number on every page of this sheet."
 )
 
 
@@ -82,6 +83,19 @@ def _draw_fitted(
         size = max(MIN_FONT_PT, size * limit / width)
     c.setFont(font, size)
     c.drawString(x_mm * mm, _y(y_mm), text)
+
+
+def _draw_centered_fitted(
+    c: canvas.Canvas, y_mm: float, text: str, font: str, size: float, max_width_mm: float
+) -> None:
+    if not text:
+        return
+    limit = max_width_mm * mm
+    width = c.stringWidth(text, font, size)
+    if width > limit:
+        size = max(MIN_FONT_PT, size * limit / width)
+    c.setFont(font, size)
+    c.drawCentredString((PAGE_WIDTH_MM / 2) * mm, _y(y_mm), text)
 
 
 def render_pdf(layout: SheetLayout, output_path: str | Path) -> Path:
@@ -155,7 +169,7 @@ def _draw_header(c: canvas.Canvas, layout: SheetLayout, page_no: int) -> None:
 
     # Right-aligned page counter, on the same line as the leftmost header text.
     page_label = f"Page {page_no} of {layout.num_pages}" if layout.num_pages > 1 else ""
-    counter_y = HEADER_META_Y_MM if page_no == 1 else HEADER_TITLE_Y_MM
+    counter_y = HEADER_META_Y_MM if page_no == 1 else CONT_HEADER_Y_MM
     reserved = 0.0
     if page_label:
         reserved = c.stringWidth(page_label, "Helvetica", 9.5) / mm + 6.0
@@ -164,14 +178,15 @@ def _draw_header(c: canvas.Canvas, layout: SheetLayout, page_no: int) -> None:
 
     if page_no > 1:
         one_line = f"{layout.exam_name}   |   {layout.course_code}   |   {layout.exam_id}   |   {total} marks"
-        _draw_fitted(c, MARGIN_MM, HEADER_TITLE_Y_MM, one_line, "Helvetica-Bold", 10.5, usable - reserved)
+        _draw_fitted(c, MARGIN_MM, CONT_HEADER_Y_MM, one_line, "Helvetica-Bold", 10.5, usable - reserved)
         return
 
-    _draw_fitted(c, MARGIN_MM, HEADER_TITLE_Y_MM, layout.exam_name, "Helvetica-Bold", 13, usable)
+    _draw_centered_fitted(c, HEADER_UNIVERSITY_Y_MM, layout.university_name, "Helvetica-Bold", 10.5, usable)
+    _draw_fitted(c, MARGIN_MM, HEADER_TITLE_Y_MM, layout.exam_name, "Helvetica-Bold", 11.5, usable)
     meta = f"{layout.course_code}  |  Exam ID: {layout.exam_id}  |  Total: {total} marks"
-    _draw_fitted(c, MARGIN_MM, HEADER_META_Y_MM, meta, "Helvetica", 9.5, usable - reserved)
-    _draw_fitted(c, MARGIN_MM, HEADER_INSTRUCTION_Y_MM, INSTRUCTION_LINE_1, "Helvetica", 7.5, usable)
-    _draw_fitted(c, MARGIN_MM, HEADER_INSTRUCTION2_Y_MM, INSTRUCTION_LINE_2, "Helvetica", 7.5, usable)
+    _draw_fitted(c, MARGIN_MM, HEADER_META_Y_MM, meta, "Helvetica", 9.0, usable - reserved)
+    _draw_fitted(c, MARGIN_MM, HEADER_INSTRUCTION_Y_MM, INSTRUCTION_LINE_1, "Helvetica", 7.0, usable)
+    _draw_fitted(c, MARGIN_MM, HEADER_INSTRUCTION2_Y_MM, INSTRUCTION_LINE_2, "Helvetica", 7.0, usable)
 
 
 # ---------------------------------------------------------------------------
@@ -209,11 +224,6 @@ def _draw_identity_block(c: canvas.Canvas, layout: SheetLayout) -> None:
     c.setFillColorRGB(0, 0, 0)
     _draw_identity_border(c, 1)
 
-    name_field = next(f for f in layout.write_in_fields if f.page == 1 and f.name == "student_name")
-    c.setFont("Helvetica-Bold", 9)
-    c.drawString(MARGIN_MM * mm, _y(name_field.y_mm + name_field.height_mm - 1.5), "Name")
-    _draw_write_in(c, name_field)
-
     # Selector bubble and grid title share a row: "(o) BTECH - BTech Roll No."
     # so there is no doubt which grid a selector governs.
     grids = (
@@ -249,20 +259,30 @@ def _draw_identity_block(c: canvas.Canvas, layout: SheetLayout) -> None:
 
 def _draw_continuation_identity(c: canvas.Canvas, layout: SheetLayout, page_no: int) -> None:
     """Continuation pages carry no bubble grid, but they do carry the
-    handwritten name and roll number — a page that gets separated from its
-    page 1 is otherwise unattributable to any student."""
+    program choice and handwritten roll number for human review if a page is
+    separated."""
     c.setFillColorRGB(0, 0, 0)
     _draw_identity_border(c, page_no)
 
-    for fld in layout.write_in_fields:
-        if fld.page != page_no:
-            continue
-        c.setFont("Helvetica-Bold", 8.5)
-        baseline = _y(fld.y_mm + fld.height_mm - 1.5)
-        if fld.name == "student_name":
-            c.drawString((fld.x_mm - NAME_FIELD_LABEL_W_MM) * mm, baseline, "Name")
-        else:
-            c.drawRightString((fld.x_mm - 2.5) * mm, baseline, "Roll No.")
+    fields = [fld for fld in layout.write_in_fields if fld.page == page_no]
+    choices = [choice for choice in layout.continuation_program_choices if choice.page == page_no]
+
+    if choices:
+        c.setLineWidth(1)
+        titles = {
+            "BTECH": "BTech Roll No.  (7 digits)",
+            "MTECH": "MTech Roll No.  (MT + 5 digits)",
+        }
+        for choice in sorted(choices, key=lambda c: c.x_mm):
+            c.circle(choice.x_mm * mm, _y(choice.y_mm), choice.radius_mm * mm, stroke=1, fill=0)
+            text_x = choice.x_mm + choice.radius_mm + 2.0
+            text_y = _y(choice.y_mm) - 3
+            c.setFont("Helvetica-Bold", 7.8)
+            c.drawString(text_x * mm, text_y, choice.program)
+            title_x = text_x + c.stringWidth(choice.program, "Helvetica-Bold", 7.8) / mm + 3.0
+            c.drawString(title_x * mm, text_y, titles[choice.program])
+
+    for fld in fields:
         _draw_write_in(c, fld)
 
 

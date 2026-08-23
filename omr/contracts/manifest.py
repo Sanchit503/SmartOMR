@@ -27,7 +27,10 @@ from pathlib import Path
 #           metadata one: a v2 sheet has no bars on it, so a v3 reader looking
 #           for them would find blank paper and conclude the page index is
 #           unreadable.
-MANIFEST_SCHEMA_VERSION = 3
+# v4 added: continuation_program_choices, so continuation pages carry compact
+#           BTECH/MTECH selectors beside their write-in roll-number boxes
+#           without repeating the full digit grid.
+MANIFEST_SCHEMA_VERSION = 4
 
 _TOP_LEVEL_KEYS = (
     "exam_id",
@@ -42,6 +45,7 @@ _TOP_LEVEL_KEYS = (
     "fiducials",
     "orientation_marker",
     "page_marks",
+    "continuation_program_choices",
     "write_in_fields",
     "roll_number_block",
     "mcq_block",
@@ -100,6 +104,17 @@ def _validate_page_identity(manifest: dict, page: int) -> None:
             f"page {page} carries no roll-number field at all — a page separated from its sheet "
             "would be unattributable to any student"
         )
+    if page > 1:
+        programs = {
+            c.get("program")
+            for c in manifest["continuation_program_choices"]
+            if c.get("page", 1) == page
+        }
+        if programs != {"BTECH", "MTECH"}:
+            raise ManifestError(
+                f"page {page} has continuation program choices {sorted(programs)}, expected "
+                "BTECH and MTECH so a separated page can be matched to the right roll-number format"
+            )
 
 
 def _validate_page_has_content(manifest: dict, page: int) -> None:
