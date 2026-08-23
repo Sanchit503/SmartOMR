@@ -1,5 +1,5 @@
 """Assembles a complete SheetLayout — the single source of truth for where
-every mark on the sheet goes (CLAUDE.md Sections 4.2-4.4).
+every mark on the sheet goes (PROJECT_SPEC.md Sections 4.2-4.4).
 
 Both `pdf_gen.render_pdf` (what gets printed) and `manifest.build_manifest`
 (what the parser reads) consume the same `SheetLayout` object, so the two can

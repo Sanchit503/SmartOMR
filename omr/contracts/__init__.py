@@ -5,7 +5,7 @@ directly: the page geometry, the mm->px conversion, and the manifest
 schema. Everything else — bubble sizes, block positions, option pitch — is
 a layout decision the generator makes and *publishes through the manifest*,
 so the reader learns it at parse time instead of sharing a constant
-(CLAUDE.md Section 2, principle 1).
+(PROJECT_SPEC.md Section 2, principle 1).
 
 The dependency direction matters: `omr.generator` and `omr.grading` both
 import from here, and nothing here imports from either. That's what keeps

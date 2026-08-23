@@ -1,6 +1,5 @@
-# SmartOMR — Phase 1 (generator + MCQ grading) dependencies.
-# OpenCV will be added in Phase 2 once real scan/photo canonicalization
-# (perspective correction) is implemented — not needed before that.
+# SmartOMR dependencies: generator, MCQ grading, and the Phase 2 scan-evaluation
+# prototype promoted under omr.reader.
 reportlab>=4.1
 numpy>=1.26
 pillow>=10.2
@@ -9,7 +8,7 @@ opencv-python>=4.10
 
 # Testing / verification. pymupdf rasterizes a generated PDF back to an
 # image so tests can check what actually prints, not just what the layout
-# engine claims — it's also the PDF splitter CLAUDE.md Section 11 calls for
+# engine claims — it's also the PDF splitter PROJECT_SPEC.md Section 11 calls for
 # in Phase 2.
 pytest>=8.0
 pypdf>=4.0

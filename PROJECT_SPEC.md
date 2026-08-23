@@ -1,7 +1,7 @@
 # SmartOMR — OMR-Based Assessment System — Project Specification
 
 **Context:** BTP project, IIIT Delhi. Covers BTech and MTech students only (no PhD).
-**Purpose of this document:** hand this to Claude Code (or any coding assistant) as persistent project context. Read the whole thing before writing any code — the module boundaries and shared schemas in Sections 3–4 are what make the rest of the pipeline work.
+**Purpose of this document:** hand this to a coding assistant as persistent project context. Read the whole thing before writing any code — the module boundaries and shared schemas in Sections 3–4 are what make the rest of the pipeline work.
 
 ---
 
@@ -213,7 +213,7 @@ Straightforward once Module 5/6 give you canonical images and manifest coordinat
 2. For each cropped answer, call a vision-capable LLM with: the question text (from the ingested question paper), the max marks, the professor's rubric/model answer, and the cropped image.
 3. Require **structured JSON output** — don't parse free text.
 
-**Example prompt (adapt to whichever provider you use — Claude, GPT-4V, and Gemini all accept an image + text prompt in broadly the same shape):**
+**Example prompt (adapt to whichever vision-capable LLM provider you use; most accept an image + text prompt in broadly the same shape):**
 
 ```
 SYSTEM:
@@ -242,7 +242,7 @@ Marking guideline: {rubric_text}
 ```
 
 4. Anything returned with `needs_human_review: true` (or a parse failure) goes into the same review queue as Module 3/4's flagged items — don't silently accept it.
-5. This module should be built behind a small provider-agnostic interface (`grade_written(image, question, rubric, max_marks) -> GradeResult`) so you can swap Claude/GPT-4V/Gemini without touching the rest of the pipeline — useful since API access/budget for a BTP can change.
+5. This module should be built behind a small provider-agnostic interface (`grade_written(image, question, rubric, max_marks) -> GradeResult`) so you can swap LLM providers without touching the rest of the pipeline — useful since API access/budget for a BTP can change.
 
 ---
 
@@ -284,6 +284,8 @@ The repo is organized by pipeline module, so code is findable by the section num
 
 ```
 omr/
+  models.py     Plain dataclasses shared by the current file-based reader/io/workflow
+                code. These are not the future database models from Section 3.
   contracts/   The ONLY thing the generator and the reader share: page geometry,
                mm<->px conversion, and the manifest schema (Sections 4.4, principle 1).
                Nothing here imports from generator/ or grading/ — that direction is
@@ -298,11 +300,22 @@ omr/
                                identity fields
                  pdf_gen.py    what gets printed        manifest.py  what's published
                  preflight.py  rasterizes the result and proves it is readable
-                 main.py       entry point (wizard / --config / --gui)
+                 main.py       entry point (terminal wizard / --config)
                Run it with `python -m omr.generator.main`.
   grading/     Modules 4/5 (Sections 7-8). Bubble reading + MCQ grading; written-answer
                LLM grading lands here in Phase 3.
-  reader/      Module 2/3 (Sections 5-6). Phase 2 — does not exist yet.
+  reader/      Modules 2/3 prototype (Sections 5-6): scan/PDF loading,
+               fiducial alignment to canonical A4, page-index reading, and
+               roll-number/program decoding.
+  io/          Roster CSV, answer-key CSV, and result CSV helpers.
+  workflows/  File-based workflows that compose contracts + reader + grading + I/O,
+               currently parse.py for canonical pages, identity, MCQs, written
+               crops and JSON artifacts; evaluate.py for the older MCQ summary
+               professor-demo flow.
+
+prototype_eval/
+  Backward-compatible demo CLI, samples, and import shims. Real implementation
+  lives under omr/ now; do not add new production code here.
 ```
 
 Bubble radius, option pitch, and block positions are **layout decisions the generator owns**

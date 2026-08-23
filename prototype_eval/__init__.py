@@ -1,7 +1,8 @@
-"""Prototype scan evaluator for the current SmartOMR sheet format.
+"""Backward-compatible demo entry point for scan evaluation.
 
-This folder is intentionally separate from `omr.generator`: it is the demo
-pipeline for scanned student sheets, professor answer keys, and roster data.
+The implementation has been promoted into `omr.reader`, `omr.io`, and
+`omr.workflows`; this package keeps the original `python -m prototype_eval`
+workflow available for professor demos.
 """
 
 from .pipeline import batch_evaluate, evaluate_scan

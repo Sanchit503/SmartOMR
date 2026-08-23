@@ -6,10 +6,9 @@ and opens the PDF. That's the whole workflow.
 
     python -m omr.generator.main                      # ask me the questions
     python -m omr.generator.main --config quiz.json   # repeatable, from a saved config
-    python -m omr.generator.main --gui                # same thing as a form
 
-Every mode ends up in the same `generate_exam()` call, so a sheet produced
-one way is byte-identical to the same sheet produced another way.
+Both modes end up in the same `generate_exam()` call, so a sheet produced
+from prompts is byte-identical to the same sheet produced from a config file.
 """
 from __future__ import annotations
 
@@ -178,11 +177,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="Generate from a saved JSON exam config instead of asking (Section 4.1 format)",
     )
     parser.add_argument(
-        "--gui",
-        action="store_true",
-        help="Open the form-based desktop window instead of asking in the terminal",
-    )
-    parser.add_argument(
         "--output-dir",
         type=Path,
         default=DEFAULT_OUTPUT_DIR,
@@ -204,15 +198,6 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
 
-    if args.gui:
-        if args.config:
-            print("--gui and --config can't be combined.", file=sys.stderr)
-            return 2
-        from .gui import main as gui_main
-
-        gui_main()
-        return 0
-
     try:
         if args.config:
             if not args.config.exists():
@@ -233,6 +218,14 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         result = generate_exam(config, args.output_dir)
+    except PermissionError as exc:
+        print(
+            "\nCould not write the output file. If the PDF or manifest is open, close it and run "
+            "the generator again. You can also use a different Exam ID or --output-dir.\n"
+            f"Locked path: {exc.filename or exc}",
+            file=sys.stderr,
+        )
+        return 1
     except ValueError as exc:
         # The generator refuses to guess a layout it can't place (Section 2,
         # principle 4), so this is a real hard stop, not a warning.

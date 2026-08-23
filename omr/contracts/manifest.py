@@ -1,4 +1,4 @@
-"""The template manifest schema (CLAUDE.md Section 4.4).
+"""The template manifest schema (PROJECT_SPEC.md Section 4.4).
 
 The manifest is the generator's output *and* the reader's only input for
 bubble/box positions. Both sides go through this module so neither can

@@ -1,4 +1,4 @@
-"""Module 1 — OMR sheet generation (CLAUDE.md Section 4).
+"""Module 1 — OMR sheet generation (PROJECT_SPEC.md Section 4).
 
 Everything needed to turn a professor's exam requirements into a printable
 sheet lives in this folder:
@@ -11,7 +11,7 @@ sheet lives in this folder:
     pdf_gen.py    what gets printed
     manifest.py   what the parser reads (the same SheetLayout, published)
     preflight.py  rasterizes the result and proves it is machine-readable
-    main.py       the entry point; gui.py the desktop form
+    main.py       the terminal entry point
     configs/      worked example configs; tests/ its own tests
 
 Run it with:  python -m omr.generator.main

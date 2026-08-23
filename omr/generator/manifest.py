@@ -1,9 +1,9 @@
-"""Builds a template manifest from a SheetLayout (CLAUDE.md Section 4.4).
+"""Builds a template manifest from a SheetLayout (PROJECT_SPEC.md Section 4.4).
 
 The manifest is the parser's ONLY source of truth for bubble/box positions
 (Section 2, principle 1) — nothing here should ever be re-derived from a
 hardcoded constant on the parsing side. Which is why this file emits rather
-more than the example in CLAUDE.md spells out:
+more than the example in PROJECT_SPEC.md spells out:
 
   bubble_radius_mm         what was printed
   bubble_sample_radius_mm  what the reader should MEASURE — smaller, so the

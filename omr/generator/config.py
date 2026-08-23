@@ -1,4 +1,4 @@
-"""Generator input contract (Section 4.1 of CLAUDE.md)."""
+"""Generator input contract (Section 4.1 of PROJECT_SPEC.md)."""
 from __future__ import annotations
 
 from typing import Literal

@@ -1,4 +1,4 @@
-"""Printable PDF rendering from a SheetLayout (Section 4 of CLAUDE.md).
+"""Printable PDF rendering from a SheetLayout (Section 4 of PROJECT_SPEC.md).
 
 Draws exactly what `manifest.build_manifest` describes, from the same
 `SheetLayout` object, so print output and manifest coordinates can't drift
@@ -145,9 +145,8 @@ def _draw_registration_marks(c: canvas.Canvas, layout: SheetLayout, page_no: int
     # squareness filter must never mistake one for the orientation marker
     # sitting on the same row.
     c.setLineWidth(HAIRLINE_PT)
-    for pm in layout.page_marks:
-        if pm.page != page_no:
-            continue
+    page_marks = [pm for pm in layout.page_marks if pm.page == page_no]
+    for pm in page_marks:
         c.rect(
             (pm.x_mm - pm.width_mm / 2) * mm,
             _y(pm.y_mm + pm.height_mm / 2),

@@ -1,6 +1,15 @@
 # Prototype OMR Evaluator
 
-This is the professor-demo reader for the current SmartOMR sheet format.
+This is the professor-demo CLI for the current SmartOMR sheet format.
+
+The implementation now lives in the main package:
+
+- `omr.reader` — scan/PDF loading, fiducial alignment, page-index bars, roll-number reading
+- `omr.io` — roster, answer-key, and result CSV helpers
+- `omr.workflows` — end-to-end scan evaluation workflow
+
+Keep new production code in `omr/`. This folder remains for sample files and
+the backward-compatible `python -m prototype_eval` command.
 
 It takes:
 
@@ -27,6 +36,7 @@ prototype_eval/
       answer_key.csv
       students.csv
       scans/
+  *.py                          # thin compatibility wrappers over omr/
 ```
 
 The output folder is read from the manifest's `exam_id`, so the scan results

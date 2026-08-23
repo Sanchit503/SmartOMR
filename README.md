@@ -1,20 +1,23 @@
 # SmartOMR
 
 OMR-based assessment system. BTP project, IIIT Delhi. Full spec and module boundaries are in
-[CLAUDE.md](CLAUDE.md) — read that first, it's the persistent design contract for this codebase.
+[PROJECT_SPEC.md](PROJECT_SPEC.md) — read that first, it's the persistent design contract for this codebase.
 
-## Status: Phase 1 in progress
+## Status: Phase 1 complete, Phase 2 prototype underway
 
-Per the roadmap in CLAUDE.md Section 12:
+Per the roadmap in PROJECT_SPEC.md Section 12:
 
-- [x] **Phase 1** — OMR sheet generator + pure MCQ grading pipeline (this repo, no real scanning yet)
-- [ ] Phase 2 — Real scan ingestion (canonicalization + identity resolution + verification email)
+- [x] **Phase 1** — OMR sheet generator + pure MCQ grading pipeline
+- [x] **Phase 2 prototype** — scan/PDF loading, fiducial alignment, page-index reading,
+  roll-number reading, roster CSV matching, and MCQ result export
+- [ ] Phase 2 production hardening — real scan/photo calibration, verification email,
+  persistent review queue, and duplicate-sheet handling
 - [ ] Phase 3 — Written-answer grading (LLM-assisted)
 - [ ] Phase 4 — Marks email, re-eval logging, admin panel
 
 ## Generate a sheet
 
-Double-click **`SmartOMR.bat`**, or:
+Run the terminal wizard:
 
 ```bash
 python -m omr.generator.main
@@ -24,16 +27,15 @@ It asks for the exam requirements one at a time — university name, course code
 MCQs, how many options each, how many written questions and how many lines each — then writes the printable PDF and
 its template manifest into `data/exams/` and opens the PDF.
 
-Two other ways in, same generator underneath:
+For repeatable generation, use a saved config file:
 
 ```bash
 python -m omr.generator.main --config omr/generator/configs/midsem_cs301.json   # repeatable
-python -m omr.generator.main --gui                                              # desktop form
 ```
 
 `--output-dir` changes where files land; `--no-open` skips opening the viewer. A sheet produced
-through any of the three routes is byte-identical to the same sheet produced through the others —
-there's a test that pins that down.
+from prompts is byte-identical to the same sheet produced from a config file; there's a test that
+pins that down.
 
 ### Preflight — how you know the sheet is actually good
 
@@ -58,7 +60,7 @@ every registration marker (the four corners *and* the orientation marker) prints
 paper around it, that the orientation marker is decisive, that each page's index bars identify that
 page and nothing else, that no two bubbles crowd each other, that the PDF's page count matches the
 manifest, and that nothing runs off the page. Anything fatal prints `DO NOT PRINT` and exits
-non-zero; the GUI shows the same report in an error dialog and won't open the PDF.
+non-zero.
 
 This exists because the layout engine can only check its own arithmetic. The failures that actually
 break an OMR sheet — a glyph on top of a fiducial, a label inside a bubble — pass every coordinate
@@ -103,6 +105,34 @@ manifest that has drifted away from the printed sheet still round-trips; catchin
 preflight's job. And there's no perspective, lighting, or toner spread here — the thresholds are
 calibrated against clean renders and need re-checking against real scans in Phase 2.
 
+## Parse a filled sheet
+
+Once you have a filled scan/photo PDF or image and its matching manifest, parse it with:
+
+```bash
+python -m omr.workflows.parse \
+  --manifest data/exams/CSE202_Quiz_1.manifest.json \
+  --scans scans/ \
+  --students students.csv \
+  --answer-key answer_key.csv
+```
+
+`--scans` can be one image/PDF or a folder of them. `--students` and `--answer-key` are optional:
+without them the parser still aligns pages, reads identity bubbles as far as it can, reads MCQs, and
+crops written answers, but it cannot roster-match or score MCQs.
+
+The parser writes to `data/parsed/<exam_id>/` by default:
+
+```text
+parse_index.json                 batch summary
+sheets/<scan_id>/parse.json       full debug/result JSON for one sheet
+sheets/<scan_id>/pages/page_1.png canonical aligned page image
+sheets/<scan_id>/written/Q11.png  written-answer crop
+```
+
+This is intentionally a parser, not the final grader. Written answers are cropped and saved for the
+future LLM/manual-grading step; no written marks are awarded here.
+
 ## Printing
 
 The sheet is laid out for **ordinary A4 printers** and never relies on borderless printing.
@@ -144,11 +174,12 @@ on every copy. That's why markers get the extra 2mm, and why preflight refuses r
 
 ```
 omr/
+  models.py       Small file-workflow dataclasses shared by reader/io/workflows
   contracts/     The shared truth between the sheet generator and the sheet reader.
     geometry.py    Page size, mm <-> px conversion (Section 4.4)
     manifest.py    Manifest schema, version, load + validate
   generator/     Module 1 — everything that MAKES a sheet (Section 4)
-    main.py        Entry point: wizard / --config / --gui
+    main.py        Entry point: terminal wizard / --config
     config.py      ExamConfig / WrittenQuestionConfig — the professor-facing input (Section 4.1)
     metrics.py     Every millimetre of the sheet, and the geometry derived from it.
                      Edit this to change how the sheet looks; nothing else hardcodes a size.
@@ -159,25 +190,29 @@ omr/
     manifest.py    Builds/saves the template manifest from the same SheetLayout
     generate.py    generate_exam(config, output_dir) -> {pdf_path, manifest_path, manifest}
     preflight.py   Rasterizes the generated PDF and verifies it is machine-readable
-    gui.py         Desktop form over the same pipeline
     configs/       Worked example exam configs — copy one and edit to make your own
     tests/         test_flow.py (pagination behaviour), test_page_identity.py (per-page
                      identity + page bars), test_preflight.py, test_generator.py,
                      test_main.py, plus test_printed_sheet.py — which rasterizes the
                      real PDF and inspects the pixels
+  reader/        Modules 2/3 prototype — scan/PDF loading, fiducial alignment,
+                   page-index reading, and roll-number/program decoding
   grading/       Modules 4/5 — everything that READS a sheet (Sections 7-8)
     bubbles.py     Bubble measurement: fill_ratio (hard threshold) + ink_density (mean darkness)
     mcq.py         MCQ reading + grading — answered/blank/multiple, with confidence
     tests/         Grading correctness, plus test_mcq_confidence.py — imperfect real-world marks
+  io/            Roster, answer-key, and result CSV helpers
+  workflows/     File-based scan evaluation workflow that composes reader + grading + CSV I/O
+    parse.py       Official parser: canonical pages, identity, MCQs, written crops, JSON artifacts
+    evaluate.py    Older MCQ summary/evaluation workflow used by the professor-demo CLI
   verify.py      Round-trips a generated sheet: fills it in, grades it, checks it came back
+prototype_eval/  Backward-compatible professor-demo CLI and sample CSVs; implementation is in omr/
 data/exams/      Generated PDFs + manifests (gitignored)
-SmartOMR.bat     Double-click launcher (wizard)
-SmartOMR (GUI).bat
 ```
 
 ### Why `contracts/` exists
 
-CLAUDE.md Section 2, principle 1 says the generator and the parser share **one** manifest. That only
+PROJECT_SPEC.md Section 2, principle 1 says the generator and the parser share **one** manifest. That only
 holds if there's somewhere for the shared half to live. `omr/contracts/` is that place — page
 geometry, the mm→px conversion, and the manifest schema. `omr.generator` and `omr.grading` both
 import from it; **nothing in it imports from them**, which is what keeps the Phase 2 scan reader from
@@ -187,8 +222,8 @@ that fails if that direction is ever reversed.
 Everything else — bubble radius, option pitch, block positions — is a layout *decision* the generator
 makes and publishes **through the manifest**, so the reader learns it at parse time instead of sharing
 a constant. `pdf_gen.py` and `manifest.py` both render from the same `SheetLayout` object, and
-`grading/mcq.py` reads every coordinate it needs back out of the manifest dict. That's what lets
-Phase 2's real scan parser reuse `grading/` unchanged.
+`grading/mcq.py` and `reader/identity.py` read every coordinate they need back out of the manifest
+dict. That's what lets the scan parser reuse `grading/` unchanged after canonicalization.
 
 ## Sheet design: why it looks the way it does
 
@@ -249,7 +284,7 @@ One more, for the humans:
 
 ## Grading: what a reading tells you
 
-`read_mcq_responses()` returns more than a letter, because CLAUDE.md principle 4 says a
+`read_mcq_responses()` returns more than a letter, because PROJECT_SPEC.md principle 4 says a
 low-confidence step queues for a human rather than guessing:
 
 | Field | What it's for |
@@ -399,14 +434,13 @@ Worth flagging to your professor:
 
 - **Uniform MCQ marks** — `marks_per_mcq` applies to every MCQ; per-question weighting isn't wired up.
 - **`exam_type` is metadata only** — stored, but doesn't currently change the layout.
-- **No answer key yet** — `grade_mcq_responses()` takes one, but `ExamConfig` has nowhere to put it.
+- **No answer key in generated exam configs yet** — `grade_mcq_responses()` takes one, and the
+  scan-evaluation workflow can load `answer_key.csv`, but `ExamConfig` still has nowhere to store it.
 - **No question-paper/rubric ingestion** — that's Module 5 (Phase 3); Phase 1 lays out bubbles and
   answer boxes, not question text.
-- **No database** — `Exam`/`Question`/etc. (CLAUDE.md Section 3) get wired up starting Phase 2, once
-  there's something that actually needs persisting.
-- **No real scanning** — grading is tested against the *rendered PDF* rasterized back to pixels,
-  with simulated pen marks drawn on it. That covers print fidelity and imperfect marks, but not
-  perspective, lighting, or paper texture. Perspective correction from a real scan/photo is Phase 2
-  (Module 2), and the fill/ink thresholds should be re-calibrated against real scans then.
-- **No roll-number reading yet** — the bubble grid is printed and its coordinates are in the
-  manifest, but `grading/` only reads MCQs so far. Identity resolution is Module 3 (Phase 2).
+- **No database** — `Exam`/`Question`/etc. (PROJECT_SPEC.md Section 3) are not wired up yet.
+- **Scan evaluation is still a prototype** — `omr.reader` can align scan images/PDFs and decode
+  page bars + roll numbers, but thresholds still need calibration against real printed sheets,
+  phone photos, lighting variation, toner spread, and duplicate uploads.
+- **No verification email or review UI yet** — low-confidence identity/MCQ reads are flagged in
+  result details, but there is no persistent professor-facing queue yet.

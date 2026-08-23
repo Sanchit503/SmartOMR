@@ -3,7 +3,7 @@
 The Phase 1 test strategy (draw perfect discs, check they read back) proves
 the coordinate plumbing works but says nothing about the case that actually
 decides whether a grade is right: a student who shaded lightly, who erased
-and re-bubbled, or whose pen slipped into the next option. CLAUDE.md
+and re-bubbled, or whose pen slipped into the next option. PROJECT_SPEC.md
 principle 4 says those queue for a human instead of being guessed at, so
 that's what these pin down.
 

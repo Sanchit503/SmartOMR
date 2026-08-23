@@ -143,10 +143,6 @@ def test_missing_config_file_exits_without_writing_anything(tmp_path):
     assert list(tmp_path.iterdir()) == []
 
 
-def test_gui_and_config_are_mutually_exclusive(tmp_path):
-    assert main(["--gui", "--config", str(CONFIG_DIR / "quiz_short.json")]) == 2
-
-
 def test_unplaceable_layout_is_a_hard_stop_not_a_guess(tmp_path):
     """Section 2, principle 4 — the generator refuses rather than silently
     producing a sheet with a question it couldn't fit."""
@@ -161,3 +157,24 @@ def test_unplaceable_layout_is_a_hard_stop_not_a_guess(tmp_path):
     )
     assert code == 1
     assert not list(tmp_path.glob("*.pdf"))
+
+
+def test_locked_output_file_gets_a_clear_error(monkeypatch, tmp_path, capsys):
+    def locked_file(*_args, **_kwargs):
+        raise PermissionError(13, "Permission denied", str(tmp_path / "LOCKED.pdf"))
+
+    monkeypatch.setattr("omr.generator.main.generate_exam", locked_file)
+    code = main(
+        [
+            "--config",
+            str(CONFIG_DIR / "quiz_short.json"),
+            "--output-dir",
+            str(tmp_path),
+            "--no-open",
+        ]
+    )
+
+    captured = capsys.readouterr()
+    assert code == 1
+    assert "Could not write the output file" in captured.err
+    assert "LOCKED.pdf" in captured.err

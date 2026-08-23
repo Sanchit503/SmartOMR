@@ -38,7 +38,7 @@ from ..contracts.geometry import A4_HEIGHT_MM, A4_WIDTH_MM
 # Page size comes from the shared contract. Everything else in this file is a
 # layout *decision* the generator owns and publishes through the manifest, so
 # the reader learns it at parse time instead of sharing a constant that could
-# drift (CLAUDE.md Section 11.1).
+# drift (PROJECT_SPEC.md Section 11.1).
 PAGE_WIDTH_MM = A4_WIDTH_MM
 PAGE_HEIGHT_MM = A4_HEIGHT_MM
 
@@ -67,7 +67,7 @@ FIDUCIAL_EDGE_CLEARANCE_MM = PRINTER_SAFE_MARGIN_MM + 2.0
 MARGIN_MM = PRINTER_SAFE_MARGIN_MM + 2.0
 
 # ---------------------------------------------------------------------------
-# Fiducials and orientation (CLAUDE.md Section 4.3)
+# Fiducials and orientation (PROJECT_SPEC.md Section 4.3)
 # ---------------------------------------------------------------------------
 FIDUCIAL_SIZE_MM = 7.0
 FIDUCIAL_QUIET_MM = 3.5  # blank paper required on every side of a marker
@@ -166,7 +166,7 @@ MTECH_GRID_COLUMNS = 5
 # and every extra bubbling is another chance to produce a page that
 # *disagrees* with page 1, which is a review-queue item rather than an
 # improvement. The strip is what a TA reads when resolving a flagged sheet
-# (CLAUDE.md Section 6, step 5), and the page-index bars above are what let
+# (PROJECT_SPEC.md Section 6, step 5), and the page-index bars above are what let
 # the reader verify a page group mechanically.
 CONT_IDENTITY_TOP_MM = 31.0
 CONT_IDENTITY_HEIGHT_MM = 19.0

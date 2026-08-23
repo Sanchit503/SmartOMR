@@ -2,7 +2,7 @@
 
 A multi-page sheet is scanned as a loose batch. If a page carries nothing
 that ties it to a student, the only way to attribute it is scan order — a
-guess, and CLAUDE.md principle 4 says a guess is not allowed to produce a
+guess, and PROJECT_SPEC.md principle 4 says a guess is not allowed to produce a
 grade. So:
 
   page 1     bubbled roll-number grid   machine-read

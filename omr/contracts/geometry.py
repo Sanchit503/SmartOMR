@@ -1,4 +1,4 @@
-"""Page geometry and the mm <-> px conversion (CLAUDE.md Section 4.4).
+"""Page geometry and the mm <-> px conversion (PROJECT_SPEC.md Section 4.4).
 
 The manifest stores millimeters tied to a known page size, never pixels,
 so it stays resolution-independent. Pixels only exist once a canonical

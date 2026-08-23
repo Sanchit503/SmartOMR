@@ -1,4 +1,4 @@
-"""MCQ auto-grading (Section 7 of CLAUDE.md).
+"""MCQ auto-grading (Section 7 of PROJECT_SPEC.md).
 
 Reads fill ratios purely from manifest coordinates (never hardcoded
 positions), then grades against a supplied answer key. Blank vs. multiple-
@@ -15,7 +15,7 @@ against a 0.50 threshold; sampling the inset radius takes it to ~0.00.
 
 *A read that is merely "probably right" says so.* An absolute threshold on
 its own can't tell a confident fill from a smudge sitting just over the
-line, and CLAUDE.md principle 4 is explicit that a low-confidence step
+line, and PROJECT_SPEC.md principle 4 is explicit that a low-confidence step
 queues for a human rather than guessing. So a reading also carries the
 margin between the darkest bubble and its runner-up, and sets
 `needs_human_review` when the evidence is thin — an erased-and-rebubbled

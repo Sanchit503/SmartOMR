@@ -1,5 +1,5 @@
-"""Compatibility wrapper for CSV helpers promoted into `omr.io.csv`."""
-from omr.io.csv import (
+"""Input/output helpers for roster, answer-key, and result CSV files."""
+from .csv import (
     load_answer_key,
     load_students,
     normalize_roll,

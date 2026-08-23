@@ -1,4 +1,4 @@
-"""Modules 4/5 — grading (CLAUDE.md Sections 7-8).
+"""Modules 4/5 — grading (PROJECT_SPEC.md Sections 7-8).
 
 `bubbles` holds the manifest-driven fill-ratio reading primitives shared by
 MCQ grading and (from Phase 2) roll-number digit reading. `mcq` is the
