@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import asdict
 from pathlib import Path
 
@@ -16,6 +17,25 @@ from .roll_reader import read_roll_number
 
 
 SCAN_EXTENSIONS = IMAGE_EXTENSIONS | {".pdf"}
+
+
+def _safe_id(value: str) -> str:
+    cleaned = re.sub(r"[^A-Za-z0-9_.-]+", "_", value.strip())
+    return cleaned.strip("._") or "exam"
+
+
+def course_id_from_manifest(manifest: dict) -> str:
+    """Use the generated manifest's exam id as the output folder id.
+
+    The scanned sheet and manifest must already match, so `exam_id` is a
+    better source of truth than asking the user to retype a course folder name.
+    """
+    exam_id = str(manifest.get("exam_id", "")).strip()
+    if exam_id:
+        return _safe_id(exam_id)
+    exam = manifest.get("exam", {})
+    parts = [str(exam.get("course_code", "")), str(exam.get("exam_type", ""))]
+    return _safe_id("_".join(part for part in parts if part.strip()))
 
 
 def _student_fields(student: Student | None) -> tuple[str | None, str | None]:
@@ -193,15 +213,16 @@ def _error_result(scan_path: Path, error: Exception, output_dir: Path | None = N
 
 
 def batch_evaluate(
-    course_id: str,
     manifest_path: str | Path,
     students_path: str | Path,
     answer_key_path: str | Path,
     scans_path: str | Path,
     output_root: str | Path = "prototype_eval/data",
     dpi: float = 200,
+    course_id: str | None = None,
 ) -> tuple[list[EvaluationResult], Path]:
-    course_id = course_id.strip().replace(" ", "_")
+    manifest = load_manifest(manifest_path)
+    course_id = _safe_id(course_id) if course_id else course_id_from_manifest(manifest)
     output_dir = Path(output_root) / course_id / "results"
     output_dir.mkdir(parents=True, exist_ok=True)
     scans = _scan_files(Path(scans_path))

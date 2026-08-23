@@ -11,7 +11,7 @@ from omr.generator.config import ExamConfig
 from omr.generator.layout import build_layout
 from omr.generator.manifest import build_manifest
 from prototype_eval.cv_scan import ScanError
-from prototype_eval.pipeline import evaluate_scan
+from prototype_eval.pipeline import batch_evaluate, evaluate_scan
 
 
 DPI = 200
@@ -155,3 +155,27 @@ def test_half_page_scan_is_rejected(tmp_path: Path):
             output_dir=tmp_path / "results",
             dpi=DPI,
         )
+
+
+def test_batch_output_folder_comes_from_manifest_exam_id(tmp_path: Path):
+    c = cv2()
+    manifest = _manifest()
+    manifest_path, students_path, answer_key_path = _write_inputs(tmp_path, manifest)
+    scans_dir = tmp_path / "scans"
+    scans_dir.mkdir()
+    scan_path = scans_dir / "student_1.png"
+    scan = _draw_page(manifest, answers={1: "A", 2: "B", 3: "C", 4: "D"})
+    assert c.imwrite(str(scan_path), scan)
+
+    results, summary_path = batch_evaluate(
+        manifest_path=manifest_path,
+        students_path=students_path,
+        answer_key_path=answer_key_path,
+        scans_path=scans_dir,
+        output_root=tmp_path / "out",
+        dpi=DPI,
+    )
+
+    assert len(results) == 1
+    assert summary_path == tmp_path / "out" / "PROTO_TEST" / "results" / "results.csv"
+    assert summary_path.exists()
