@@ -36,7 +36,7 @@ DEFAULT_FILL_THRESHOLD = 0.5
 
 # A bubble this dark isn't blank paper, but isn't a confident fill either —
 # a partial erase, a faint pencil, or a stray mark lands in here.
-DEFAULT_AMBIGUOUS_FLOOR = 0.22
+DEFAULT_AMBIGUOUS_FLOOR = 0.28
 
 # The darkest bubble must beat its runner-up by at least this much, or the
 # read is treated as too close to call.
@@ -45,7 +45,177 @@ DEFAULT_MIN_MARGIN = 0.18
 # Mean-darkness floor for "someone put something here". Blank paper on a
 # phone photo sits under ~0.05; a light pencil fill covering the whole
 # bubble reaches ~0.25 while still scoring 0.0 on the hard fill threshold.
-DEFAULT_INK_FLOOR = 0.12
+DEFAULT_INK_FLOOR = 0.24
+
+
+def _cv2():
+    try:
+        import cv2
+    except ImportError:
+        return None
+    return cv2
+
+
+def _as_gray_array(image: np.ndarray) -> np.ndarray:
+    gray = np.asarray(image)
+    if gray.ndim == 3:
+        return gray.mean(axis=2).astype(np.uint8)
+    return gray
+
+
+def _cluster_values(values: list[float], tolerance_px: float) -> list[float]:
+    groups: list[list[float]] = []
+    for value in sorted(values):
+        if not groups or abs((sum(groups[-1]) / len(groups[-1])) - value) > tolerance_px:
+            groups.append([value])
+        else:
+            groups[-1].append(value)
+    return [sum(group) / len(group) for group in groups]
+
+
+def _best_matching_run(
+    clusters: list[float],
+    expected: list[float],
+    max_distance_px: float,
+) -> list[float] | None:
+    count = len(expected)
+    if len(clusters) < count:
+        return None
+
+    clusters = sorted(clusters)
+    best: tuple[float, list[float]] | None = None
+    for start in range(0, len(clusters) - count + 1):
+        run = clusters[start : start + count]
+        distances = [abs(actual - wanted) for actual, wanted in zip(run, expected)]
+        if max(distances) > max_distance_px:
+            continue
+        score = sum(distances)
+        if count > 1:
+            expected_pitch = (expected[-1] - expected[0]) / (count - 1)
+            pitch_error = sum(abs((run[i + 1] - run[i]) - expected_pitch) for i in range(count - 1))
+            score += 0.35 * pitch_error
+        if best is None or score < best[0]:
+            best = (score, run)
+    if best is None:
+        return None
+    return best[1]
+
+
+def _detect_bubble_center_candidates(
+    gray: np.ndarray,
+    bbox: tuple[int, int, int, int],
+    dpi: float,
+) -> list[tuple[float, float]]:
+    cv2 = _cv2()
+    if cv2 is None:
+        return []
+
+    x0, y0, x1, y1 = bbox
+    roi = gray[y0:y1, x0:x1]
+    if roi.size == 0:
+        return []
+
+    scale = px_per_mm(dpi)
+    min_side = 2.5 * scale
+    max_side = 7.5 * scale
+    candidates: list[tuple[float, float, float, float]] = []
+    for threshold in (160, 180, 200, 220, 235):
+        _ignored, binary = cv2.threshold(roi, threshold, 255, cv2.THRESH_BINARY_INV)
+        contours, _hierarchy = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        for contour in contours:
+            area = float(cv2.contourArea(contour))
+            if area < 20:
+                continue
+            x, y, w, h = cv2.boundingRect(contour)
+            if not (min_side <= w <= max_side and min_side <= h <= max_side):
+                continue
+            aspect = w / h if h else 0.0
+            if not 0.45 <= aspect <= 2.20:
+                continue
+            moments = cv2.moments(contour)
+            if moments["m00"]:
+                cx = x0 + moments["m10"] / moments["m00"]
+                cy = y0 + moments["m01"] / moments["m00"]
+            else:
+                cx = x0 + x + w / 2
+                cy = y0 + y + h / 2
+            candidates.append((cx, cy, float(max(w, h)), area))
+
+    unique: list[tuple[float, float, float, float]] = []
+    for candidate in sorted(candidates, key=lambda item: item[3], reverse=True):
+        duplicate = False
+        for existing in unique:
+            distance = ((candidate[0] - existing[0]) ** 2 + (candidate[1] - existing[1]) ** 2) ** 0.5
+            if distance < max(5.0, min(candidate[2], existing[2]) * 0.65):
+                duplicate = True
+                break
+        if not duplicate:
+            unique.append(candidate)
+    return [(cx, cy) for cx, cy, _side, _area in unique]
+
+
+def _entry_option_centers(entry: dict, manifest: dict, dpi: float) -> dict[str, tuple[int, int]]:
+    return {
+        option: mm_to_px(
+            entry["x_mm"] + manifest["mcq_label_offset_mm"] + index * manifest["mcq_option_pitch_mm"],
+            entry["y_mm"],
+            dpi,
+        )
+        for index, option in enumerate(entry["options"])
+    }
+
+
+def _calibrate_mcq_centers(
+    gray: np.ndarray,
+    entries: list[dict],
+    manifest: dict,
+    dpi: float,
+) -> dict[tuple[int, str], tuple[int, int]]:
+    if not entries:
+        return {}
+
+    scale = px_per_mm(dpi)
+    calibrated: dict[tuple[int, str], tuple[int, int]] = {}
+    groups: dict[tuple[float, tuple[str, ...]], list[dict]] = {}
+    for entry in entries:
+        groups.setdefault((float(entry["x_mm"]), tuple(entry["options"])), []).append(entry)
+
+    for (_x_mm, options), group_entries in groups.items():
+        group_entries = sorted(group_entries, key=lambda entry: (entry["y_mm"], entry["q_no"]))
+        expected_by_entry = {
+            entry["q_no"]: _entry_option_centers(entry, manifest, dpi)
+            for entry in group_entries
+        }
+        expected_x = [expected_by_entry[group_entries[0]["q_no"]][option][0] for option in options]
+        expected_y = [expected_by_entry[entry["q_no"]][options[0]][1] for entry in group_entries]
+        all_x = [center[0] for centers in expected_by_entry.values() for center in centers.values()]
+        all_y = [center[1] for centers in expected_by_entry.values() for center in centers.values()]
+
+        pad = round(8.0 * scale)
+        x0 = max(0, int(min(all_x) - pad))
+        x1 = min(gray.shape[1], int(max(all_x) + pad))
+        y0 = max(0, int(min(all_y) - pad))
+        y1 = min(gray.shape[0], int(max(all_y) + pad))
+        candidates = _detect_bubble_center_candidates(gray, (x0, y0, x1, y1), dpi)
+        if len(candidates) < max(len(options), len(group_entries)):
+            continue
+
+        tolerance = 2.4 * scale
+        max_distance = 6.5 * scale
+        x_clusters = _cluster_values([candidate[0] for candidate in candidates], tolerance)
+        y_clusters = _cluster_values([candidate[1] for candidate in candidates], tolerance)
+        x_run = _best_matching_run(x_clusters, expected_x, max_distance)
+        y_run = _best_matching_run(y_clusters, expected_y, max_distance)
+        if x_run is None or y_run is None:
+            continue
+
+        for row_index, entry in enumerate(group_entries):
+            for option_index, option in enumerate(options):
+                calibrated[(entry["q_no"], option)] = (
+                    int(round(x_run[option_index])),
+                    int(round(y_run[row_index])),
+                )
+    return calibrated
 
 
 class MCQOutcome(str, Enum):
@@ -194,17 +364,28 @@ def read_mcq_responses(
     radius_px = max(1, round(manifest["bubble_sample_radius_mm"] * px_per_mm(dpi)))
 
     readings: list[MCQReading] = []
+    gray_by_page = {page: _as_gray_array(image) for page, image in images_by_page.items()}
+    entries_by_page: dict[int, list[dict]] = {}
+    for entry in manifest["mcq_block"]:
+        entries_by_page.setdefault(entry.get("page", 1), []).append(entry)
+    calibrated_by_page = {
+        page: _calibrate_mcq_centers(gray_by_page[page], entries, manifest, dpi)
+        for page, entries in entries_by_page.items()
+        if page in gray_by_page
+    }
+
     for entry in manifest["mcq_block"]:
         page = entry.get("page", 1)
-        if page not in images_by_page:
+        if page not in gray_by_page:
             raise KeyError(f"no canonical image provided for page {page} (needed for Q{entry['q_no']})")
-        image = images_by_page[page]
+        image = gray_by_page[page]
+        calibrated_centers = calibrated_by_page.get(page, {})
 
         ratios: dict[str, float] = {}
         inks: dict[str, float] = {}
         for i, opt in enumerate(entry["options"]):
             ox_mm = entry["x_mm"] + label_offset_mm + i * option_pitch_mm
-            cx, cy = mm_to_px(ox_mm, entry["y_mm"], dpi)
+            cx, cy = calibrated_centers.get((entry["q_no"], opt), mm_to_px(ox_mm, entry["y_mm"], dpi))
             ratios[opt] = fill_ratio(image, cx, cy, radius_px)
             inks[opt] = ink_density(image, cx, cy, radius_px)
 

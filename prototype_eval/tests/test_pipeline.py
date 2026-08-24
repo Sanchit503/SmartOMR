@@ -137,6 +137,32 @@ def test_tilted_scan_recovers_roll_number_and_score(tmp_path: Path):
     assert result.total == 4
 
 
+def test_sideways_scan_recovers_roll_number_and_score(tmp_path: Path):
+    c = cv2()
+    manifest = _manifest()
+    manifest_path, students_path, answer_key_path = _write_inputs(tmp_path, manifest)
+    scan = c.rotate(
+        _draw_page(manifest, answers={1: "A", 2: "B", 3: "C", 4: "D"}),
+        c.ROTATE_90_CLOCKWISE,
+    )
+    scan_path = tmp_path / "sideways_student.png"
+    assert c.imwrite(str(scan_path), scan)
+
+    result = evaluate_scan(
+        scan_path,
+        manifest_path=manifest_path,
+        students_path=students_path,
+        answer_key_path=answer_key_path,
+        output_dir=tmp_path / "results",
+        dpi=DPI,
+    )
+
+    assert result.status == "ready"
+    assert result.roll_no == "2026001"
+    assert result.score == 4
+    assert result.total == 4
+
+
 def test_half_page_scan_is_rejected(tmp_path: Path):
     c = cv2()
     manifest = _manifest()

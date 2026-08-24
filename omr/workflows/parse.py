@@ -21,7 +21,7 @@ from PIL import Image
 from omr.contracts import load_manifest
 from omr.grading.mcq import MCQOutcome, read_mcq_responses
 from omr.io.csv import load_answer_key, load_students, normalize_roll
-from omr.models import AnswerKeyEntry, ParsedPage, Student
+from omr.models import AnswerKeyEntry, ParsedPage, RollRead, Student
 from omr.reader.identity import read_roll_number
 from omr.reader.scan import IMAGE_EXTENSIONS, ScanError, align_scan_pages, load_scan_pages
 from omr.reader.written import crop_written_responses
@@ -91,6 +91,18 @@ def _page_artifacts(aligned_pages: dict[int, Any], output_dir: Path) -> tuple[di
         )
 
     return images_by_page, pages
+
+
+def _missing_pages(manifest: dict, images_by_page: dict[int, np.ndarray]) -> list[int]:
+    expected = set(range(1, manifest["num_pages"] + 1))
+    return sorted(expected - set(images_by_page))
+
+
+def _manifest_for_pages(manifest: dict, pages: set[int]) -> dict:
+    partial = dict(manifest)
+    partial["mcq_block"] = [entry for entry in manifest["mcq_block"] if entry.get("page", 1) in pages]
+    partial["written_block"] = [entry for entry in manifest["written_block"] if entry.get("page", 1) in pages]
+    return partial
 
 
 def _student_payload(student: Student | None, roll_no: str | None, program: str | None) -> dict:
@@ -180,6 +192,21 @@ def _mcq_payload(
     return responses, score, total
 
 
+def _mcq_answer_summary(result: dict) -> list[dict]:
+    return [
+        {
+            "q_no": response["q_no"],
+            "answer": response["selected_option"],
+            "outcome": response["outcome"],
+            "confidence": response["confidence"],
+            "needs_review": response["needs_human_review"],
+            "correct_option": response["correct_option"],
+            "marks_awarded": response["marks_awarded"],
+        }
+        for response in result.get("mcq_responses", [])
+    ]
+
+
 def parse_scan(
     scan_path: str | Path,
     manifest_path: str | Path,
@@ -188,6 +215,7 @@ def parse_scan(
     answer_key_path: str | Path | None = None,
     dpi: float = 200,
     written_padding_mm: float = 0.0,
+    allow_partial: bool = True,
 ) -> dict:
     """Parse one filled OMR scan/PDF and write its artifacts.
 
@@ -203,21 +231,39 @@ def parse_scan(
     answer_key = load_answer_key(answer_key_path, default_marks=default_marks) if answer_key_path else None
 
     raw_pages = load_scan_pages(scan_path, dpi)
-    aligned_pages = align_scan_pages(raw_pages, manifest, dpi)
+    aligned_pages = align_scan_pages(raw_pages, manifest, dpi, allow_partial=allow_partial)
     images_by_page, page_records = _page_artifacts(aligned_pages, output_dir)
+    available_pages = set(images_by_page)
+    parse_manifest = _manifest_for_pages(manifest, available_pages) if allow_partial else manifest
 
-    roll = read_roll_number(images_by_page[1], manifest, dpi)
-    review_flags = list(roll.review_flags)
-    roll_no = normalize_roll(roll.roll_no or "") if roll.roll_no else None
+    missing_pages = _missing_pages(manifest, images_by_page)
+    review_flags = []
+    if missing_pages:
+        review_flags.append(f"partial scan: missing page(s): {', '.join(str(page) for page in missing_pages)}")
+
+    if 1 in images_by_page:
+        roll = read_roll_number(images_by_page[1], manifest, dpi)
+        review_flags.extend(roll.review_flags)
+        roll_no = normalize_roll(roll.roll_no or "") if roll.roll_no else None
+    else:
+        roll = RollRead(
+            program=None,
+            roll_no=None,
+            confidence="low",
+            ratios={},
+            review_flags=["page 1 is missing; cannot read bubbled roll number"],
+        )
+        review_flags.extend(roll.review_flags)
+        roll_no = None
     student = _match_student(roll_no, roll.program, students, review_flags)
 
-    readings = read_mcq_responses(images_by_page, manifest, dpi)
-    mcq_responses, mcq_score, mcq_total = _mcq_payload(readings, manifest, answer_key, review_flags)
+    readings = read_mcq_responses(images_by_page, parse_manifest, dpi)
+    mcq_responses, mcq_score, mcq_total = _mcq_payload(readings, parse_manifest, answer_key, review_flags)
 
     written_dir = output_dir / "written"
     written_crops = crop_written_responses(
         images_by_page,
-        manifest,
+        parse_manifest,
         written_dir,
         dpi,
         padding_mm=written_padding_mm,
@@ -278,6 +324,7 @@ def parse_scans(
     dpi: float = 200,
     course_id: str | None = None,
     written_padding_mm: float = 0.0,
+    allow_partial: bool = True,
 ) -> tuple[list[dict], Path]:
     """Parse one scan file or every scan file in a folder."""
     manifest = load_manifest(manifest_path)
@@ -301,6 +348,7 @@ def parse_scans(
                     answer_key_path=answer_key_path,
                     dpi=dpi,
                     written_padding_mm=written_padding_mm,
+                    allow_partial=allow_partial,
                 )
             )
         except Exception as exc:
@@ -323,6 +371,7 @@ def parse_scans(
                 "student_name": result["student"]["name"],
                 "mcq_score": result["mcq_score"],
                 "mcq_total": result["mcq_total"],
+                "mcq_answers": _mcq_answer_summary(result),
                 "review_flags": result["review_flags"],
                 "details_path": result["details_path"],
             }
@@ -354,6 +403,11 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         help="Extra margin around each written-answer crop",
     )
+    parser.add_argument(
+        "--strict-complete",
+        action="store_true",
+        help="Fail sheets that are missing any page instead of saving a partial needs-review result",
+    )
     return parser
 
 
@@ -369,6 +423,7 @@ def main(argv: list[str] | None = None) -> int:
             dpi=args.dpi,
             course_id=args.course_id,
             written_padding_mm=args.written_padding_mm,
+            allow_partial=not args.strict_complete,
         )
     except (OSError, ScanError, ValueError) as exc:
         print(str(exc), file=sys.stderr)

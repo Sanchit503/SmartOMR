@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import json
 from pathlib import Path
 
 import numpy as np
@@ -171,3 +172,64 @@ def test_parse_scans_writes_an_index_for_a_folder(tmp_path: Path):
     assert results[0]["status"] == "ready", results[0]["review_flags"]
     assert index_path == tmp_path / "out" / "PARSE_TEST" / "parse_index.json"
     assert index_path.exists()
+    index = json.loads(index_path.read_text(encoding="utf-8"))
+    answers = index["results"][0]["mcq_answers"]
+    assert len(answers) == 10
+    assert {answer["q_no"] for answer in answers} == set(range(1, 11))
+    assert all("answer" in answer and "outcome" in answer for answer in answers)
+
+
+def test_parse_scan_scores_available_pages_by_default(tmp_path: Path):
+    result = generate_exam(_config(), tmp_path / "exam")
+    manifest = result["manifest"]
+    pages = _render_pages(result["pdf_path"])
+    draws = {page: ImageDraw.Draw(image) for page, image in pages.items()}
+    _fill_identity(draws[1], manifest)
+    selections = _fill_mcqs(draws, manifest)
+    _write_answers(draws, manifest)
+
+    page_1_only = _save_scan_pdf({1: pages[1]}, manifest, tmp_path / "page_1_only.pdf")
+    students, answer_key = _write_csvs(tmp_path, selections)
+
+    payload = parse_scan(
+        page_1_only,
+        manifest_path=result["manifest_path"],
+        output_dir=tmp_path / "partial" / "sheet_1",
+        students_path=students,
+        answer_key_path=answer_key,
+        dpi=DPI,
+    )
+
+    assert payload["status"] == "needs_review"
+    assert payload["student"]["roll_no"] == "2026001"
+    assert payload["mcq_score"] == 10
+    assert payload["mcq_total"] == 10
+    assert {page["page_index"] for page in payload["pages"]} == {1}
+    assert any("missing page(s): 2" in flag for flag in payload["review_flags"])
+    assert all(written["page"] == 1 for written in payload["written_responses"])
+
+
+def test_parse_scan_can_still_fail_on_missing_pages_in_strict_mode(tmp_path: Path):
+    result = generate_exam(_config(), tmp_path / "exam")
+    manifest = result["manifest"]
+    pages = _render_pages(result["pdf_path"])
+    draws = {page: ImageDraw.Draw(image) for page, image in pages.items()}
+    _fill_identity(draws[1], manifest)
+    selections = _fill_mcqs(draws, manifest)
+
+    page_1_only = _save_scan_pdf({1: pages[1]}, manifest, tmp_path / "page_1_only.pdf")
+    students, answer_key = _write_csvs(tmp_path, selections)
+
+    try:
+        parse_scan(
+            page_1_only,
+            manifest_path=result["manifest_path"],
+            output_dir=tmp_path / "strict" / "sheet_1",
+            students_path=students,
+            answer_key_path=answer_key,
+            dpi=DPI,
+            allow_partial=False,
+        )
+        assert False, "strict mode should reject a missing page"
+    except Exception as exc:
+        assert "missing page(s): 2" in str(exc)

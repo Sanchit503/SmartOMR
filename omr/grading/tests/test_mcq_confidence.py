@@ -87,6 +87,25 @@ def test_an_untouched_question_reads_blank_with_confidence(sheet):
     assert max(r.fill_ratios.values()) == pytest.approx(0.0, abs=0.02)
 
 
+def test_shifted_printed_grid_is_locally_calibrated(sheet):
+    """A perspective correction can leave the MCQ block a few millimetres off
+    even after the page is canonical. The reader should use the printed
+    bubble grid near the manifest coordinates instead of sampling blank
+    space at the old coordinate."""
+    manifest, img = sheet
+    shade(img, manifest, 1, 2, coverage=0.7)
+    shade(img, manifest, 2, 0, coverage=0.7)
+
+    shifted = Image.new("L", img.size, color=255)
+    shifted.paste(img, (24, 32))
+    readings = read(shifted, manifest)
+
+    assert readings[1].outcome == MCQOutcome.ANSWERED
+    assert readings[1].selected_option == "C"
+    assert readings[2].outcome == MCQOutcome.ANSWERED
+    assert readings[2].selected_option == "A"
+
+
 def test_a_light_pencil_fill_is_flagged_not_silently_blanked(sheet):
     """The dangerous failure, and the reason `ink_density` exists: a light
     pencil answer covers the whole bubble but never gets dark enough to

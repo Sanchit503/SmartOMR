@@ -27,8 +27,16 @@ __all__ = [
 DARK_THRESHOLD = 150
 
 
+def _as_gray_array(image: np.ndarray) -> np.ndarray:
+    gray = np.asarray(image)
+    if gray.ndim == 3:
+        return gray.mean(axis=2).astype(np.uint8)
+    return gray
+
+
 def _disc(gray: np.ndarray, cx_px: int, cy_px: int, radius_px: int) -> np.ndarray | None:
     """The pixels inside a circular bubble region, or None if it's off-image."""
+    gray = _as_gray_array(gray)
     h, w = gray.shape[:2]
     x0, x1 = max(0, cx_px - radius_px), min(w, cx_px + radius_px + 1)
     y0, y1 = max(0, cy_px - radius_px), min(h, cy_px + radius_px + 1)
@@ -67,7 +75,10 @@ def ink_density(gray: np.ndarray, cx_px: int, cy_px: int, radius_px: int) -> flo
     same bubble, which is what lets the reader say "something was written
     here, a human should look" instead of silently scoring it zero.
     """
-    pixels = _disc(gray, cx_px, cy_px, radius_px)
+    # Use the core for mean darkness. The printed bubble outline sits near
+    # the edge and camera blur can pull that outline into the sample area,
+    # so the centre is the cleaner signal for "student filled this".
+    pixels = _disc(gray, cx_px, cy_px, max(1, round(radius_px * 0.70)))
     if pixels is None:
         return 0.0
     return float((255.0 - pixels.astype(np.float32)).mean()) / 255.0
