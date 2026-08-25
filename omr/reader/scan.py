@@ -52,6 +52,7 @@ class _SquareCandidate:
 CORNER_ORDER = ("TL", "TR", "BR", "BL")
 CORNER_INDEX = {corner: index for index, corner in enumerate(CORNER_ORDER)}
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"}
+SMARTOMR_VALIDATION_PREFIX = "could not validate this as a SmartOMR sheet"
 
 
 def load_scan_pages(path: str | Path, dpi: float) -> list[np.ndarray]:
@@ -557,6 +558,12 @@ def _alignment_sources(
     return sources
 
 
+def _alignment_error(errors: list[str]) -> ScanError:
+    if errors:
+        return ScanError(f"{SMARTOMR_VALIDATION_PREFIX}: {'; '.join(errors)}")
+    return ScanError(f"{SMARTOMR_VALIDATION_PREFIX}: no alignment strategy was able to run")
+
+
 def _expected_fiducials_px(manifest: dict, dpi: float) -> np.ndarray:
     by_corner = {f["corner"]: f for f in manifest["fiducials"] if f.get("page", 1) == 1}
     return np.array([mm_to_px(by_corner[corner]["x_mm"], by_corner[corner]["y_mm"], dpi) for corner in CORNER_ORDER],
@@ -711,7 +718,7 @@ def align_scan_page(gray: np.ndarray, manifest: dict, dpi: float, source_index: 
 
     if best_page is not None:
         return best_page
-    raise ScanError("; ".join(errors))
+    raise _alignment_error(errors)
 
 
 def align_scan_pages(

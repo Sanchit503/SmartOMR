@@ -179,6 +179,26 @@ def test_parse_scans_writes_an_index_for_a_folder(tmp_path: Path):
     assert all("answer" in answer and "outcome" in answer for answer in answers)
 
 
+def test_parse_scans_records_non_omr_upload_as_error(tmp_path: Path):
+    result = generate_exam(_config(), tmp_path / "exam")
+    scans_dir = tmp_path / "scans"
+    scans_dir.mkdir()
+    Image.new("L", (700, 900), 255).save(scans_dir / "plain_paper.png")
+
+    results, index_path = parse_scans(
+        manifest_path=result["manifest_path"],
+        scans_path=scans_dir,
+        output_root=tmp_path / "out",
+        dpi=DPI,
+    )
+
+    assert len(results) == 1
+    assert results[0]["status"] == "error"
+    assert "SmartOMR" in results[0]["review_flags"][0]
+    index = json.loads(index_path.read_text(encoding="utf-8"))
+    assert index["status_counts"] == {"ready": 0, "needs_review": 0, "error": 1}
+
+
 def test_parse_scan_scores_available_pages_by_default(tmp_path: Path):
     result = generate_exam(_config(), tmp_path / "exam")
     manifest = result["manifest"]

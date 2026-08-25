@@ -3,10 +3,14 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
+from omr.contracts.geometry import canonical_size_px, mm_to_px, px_per_mm
 from omr.generator.config import ExamConfig
 from omr.generator.layout import build_layout
 from omr.generator.manifest import build_manifest
 from omr.reader.scan import ScanError, align_scan_page
+
+
+DPI = 200
 
 
 def _manifest() -> dict:
@@ -23,6 +27,60 @@ def _manifest() -> dict:
     return build_manifest(build_layout(config))
 
 
+def _draw_rect_mm(
+    image: np.ndarray,
+    x_mm: float,
+    y_mm: float,
+    width_mm: float,
+    height_mm: float,
+    fill: bool = True,
+) -> None:
+    import cv2
+
+    scale = px_per_mm(DPI)
+    cx, cy = mm_to_px(x_mm, y_mm, DPI)
+    half_w = round(width_mm * scale / 2)
+    half_h = round(height_mm * scale / 2)
+    thickness = -1 if fill else 2
+    cv2.rectangle(image, (cx - half_w, cy - half_h), (cx + half_w, cy + half_h), 0, thickness)
+
+
+def test_plain_white_image_is_rejected_as_not_smartomr():
+    image = np.full((900, 700), 255, dtype=np.uint8)
+
+    with pytest.raises(ScanError, match="SmartOMR"):
+        align_scan_page(image, _manifest(), dpi=DPI)
+
+
+def test_paper_shaped_photo_without_markers_is_rejected():
+    import cv2
+
+    image = np.full((900, 700), 225, dtype=np.uint8)
+    paper = np.array([[105, 75], [610, 130], [555, 805], [70, 730]], dtype=np.int32)
+    cv2.fillConvexPoly(image, paper, 255)
+    cv2.polylines(image, [paper], isClosed=True, color=155, thickness=2)
+
+    with pytest.raises(ScanError, match="SmartOMR"):
+        align_scan_page(image, _manifest(), dpi=DPI)
+
+
+def test_corner_markers_without_sheet_identity_are_rejected():
+    manifest = _manifest()
+    width, height = canonical_size_px(manifest, DPI)
+    image = np.full((height, width), 255, dtype=np.uint8)
+    for fiducial in manifest["fiducials"]:
+        _draw_rect_mm(
+            image,
+            fiducial["x_mm"],
+            fiducial["y_mm"],
+            fiducial["size_mm"],
+            fiducial["size_mm"],
+        )
+
+    with pytest.raises(ScanError, match="SmartOMR"):
+        align_scan_page(image, manifest, dpi=DPI)
+
+
 def test_four_random_black_squares_are_not_enough_to_be_an_omr():
     import cv2
 
@@ -30,5 +88,5 @@ def test_four_random_black_squares_are_not_enough_to_be_an_omr():
     for x, y in [(80, 80), (620, 80), (80, 360), (620, 360)]:
         cv2.rectangle(image, (x - 14, y - 14), (x + 14, y + 14), 0, -1)
 
-    with pytest.raises(ScanError):
-        align_scan_page(image, _manifest(), dpi=200)
+    with pytest.raises(ScanError, match="SmartOMR"):
+        align_scan_page(image, _manifest(), dpi=DPI)
