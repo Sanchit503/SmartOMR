@@ -180,9 +180,10 @@ Pipeline (same for both, this is the convergence point from principle 3):
 1. Detect the four fiducial markers (contour/corner detection).
 2. Compute a perspective transform from detected marker positions to the canonical page rectangle (`cv2.getPerspectiveTransform` + `warpPerspective` if using OpenCV).
 3. Deskew and normalize to a fixed canonical resolution.
-4. From here on, every downstream module works only with canonical images and manifest mm→px coordinates. It never needs to know if the source was a scanner or a phone.
+4. Run a post-alignment quality gate on the canonical image: re-check marker darkness/position, page-index bar contrast, printed bubble anchor residuals, blur, and page size. Save an alignment JSON report plus an overlay image so a TA can inspect failures quickly.
+5. From here on, every downstream module works only with canonical images and manifest mm→px coordinates. It never needs to know if the source was a scanner or a phone.
 
-If fiducials can't be reliably detected (torn corner, extreme blur) — flag the sheet `needs_review` rather than guessing a transform.
+If fiducials can't be reliably detected (torn corner, extreme blur), or if the page warps but fails the quality gate, flag the sheet `needs_review` rather than guessing a transform.
 
 ---
 
@@ -305,13 +306,13 @@ omr/
   grading/     Modules 4/5 (Sections 7-8). Bubble reading + MCQ grading; written-answer
                LLM grading lands here in Phase 3.
   reader/      Modules 2/3 prototype (Sections 5-6): scan/PDF loading,
-               fiducial alignment to canonical A4, page-index reading, and
-               roll-number/program decoding.
+               fiducial alignment to canonical A4, alignment quality reports,
+               page-index reading, and roll-number/program decoding.
   io/          Roster CSV, answer-key CSV, and result CSV helpers.
   workflows/  File-based workflows that compose contracts + reader + grading + I/O,
-               currently parse.py for canonical pages, identity, MCQs, written
-               crops and JSON artifacts; evaluate.py for the older MCQ summary
-               professor-demo flow.
+               currently parse.py for canonical pages, alignment diagnostics,
+               identity, MCQs, written crops and JSON artifacts; evaluate.py
+               for the older MCQ summary professor-demo flow.
 
 prototype_eval/
   Backward-compatible demo CLI, samples, and import shims. Real implementation

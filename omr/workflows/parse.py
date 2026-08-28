@@ -22,6 +22,11 @@ from omr.contracts import load_manifest
 from omr.grading.mcq import MCQOutcome, read_mcq_responses
 from omr.io.csv import load_answer_key, load_students, normalize_roll
 from omr.models import AnswerKeyEntry, ParsedPage, RollRead, Student
+from omr.reader.quality import (
+    assess_alignment_quality,
+    save_alignment_overlay,
+    save_alignment_report,
+)
 from omr.reader.identity import read_roll_number
 from omr.reader.scan import IMAGE_EXTENSIONS, ScanError, align_scan_pages, load_scan_pages
 from omr.reader.written import crop_written_responses
@@ -70,16 +75,35 @@ def _save_gray_image(image: object, path: Path) -> None:
     Image.fromarray(gray.astype(np.uint8, copy=False), mode="L").save(path)
 
 
-def _page_artifacts(aligned_pages: dict[int, Any], output_dir: Path) -> tuple[dict[int, np.ndarray], list[ParsedPage]]:
+def _page_artifacts(
+    aligned_pages: dict[int, Any],
+    manifest: dict,
+    output_dir: Path,
+    dpi: float,
+) -> tuple[dict[int, np.ndarray], list[ParsedPage], list[Any]]:
     pages_dir = output_dir / "pages"
+    debug_dir = output_dir / "debug"
     images_by_page: dict[int, np.ndarray] = {}
     pages: list[ParsedPage] = []
+    quality_reports = []
 
     for page_no, page in sorted(aligned_pages.items()):
         image = np.asarray(page.image)
         images_by_page[page_no] = image
         image_path = pages_dir / f"page_{page_no}.png"
         _save_gray_image(image, image_path)
+
+        report = assess_alignment_quality(image, manifest, page_no, dpi)
+        overlay_path = debug_dir / f"page_{page_no}_alignment_overlay.png"
+        report_path = debug_dir / f"page_{page_no}_alignment.json"
+        save_alignment_overlay(image, manifest, page_no, dpi, overlay_path)
+        report = report.with_paths(
+            report_path=_json_path(report_path, output_dir),
+            overlay_path=_json_path(overlay_path, output_dir),
+        )
+        save_alignment_report(report, report_path)
+        quality_reports.append(report)
+
         pages.append(
             ParsedPage(
                 page_index=page.page_index,
@@ -87,10 +111,14 @@ def _page_artifacts(aligned_pages: dict[int, Any], output_dir: Path) -> tuple[di
                 canonical_image_path=_json_path(image_path, output_dir),
                 alignment_confidence=page.alignment_confidence,
                 page_mark_confidence=page.page_mark_confidence,
+                alignment_quality_status=report.status,
+                alignment_quality_score=report.score,
+                alignment_report_path=report.report_path,
+                alignment_overlay_path=report.overlay_path,
             )
         )
 
-    return images_by_page, pages
+    return images_by_page, pages, quality_reports
 
 
 def _missing_pages(manifest: dict, images_by_page: dict[int, np.ndarray]) -> list[int]:
@@ -232,12 +260,14 @@ def parse_scan(
 
     raw_pages = load_scan_pages(scan_path, dpi)
     aligned_pages = align_scan_pages(raw_pages, manifest, dpi, allow_partial=allow_partial)
-    images_by_page, page_records = _page_artifacts(aligned_pages, output_dir)
+    images_by_page, page_records, quality_reports = _page_artifacts(aligned_pages, manifest, output_dir, dpi)
     available_pages = set(images_by_page)
     parse_manifest = _manifest_for_pages(manifest, available_pages) if allow_partial else manifest
 
     missing_pages = _missing_pages(manifest, images_by_page)
     review_flags = []
+    for report in quality_reports:
+        review_flags.extend(f"page {report.page_index}: {flag}" for flag in report.review_flags)
     if missing_pages:
         review_flags.append(f"partial scan: missing page(s): {', '.join(str(page) for page in missing_pages)}")
 
@@ -372,6 +402,16 @@ def parse_scans(
                 "mcq_score": result["mcq_score"],
                 "mcq_total": result["mcq_total"],
                 "mcq_answers": _mcq_answer_summary(result),
+                "page_quality": [
+                    {
+                        "page": page["page_index"],
+                        "status": page.get("alignment_quality_status"),
+                        "score": page.get("alignment_quality_score"),
+                        "report_path": page.get("alignment_report_path"),
+                        "overlay_path": page.get("alignment_overlay_path"),
+                    }
+                    for page in result["pages"]
+                ],
                 "review_flags": result["review_flags"],
                 "details_path": result["details_path"],
             }

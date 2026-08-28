@@ -9,7 +9,7 @@ Per the roadmap in PROJECT_SPEC.md Section 12:
 
 - [x] **Phase 1** — OMR sheet generator + pure MCQ grading pipeline
 - [x] **Phase 2 prototype** — scan/PDF loading, fiducial alignment, page-index reading,
-  roll-number reading, roster CSV matching, and MCQ result export
+  alignment quality reports, roll-number reading, roster CSV matching, and MCQ result export
 - [ ] Phase 2 production hardening — real scan/photo calibration, verification email,
   persistent review queue, and duplicate-sheet handling
 - [ ] Phase 3 — Written-answer grading (LLM-assisted)
@@ -127,11 +127,18 @@ The parser writes to `data/parsed/<exam_id>/` by default:
 parse_index.json                 batch summary
 sheets/<scan_id>/parse.json       full debug/result JSON for one sheet
 sheets/<scan_id>/pages/page_1.png canonical aligned page image
+sheets/<scan_id>/debug/page_1_alignment.json         post-warp quality metrics
+sheets/<scan_id>/debug/page_1_alignment_overlay.png  visual overlay of expected anchors
 sheets/<scan_id>/written/Q11.png  written-answer crop
 ```
 
 This is intentionally a parser, not the final grader. Written answers are cropped and saved for the
 future LLM/manual-grading step; no written marks are awarded here.
+
+Every parsed page also carries `alignment_quality_status`, `alignment_quality_score`,
+`alignment_report_path`, and `alignment_overlay_path` in `parse.json`. If the page aligns but the
+markers, page bars, bubble anchors, or image-quality checks look risky, the sheet is marked
+`needs_review` instead of being treated as final.
 
 ## Printing
 
@@ -196,14 +203,15 @@ omr/
                      test_main.py, plus test_printed_sheet.py — which rasterizes the
                      real PDF and inspects the pixels
   reader/        Modules 2/3 prototype — scan/PDF loading, fiducial alignment,
-                   page-index reading, and roll-number/program decoding
+                   alignment quality reports, page-index reading, and roll-number/program decoding
   grading/       Modules 4/5 — everything that READS a sheet (Sections 7-8)
     bubbles.py     Bubble measurement: fill_ratio (hard threshold) + ink_density (mean darkness)
     mcq.py         MCQ reading + grading — answered/blank/multiple, with confidence
     tests/         Grading correctness, plus test_mcq_confidence.py — imperfect real-world marks
   io/            Roster, answer-key, and result CSV helpers
   workflows/     File-based scan evaluation workflow that composes reader + grading + CSV I/O
-    parse.py       Official parser: canonical pages, identity, MCQs, written crops, JSON artifacts
+    parse.py       Official parser: canonical pages, alignment diagnostics, identity, MCQs,
+                     written crops, JSON artifacts
     evaluate.py    Older MCQ summary/evaluation workflow used by the professor-demo CLI
   verify.py      Round-trips a generated sheet: fills it in, grades it, checks it came back
 prototype_eval/  Backward-compatible professor-demo CLI and sample CSVs; implementation is in omr/
@@ -439,8 +447,8 @@ Worth flagging to your professor:
 - **No question-paper/rubric ingestion** — that's Module 5 (Phase 3); Phase 1 lays out bubbles and
   answer boxes, not question text.
 - **No database** — `Exam`/`Question`/etc. (PROJECT_SPEC.md Section 3) are not wired up yet.
-- **Scan evaluation is still a prototype** — `omr.reader` can align scan images/PDFs and decode
-  page bars + roll numbers, but thresholds still need calibration against real printed sheets,
-  phone photos, lighting variation, toner spread, and duplicate uploads.
+- **Scan evaluation is still a prototype** — `omr.reader` now writes per-page alignment quality
+  reports and sends weak alignment to review, but thresholds still need calibration against real
+  printed sheets, phone photos, lighting variation, toner spread, and duplicate uploads.
 - **No verification email or review UI yet** — low-confidence identity/MCQ reads are flagged in
   result details, but there is no persistent professor-facing queue yet.

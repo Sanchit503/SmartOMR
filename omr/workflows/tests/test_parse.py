@@ -144,6 +144,10 @@ def test_parse_scan_saves_canonical_pages_mcqs_and_written_crops(tmp_path: Path)
 
     for page in payload["pages"]:
         assert (output_dir / page["canonical_image_path"]).exists()
+        assert page["alignment_quality_status"] == "ready"
+        assert page["alignment_quality_score"] > 0.80
+        assert (output_dir / page["alignment_report_path"]).exists()
+        assert (output_dir / page["alignment_overlay_path"]).exists()
     for written in payload["written_responses"]:
         crop_path = output_dir / written["crop_path"]
         assert crop_path.exists()

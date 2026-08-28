@@ -66,6 +66,10 @@ class ParsedPage:
     canonical_image_path: str | None
     alignment_confidence: float
     page_mark_confidence: float
+    alignment_quality_status: str = "unknown"
+    alignment_quality_score: float | None = None
+    alignment_report_path: str | None = None
+    alignment_overlay_path: str | None = None
 
 
 @dataclass(frozen=True)
