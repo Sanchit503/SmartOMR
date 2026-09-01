@@ -11,7 +11,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from omr.contracts.geometry import mm_to_px, px_per_mm
-from omr.grading.bubbles import fill_ratio, ink_density
+from omr.grading.bubbles import ink_density, student_mark_fill_ratio
 from omr.grading.mcq import (
     DEFAULT_AMBIGUOUS_FLOOR,
     DEFAULT_FILL_THRESHOLD,
@@ -20,22 +20,109 @@ from omr.grading.mcq import (
 )
 
 from omr.models import RollRead
+from omr.local_registration import LocalTransform, fit_ordered_local_transform
 
 
 @dataclass(frozen=True)
 class _GridCalibration:
-    x_centers_mm: list[float]
-    y_centers_mm: list[float]
+    transform: LocalTransform
+    matched_anchors: int
+    mean_residual_mm: float
+    max_residual_mm: float
+
+    def apply_mm(self, x_mm: float, y_mm: float, dpi: float) -> tuple[float, float]:
+        return self.transform.apply(mm_to_px(x_mm, y_mm, dpi))
 
 
 def _bubble_signal(gray: np.ndarray, manifest: dict, dpi: float, x_mm: float, y_mm: float) -> tuple[float, float]:
     radius_px = max(1, round(manifest["bubble_sample_radius_mm"] * px_per_mm(dpi)))
     cx, cy = mm_to_px(x_mm, y_mm, dpi)
-    return fill_ratio(gray, cx, cy, radius_px), ink_density(gray, cx, cy, radius_px)
+    return student_mark_fill_ratio(gray, cx, cy, radius_px), ink_density(gray, cx, cy, radius_px)
+
+
+def _bubble_signal_px(gray: np.ndarray, manifest: dict, dpi: float, cx: float, cy: float) -> tuple[float, float]:
+    radius_px = max(1, round(manifest["bubble_sample_radius_mm"] * px_per_mm(dpi)))
+    return student_mark_fill_ratio(gray, int(round(cx)), int(round(cy)), radius_px), ink_density(
+        gray,
+        int(round(cx)),
+        int(round(cy)),
+        radius_px,
+    )
 
 
 def _is_marked(ratio: float, ink: float) -> bool:
     return ratio >= DEFAULT_AMBIGUOUS_FLOOR or ink >= DEFAULT_INK_FLOOR
+
+
+ROLL_NOISE_FILL_FLOOR = 0.18
+ROLL_INK_EXCESS_FLOOR = 0.10
+ROLL_FAINT_INK_EXCESS_FLOOR = 0.12
+
+
+def _column_blank_ink_baseline(signals: dict[int, tuple[float, float]], selected: int | None = None) -> float:
+    blankish_inks = [
+        ink
+        for digit, (ratio, ink) in signals.items()
+        if digit != selected and ratio < DEFAULT_AMBIGUOUS_FLOOR
+    ]
+    if not blankish_inks:
+        blankish_inks = [ink for digit, (_ratio, ink) in signals.items() if digit != selected]
+    if not blankish_inks:
+        return 0.0
+    return float(np.median(blankish_inks))
+
+
+def _is_meaningful_roll_mark(
+    ratio: float,
+    ink: float,
+    baseline_ink: float,
+    fill_floor: float = ROLL_NOISE_FILL_FLOOR,
+) -> bool:
+    if ratio >= DEFAULT_AMBIGUOUS_FLOOR:
+        return True
+    ink_excess = ink - baseline_ink
+    if ratio >= fill_floor and ink_excess >= ROLL_INK_EXCESS_FLOOR:
+        return True
+    return ink >= DEFAULT_INK_FLOOR and ink_excess >= ROLL_FAINT_INK_EXCESS_FLOOR
+
+
+def _extra_roll_marks(
+    signals: dict[int, tuple[float, float]],
+    selected: int,
+) -> list[int]:
+    baseline_ink = _column_blank_ink_baseline(signals, selected)
+    return [
+        digit
+        for digit, (ratio, ink) in signals.items()
+        if digit != selected and _is_meaningful_roll_mark(ratio, ink, baseline_ink)
+    ]
+
+
+def _marked_roll_digits(signals: dict[int, tuple[float, float]]) -> list[int]:
+    baseline_ink = _column_blank_ink_baseline(signals)
+    return [
+        digit
+        for digit, (ratio, ink) in signals.items()
+        if _is_meaningful_roll_mark(ratio, ink, baseline_ink, fill_floor=0.14)
+    ]
+
+
+def _roll_confidence(roll_no: str | None, flags: list[str]) -> str:
+    if not roll_no:
+        return "low"
+    severe_terms = (
+        "blank",
+        "could not",
+        "multiple filled",
+        "too close",
+        "only faint",
+        "also has marks",
+    )
+    if any(any(term in flag for term in severe_terms) for flag in flags):
+        return "low"
+    if flags:
+        return "medium"
+    return "high"
 
 
 def _cv2():
@@ -85,10 +172,10 @@ def _calibrate_digit_grid(gray: np.ndarray, manifest: dict, dpi: float, grid: di
         return None
 
     scale = px_per_mm(dpi)
-    x0, y0 = mm_to_px(grid["x_mm"] - 5.0, grid["y_mm"] - 7.0, dpi)
+    x0, y0 = mm_to_px(grid["x_mm"] - 5.0, grid["y_mm"] - 3.0, dpi)
     x1, y1 = mm_to_px(
         grid["x_mm"] + (grid["columns"] - 1) * grid["col_pitch_mm"] + 5.0,
-        grid["y_mm"] + 9 * grid["row_pitch_mm"] + 7.0,
+        grid["y_mm"] + 9 * grid["row_pitch_mm"] + 5.0,
         dpi,
     )
     x0, x1 = max(0, x0), min(gray.shape[1], x1)
@@ -102,7 +189,7 @@ def _calibrate_digit_grid(gray: np.ndarray, manifest: dict, dpi: float, grid: di
 
     points: list[tuple[float, float]] = []
     min_side = 2.4 * scale
-    max_side = 6.2 * scale
+    max_side = 5.4 * scale
     for contour in contours:
         area = cv2.contourArea(contour)
         if area < 30:
@@ -120,18 +207,46 @@ def _calibrate_digit_grid(gray: np.ndarray, manifest: dict, dpi: float, grid: di
         else:
             cx = x0 + x + w / 2
             cy = y0 + y + h / 2
-        points.append((cx / scale, cy / scale))
+        points.append((cx, cy))
 
-    if len(points) < grid["columns"] * 8:
+    min_matches = grid["columns"] * 8
+    if len(points) < min_matches:
         return None
 
-    x_clusters = _cluster_values([p[0] for p in points], tolerance_mm=2.5)
-    y_clusters = _cluster_values([p[1] for p in points], tolerance_mm=2.5)
+    x_clusters = _cluster_values([p[0] / scale for p in points], tolerance_mm=2.5)
+    y_clusters = _cluster_values([p[1] / scale for p in points], tolerance_mm=2.5)
     x_centers = _best_regular_run(x_clusters, grid["columns"], grid["col_pitch_mm"])
     y_centers = _best_regular_run(y_clusters, 10, grid["row_pitch_mm"])
     if x_centers is None or y_centers is None:
         return None
-    return _GridCalibration(x_centers_mm=x_centers, y_centers_mm=y_centers)
+
+    expected_points = [
+        (
+            (grid["x_mm"] + col * grid["col_pitch_mm"]) * scale,
+            (grid["y_mm"] + digit * grid["row_pitch_mm"]) * scale,
+        )
+        for col in range(grid["columns"])
+        for digit in range(10)
+    ]
+    observed_points = [
+        (x_centers[col] * scale, y_centers[digit] * scale)
+        for col in range(grid["columns"])
+        for digit in range(10)
+    ]
+    transform = fit_ordered_local_transform(
+        expected_points,
+        observed_points,
+        min_points=3,
+        ransac_reproj_threshold_px=1.6 * scale,
+    )
+    if transform is None:
+        return None
+    return _GridCalibration(
+        transform=transform,
+        matched_anchors=transform.matched_count,
+        mean_residual_mm=transform.mean_residual_px / scale,
+        max_residual_mm=transform.max_residual_px / scale,
+    )
 
 
 def _read_program_selector(
@@ -148,11 +263,10 @@ def _read_program_selector(
         x_mm, y_mm = coords["x_mm"], coords["y_mm"]
         calibration = calibrations.get(program)
         if calibration is not None:
-            grid_key = "btech_digits" if program == "BTECH" else "mtech_digits"
-            grid = block[grid_key]
-            x_mm += calibration.x_centers_mm[0] - grid["x_mm"]
-            y_mm += calibration.y_centers_mm[0] - grid["y_mm"]
-        ratio, ink = _bubble_signal(gray, manifest, dpi, x_mm, y_mm)
+            cx, cy = calibration.apply_mm(x_mm, y_mm, dpi)
+            ratio, ink = _bubble_signal_px(gray, manifest, dpi, cx, cy)
+        else:
+            ratio, ink = _bubble_signal(gray, manifest, dpi, x_mm, y_mm)
         signals[program] = {"fill": ratio, "ink": ink}
 
     filled = [program for program, signal in signals.items() if signal["fill"] >= DEFAULT_FILL_THRESHOLD]
@@ -188,13 +302,13 @@ def _read_digit_grid(
         col_label = str(col + 1)
         signals: dict[int, tuple[float, float]] = {}
         for digit in range(10):
+            x_mm = grid["x_mm"] + col * grid["col_pitch_mm"]
+            y_mm = grid["y_mm"] + digit * grid["row_pitch_mm"]
             if calibration is not None:
-                x_mm = calibration.x_centers_mm[col]
-                y_mm = calibration.y_centers_mm[digit]
+                cx, cy = calibration.apply_mm(x_mm, y_mm, dpi)
+                signals[digit] = _bubble_signal_px(gray, manifest, dpi, cx, cy)
             else:
-                x_mm = grid["x_mm"] + col * grid["col_pitch_mm"]
-                y_mm = grid["y_mm"] + digit * grid["row_pitch_mm"]
-            signals[digit] = _bubble_signal(gray, manifest, dpi, x_mm, y_mm)
+                signals[digit] = _bubble_signal(gray, manifest, dpi, x_mm, y_mm)
         ratios_by_col[col_label] = {str(digit): ratio for digit, (ratio, _ink) in signals.items()}
 
         filled = [digit for digit, (ratio, _ink) in signals.items() if ratio >= DEFAULT_FILL_THRESHOLD]
@@ -207,11 +321,7 @@ def _read_digit_grid(
             selected = filled[0]
             digits.append(str(selected))
             valid_columns += 1
-            other_marks = [
-                digit
-                for digit, (ratio, ink) in signals.items()
-                if digit != selected and _is_marked(ratio, ink)
-            ]
+            other_marks = _extra_roll_marks(signals, selected)
             if margin < DEFAULT_MIN_MARGIN:
                 flags.append(
                     f"{program} roll column {col + 1} is too close to call "
@@ -229,7 +339,7 @@ def _read_digit_grid(
             digits.append("?")
             continue
 
-        marked = [digit for digit, (ratio, ink) in signals.items() if _is_marked(ratio, ink)]
+        marked = _marked_roll_digits(signals)
         if len(marked) == 1:
             selected = marked[0]
             digits.append(str(selected))
@@ -248,6 +358,48 @@ def _read_digit_grid(
     if program == "MTECH":
         return f"MT{roll_digits}", valid_columns, ratios_by_col, flags
     return roll_digits, valid_columns, ratios_by_col, flags
+
+
+def roll_sample_centers(
+    gray: np.ndarray,
+    manifest: dict,
+    dpi: float,
+    page_index: int,
+) -> dict[str, tuple[int, int]]:
+    """Return the exact roll/program centers the identity reader will sample."""
+    block = manifest["roll_number_block"]
+    if block.get("page", 1) != page_index:
+        return {}
+
+    calibrations = {
+        "BTECH": _calibrate_digit_grid(gray, manifest, dpi, block["btech_digits"]),
+        "MTECH": _calibrate_digit_grid(gray, manifest, dpi, block["mtech_digits"]),
+    }
+    centers: dict[str, tuple[int, int]] = {}
+
+    for program, coords in block["program_selector"].items():
+        calibration = calibrations.get(program)
+        if calibration is not None:
+            cx, cy = calibration.apply_mm(coords["x_mm"], coords["y_mm"], dpi)
+            centers[f"program.{program}"] = (int(round(cx)), int(round(cy)))
+        else:
+            centers[f"program.{program}"] = mm_to_px(coords["x_mm"], coords["y_mm"], dpi)
+
+    for grid_name, program in (("btech_digits", "BTECH"), ("mtech_digits", "MTECH")):
+        grid = block[grid_name]
+        calibration = calibrations.get(program)
+        for col in range(grid["columns"]):
+            for digit in range(10):
+                x_mm = grid["x_mm"] + col * grid["col_pitch_mm"]
+                y_mm = grid["y_mm"] + digit * grid["row_pitch_mm"]
+                label = f"{grid_name}.{col + 1}.{digit}"
+                if calibration is not None:
+                    cx, cy = calibration.apply_mm(x_mm, y_mm, dpi)
+                    centers[label] = (int(round(cx)), int(round(cy)))
+                else:
+                    centers[label] = mm_to_px(x_mm, y_mm, dpi)
+
+    return centers
 
 
 def read_roll_number(gray: np.ndarray, manifest: dict, dpi: float) -> RollRead:
@@ -299,5 +451,5 @@ def read_roll_number(gray: np.ndarray, manifest: dict, dpi: float) -> RollRead:
 
     if roll_no:
         roll_no = "".join(roll_no.upper().split())
-    confidence = "high" if not flags else "low"
+    confidence = _roll_confidence(roll_no, flags)
     return RollRead(program=program, roll_no=roll_no, confidence=confidence, ratios=ratios, review_flags=flags)

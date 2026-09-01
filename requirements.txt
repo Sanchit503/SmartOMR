@@ -1,15 +1,11 @@
-# SmartOMR dependencies: generator, MCQ grading, and the Phase 2 scan-evaluation
-# prototype promoted under omr.reader.
+# SmartOMR runtime dependencies: generator, parser, grading, and deployment health checks.
 reportlab>=4.1
 numpy>=1.26
 pillow>=10.2
 pydantic>=2.6
-opencv-python>=4.10
-
-# Testing / verification. pymupdf rasterizes a generated PDF back to an
-# image so tests can check what actually prints, not just what the layout
-# engine claims — it's also the PDF splitter PROJECT_SPEC.md Section 11 calls for
-# in Phase 2.
-pytest>=8.0
+opencv-python-headless>=4.10
 pypdf>=4.0
 pymupdf>=1.24
+
+# Development / CI.
+pytest>=8.0

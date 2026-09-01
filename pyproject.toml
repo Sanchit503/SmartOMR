@@ -3,10 +3,35 @@ name = "smartomr"
 version = "0.3.0"
 description = "SmartOMR — OMR-based assessment pipeline (BTP, IIIT Delhi)"
 requires-python = ">=3.11"
+dependencies = [
+    "numpy>=1.26",
+    "opencv-python-headless>=4.10",
+    "pillow>=10.2",
+    "pydantic>=2.6",
+    "pymupdf>=1.24",
+    "pypdf>=4.0",
+    "reportlab>=4.1",
+]
+
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
 
 [project.scripts]
 smartomr-generate = "omr.generator.main:main"
 smartomr-parse = "omr.workflows.parse:main"
+smartomr-health = "omr.health:main"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+]
+
+[tool.setuptools.packages.find]
+include = ["omr*", "prototype_eval*"]
+
+[tool.setuptools.package-data]
+"omr.generator" = ["configs/*.json"]
 
 [tool.pytest.ini_options]
 pythonpath = ["."]

@@ -5,8 +5,8 @@ MCQ grading and (from Phase 2) roll-number digit reading. `mcq` is the
 Section 7 auto-grader. Written-answer grading (Section 8) lands here in
 Phase 3, behind the provider-agnostic `grade_written()` interface.
 """
-from .bubbles import fill_ratio
-from .mcq import MCQGrade, MCQOutcome, MCQReading, grade_mcq_responses, read_mcq_responses
+from .bubbles import fill_ratio, student_mark_fill_ratio
+from .mcq import MCQGrade, MCQOutcome, MCQReading, grade_mcq_responses, mcq_sample_centers, read_mcq_responses
 
 __all__ = [
     "MCQGrade",
@@ -14,5 +14,7 @@ __all__ = [
     "MCQReading",
     "fill_ratio",
     "grade_mcq_responses",
+    "mcq_sample_centers",
     "read_mcq_responses",
+    "student_mark_fill_ratio",
 ]

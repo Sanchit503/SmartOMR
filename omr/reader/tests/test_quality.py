@@ -9,10 +9,13 @@ from PIL import Image
 
 from omr.generator.config import ExamConfig, WrittenQuestionConfig
 from omr.generator.generate import generate_exam
+from omr.grading.mcq import mcq_sample_centers
 from omr.reader.quality import (
+    _local_overlay_points,
     assess_alignment_quality,
     save_alignment_overlay,
     save_alignment_report,
+    save_sampling_overlay,
 )
 
 
@@ -45,7 +48,11 @@ def test_clean_generated_page_passes_alignment_quality_gate(tmp_path: Path):
     assert report.ok, report.to_dict()
     assert report.status == "ready"
     assert report.score > 0.80
+    assert report.metrics["geometry_quality"]["status"] == "ready"
+    assert report.metrics["local_quality"]["status"] == "ready"
+    assert report.metrics["image_quality"]["status"] in {"ready", "warning"}
     assert report.metrics["bubble_anchors"]["matched_fraction"] > 0.90
+    assert report.metrics["bubble_anchors"]["blocks"]["mcq_block_1"]["matched_fraction"] > 0.90
     assert report.metrics["page_marks"]["detected_index"] == 1
 
 
@@ -67,10 +74,23 @@ def test_alignment_debug_artifacts_are_written(tmp_path: Path):
     report = report.with_paths("debug/page_1_alignment.json", "debug/page_1_alignment_overlay.png")
 
     overlay = save_alignment_overlay(page, manifest, page_index=1, dpi=DPI, path=tmp_path / "overlay.png")
+    sampling_overlay = save_sampling_overlay(page, manifest, page_index=1, dpi=DPI, path=tmp_path / "sampling.png")
     saved_report = save_alignment_report(report, tmp_path / "alignment.json")
 
     assert overlay.exists()
+    assert sampling_overlay.exists()
     assert saved_report.exists()
     payload = json.loads(saved_report.read_text(encoding="utf-8"))
     assert payload["status"] == "ready"
     assert payload["overlay_path"] == "debug/page_1_alignment_overlay.png"
+
+
+def test_alignment_overlay_points_match_reader_sample_centers(tmp_path: Path):
+    manifest, page = _sheet(tmp_path)
+    entries = [entry for entry in manifest["mcq_block"] if entry.get("page", 1) == 1]
+
+    overlay_points = {(round(x), round(y)) for x, y in _local_overlay_points(page, manifest, page_index=1, dpi=DPI)}
+    sample_centers = mcq_sample_centers(page, entries, manifest, DPI)
+
+    assert sample_centers
+    assert all(center in overlay_points for center in sample_centers.values())

@@ -3,17 +3,21 @@
 OMR-based assessment system. BTP project, IIIT Delhi. Full spec and module boundaries are in
 [PROJECT_SPEC.md](PROJECT_SPEC.md) — read that first, it's the persistent design contract for this codebase.
 
-## Status: Phase 1 complete, Phase 2 prototype underway
+## Status: deployable batch workflow, backend/UI still pending
 
 Per the roadmap in PROJECT_SPEC.md Section 12:
 
 - [x] **Phase 1** — OMR sheet generator + pure MCQ grading pipeline
-- [x] **Phase 2 prototype** — scan/PDF loading, fiducial alignment, page-index reading,
-  alignment quality reports, roll-number reading, roster CSV matching, and MCQ result export
-- [ ] Phase 2 production hardening — real scan/photo calibration, verification email,
-  persistent review queue, and duplicate-sheet handling
+- [x] **Phase 2 deployable batch parser** — scan/PDF loading, fiducial alignment, page-index reading,
+  alignment quality reports, roll-number reading, roster CSV matching, MCQ result export,
+  production package entrypoints, Docker runtime, and health checks
+- [ ] Phase 2 service hardening — upload API, verification email, persistent review queue,
+  duplicate-sheet handling, and production scan-calibration dataset
 - [ ] Phase 3 — Written-answer grading (LLM-assisted)
 - [ ] Phase 4 — Marks email, re-eval logging, admin panel
+
+For production install, Docker, health checks, and mounted data folders, see
+[DEPLOYMENT.md](DEPLOYMENT.md).
 
 ## Generate a sheet
 
@@ -128,7 +132,9 @@ parse_index.json                 batch summary
 sheets/<scan_id>/parse.json       full debug/result JSON for one sheet
 sheets/<scan_id>/pages/page_1.png canonical aligned page image
 sheets/<scan_id>/debug/page_1_alignment.json         post-warp quality metrics
+sheets/<scan_id>/debug/page_1_aligned_color.png      color-preserved aligned page for review
 sheets/<scan_id>/debug/page_1_alignment_overlay.png  visual overlay of expected anchors
+sheets/<scan_id>/debug/page_1_sampling_overlay.png   exact full/core sample regions used by the reader
 sheets/<scan_id>/written/Q11.png  written-answer crop
 ```
 
@@ -202,7 +208,7 @@ omr/
                      identity + page bars), test_preflight.py, test_generator.py,
                      test_main.py, plus test_printed_sheet.py — which rasterizes the
                      real PDF and inspects the pixels
-  reader/        Modules 2/3 prototype — scan/PDF loading, fiducial alignment,
+  reader/        Modules 2/3 — scan/PDF loading, fiducial alignment,
                    alignment quality reports, page-index reading, and roll-number/program decoding
   grading/       Modules 4/5 — everything that READS a sheet (Sections 7-8)
     bubbles.py     Bubble measurement: fill_ratio (hard threshold) + ink_density (mean darkness)
@@ -212,7 +218,7 @@ omr/
   workflows/     File-based scan evaluation workflow that composes reader + grading + CSV I/O
     parse.py       Official parser: canonical pages, alignment diagnostics, identity, MCQs,
                      written crops, JSON artifacts
-    evaluate.py    Older MCQ summary/evaluation workflow used by the professor-demo CLI
+    evaluate.py    Older MCQ summary/evaluation workflow retained for compatibility
   verify.py      Round-trips a generated sheet: fills it in, grades it, checks it came back
 prototype_eval/  Backward-compatible professor-demo CLI and sample CSVs; implementation is in omr/
 data/exams/      Generated PDFs + manifests (gitignored)
@@ -315,7 +321,9 @@ too-close-to-call margin, and multiple fills are flagged the same way.
 ```bash
 python -m venv .venv
 .venv\Scripts\activate
-pip install -r requirements.txt
+python -m pip install --upgrade pip
+python -m pip install .[dev]
+smartomr-health --data-dir data
 ```
 
 ## Run tests
@@ -447,8 +455,8 @@ Worth flagging to your professor:
 - **No question-paper/rubric ingestion** — that's Module 5 (Phase 3); Phase 1 lays out bubbles and
   answer boxes, not question text.
 - **No database** — `Exam`/`Question`/etc. (PROJECT_SPEC.md Section 3) are not wired up yet.
-- **Scan evaluation is still a prototype** — `omr.reader` now writes per-page alignment quality
-  reports and sends weak alignment to review, but thresholds still need calibration against real
-  printed sheets, phone photos, lighting variation, toner spread, and duplicate uploads.
+- **Scan evaluation is deployable as a batch workflow, not yet a hosted web service** — `omr.reader`
+  writes per-page alignment quality reports, color debug pages, overlays, and review flags, but
+  thresholds still need calibration against a larger real printed-sheet dataset.
 - **No verification email or review UI yet** — low-confidence identity/MCQ reads are flagged in
   result details, but there is no persistent professor-facing queue yet.

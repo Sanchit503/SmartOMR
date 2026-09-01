@@ -1,9 +1,9 @@
 """MCQ auto-grading (Section 7 of PROJECT_SPEC.md).
 
-Reads fill ratios purely from manifest coordinates (never hardcoded
-positions), then grades against a supplied answer key. Blank vs. multiple-
-filled are kept as distinct outcomes so a professor can tell a scanning
-issue apart from a genuine blank (Section 7, step 3).
+Reads fill ratios from manifest-defined positions, with a local block
+registration step when printed bubble anchors are visible. Blank vs.
+multiple-filled are kept as distinct outcomes so a professor can tell a
+scanning issue apart from a genuine blank (Section 7, step 3).
 
 Two decisions here exist because the output of this module is a grade:
 
@@ -29,7 +29,8 @@ from enum import Enum
 import numpy as np
 
 from ..contracts.geometry import mm_to_px, px_per_mm
-from .bubbles import fill_ratio, ink_density
+from ..local_registration import fit_ordered_local_transform
+from .bubbles import ink_density, student_mark_fill_ratio
 
 # Above this, a bubble counts as deliberately filled.
 DEFAULT_FILL_THRESHOLD = 0.5
@@ -46,6 +47,7 @@ DEFAULT_MIN_MARGIN = 0.18
 # phone photo sits under ~0.05; a light pencil fill covering the whole
 # bubble reaches ~0.25 while still scoring 0.0 on the hard fill threshold.
 DEFAULT_INK_FLOOR = 0.24
+DEFAULT_INK_EXCESS_FLOOR = 0.10
 
 
 def _cv2():
@@ -188,8 +190,13 @@ def _calibrate_mcq_centers(
         }
         expected_x = [expected_by_entry[group_entries[0]["q_no"]][option][0] for option in options]
         expected_y = [expected_by_entry[entry["q_no"]][options[0]][1] for entry in group_entries]
-        all_x = [center[0] for centers in expected_by_entry.values() for center in centers.values()]
-        all_y = [center[1] for centers in expected_by_entry.values() for center in centers.values()]
+        expected_items = [
+            ((entry["q_no"], option), expected_by_entry[entry["q_no"]][option])
+            for entry in group_entries
+            for option in options
+        ]
+        all_x = [center[0] for _key, center in expected_items]
+        all_y = [center[1] for _key, center in expected_items]
 
         pad = round(8.0 * scale)
         x0 = max(0, int(min(all_x) - pad))
@@ -209,13 +216,50 @@ def _calibrate_mcq_centers(
         if x_run is None or y_run is None:
             continue
 
-        for row_index, entry in enumerate(group_entries):
-            for option_index, option in enumerate(options):
-                calibrated[(entry["q_no"], option)] = (
-                    int(round(x_run[option_index])),
-                    int(round(y_run[row_index])),
-                )
+        expected_points = [
+            expected_by_entry[entry["q_no"]][option]
+            for entry in group_entries
+            for option in options
+        ]
+        observed_points = [
+            (x_run[option_index], y_run[row_index])
+            for row_index, _entry in enumerate(group_entries)
+            for option_index, _option in enumerate(options)
+        ]
+        transform = fit_ordered_local_transform(
+            expected_points,
+            observed_points,
+            min_points=min(3, len(expected_points)),
+            ransac_reproj_threshold_px=1.6 * scale,
+        )
+        if transform is None:
+            continue
+
+        for key, center in expected_items:
+            cx, cy = transform.apply(center)
+            calibrated[key] = (int(round(cx)), int(round(cy)))
     return calibrated
+
+
+def mcq_sample_centers(
+    gray: np.ndarray,
+    entries: list[dict],
+    manifest: dict,
+    dpi: float,
+) -> dict[tuple[int, str], tuple[int, int]]:
+    """Return the exact MCQ centers the reader will sample.
+
+    Centers come from local block calibration when the printed bubble grid is
+    detectable; otherwise they fall back to the manifest coordinates. Debug
+    overlays use this too, so the visual marker matches the scoring path.
+    """
+    calibrated = _calibrate_mcq_centers(gray, entries, manifest, dpi)
+    centers: dict[tuple[int, str], tuple[int, int]] = {}
+    for entry in entries:
+        expected = _entry_option_centers(entry, manifest, dpi)
+        for option, center in expected.items():
+            centers[(int(entry["q_no"]), option)] = calibrated.get((int(entry["q_no"]), option), center)
+    return centers
 
 
 class MCQOutcome(str, Enum):
@@ -276,10 +320,16 @@ def _assess(
     bubble is "marked" if either signal says so, which is what catches a
     pencil fill too light to cross the hard threshold.
     """
+    blankish_inks = [ink for opt, ink in inks.items() if ratios[opt] < ambiguous_floor]
+    local_ink_baseline = float(np.median(blankish_inks)) if blankish_inks else 0.0
+
     def is_marked(opt: str) -> bool:
         """Did a student put something here? Either signal is enough — a
         light pencil fill scores 0.00 on `ratios` but shows up in `inks`."""
-        return ratios[opt] >= ambiguous_floor or inks.get(opt, 0.0) >= ink_floor
+        ink = inks.get(opt, 0.0)
+        if ratios[opt] >= ambiguous_floor:
+            return True
+        return ink >= ink_floor and (ink - local_ink_baseline) >= DEFAULT_INK_EXCESS_FLOOR
 
     def describe(opt: str) -> str:
         return f"'{opt}' (fill {ratios[opt]:.2f}, ink {inks.get(opt, 0.0):.2f})"
@@ -358,8 +408,6 @@ def read_mcq_responses(
     pages, so grading a single question always reads its own page's image —
     never guessing from whichever image happens to be at hand (Section 2,
     principle 4)."""
-    label_offset_mm = manifest["mcq_label_offset_mm"]
-    option_pitch_mm = manifest["mcq_option_pitch_mm"]
     # Measure the inset disc, not the printed one — see the module docstring.
     radius_px = max(1, round(manifest["bubble_sample_radius_mm"] * px_per_mm(dpi)))
 
@@ -369,7 +417,7 @@ def read_mcq_responses(
     for entry in manifest["mcq_block"]:
         entries_by_page.setdefault(entry.get("page", 1), []).append(entry)
     calibrated_by_page = {
-        page: _calibrate_mcq_centers(gray_by_page[page], entries, manifest, dpi)
+        page: mcq_sample_centers(gray_by_page[page], entries, manifest, dpi)
         for page, entries in entries_by_page.items()
         if page in gray_by_page
     }
@@ -384,9 +432,8 @@ def read_mcq_responses(
         ratios: dict[str, float] = {}
         inks: dict[str, float] = {}
         for i, opt in enumerate(entry["options"]):
-            ox_mm = entry["x_mm"] + label_offset_mm + i * option_pitch_mm
-            cx, cy = calibrated_centers.get((entry["q_no"], opt), mm_to_px(ox_mm, entry["y_mm"], dpi))
-            ratios[opt] = fill_ratio(image, cx, cy, radius_px)
+            cx, cy = calibrated_centers[(entry["q_no"], opt)]
+            ratios[opt] = student_mark_fill_ratio(image, cx, cy, radius_px)
             inks[opt] = ink_density(image, cx, cy, radius_px)
 
         outcome, selected, confidence, needs_review, reason = _assess(

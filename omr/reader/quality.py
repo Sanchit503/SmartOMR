@@ -18,6 +18,9 @@ import numpy as np
 from PIL import Image, ImageDraw
 
 from omr.contracts.geometry import canonical_size_px, mm_to_px, px_per_mm
+from omr.grading.bubbles import STUDENT_MARK_CORE_RATIO
+from omr.grading.mcq import mcq_sample_centers
+from omr.reader.identity import roll_sample_centers
 
 
 @dataclass(frozen=True)
@@ -62,6 +65,16 @@ def _gray_array(image: object) -> np.ndarray:
     if gray.ndim == 3:
         gray = gray.mean(axis=2)
     return gray.astype(np.uint8, copy=False)
+
+
+def _rgb_display_array(image: object) -> np.ndarray:
+    array = np.asarray(image)
+    if array.ndim == 2:
+        return np.repeat(array[:, :, None], 3, axis=2).astype(np.uint8, copy=False)
+    if array.ndim == 3 and array.shape[2] >= 3:
+        return array[:, :, :3][:, :, ::-1].astype(np.uint8, copy=False)
+    gray = _gray_array(image)
+    return np.repeat(gray[:, :, None], 3, axis=2).astype(np.uint8, copy=False)
 
 
 def _rect_bounds(
@@ -254,6 +267,84 @@ def _expected_bubble_anchors(manifest: dict, page_index: int) -> list[tuple[str,
     return anchors
 
 
+def _expected_bubble_anchor_blocks(manifest: dict, page_index: int) -> list[tuple[str, list[tuple[str, float, float]]]]:
+    """Return nearby anchor groups so local stretch can be measured by region."""
+    blocks: list[tuple[str, list[tuple[str, float, float]]]] = []
+    label_offset = manifest["mcq_label_offset_mm"]
+    option_pitch = manifest["mcq_option_pitch_mm"]
+
+    mcq_groups: dict[tuple[float, tuple[str, ...]], list[dict]] = {}
+    for entry in manifest["mcq_block"]:
+        if entry.get("page", 1) != page_index:
+            continue
+        mcq_groups.setdefault((float(entry["x_mm"]), tuple(entry["options"])), []).append(entry)
+    for index, ((_x_mm, options), entries) in enumerate(sorted(mcq_groups.items()), start=1):
+        anchors: list[tuple[str, float, float]] = []
+        for entry in sorted(entries, key=lambda item: (item["y_mm"], item["q_no"])):
+            for option_index, option in enumerate(options):
+                anchors.append(
+                    (
+                        f"Q{entry['q_no']}.{option}",
+                        entry["x_mm"] + label_offset + option_index * option_pitch,
+                        entry["y_mm"],
+                    )
+                )
+        if anchors:
+            blocks.append((f"mcq_block_{index}", anchors))
+
+    if manifest["roll_number_block"].get("page", 1) == page_index:
+        block = manifest["roll_number_block"]
+        for grid_name, program in (("btech_digits", "BTECH"), ("mtech_digits", "MTECH")):
+            anchors = []
+            selector = block["program_selector"].get(program)
+            if selector is not None:
+                anchors.append((f"program.{program}", selector["x_mm"], selector["y_mm"]))
+            grid = block[grid_name]
+            for col in range(grid["columns"]):
+                for digit in range(10):
+                    anchors.append(
+                        (
+                            f"{grid_name}.{col + 1}.{digit}",
+                            grid["x_mm"] + col * grid["col_pitch_mm"],
+                            grid["y_mm"] + digit * grid["row_pitch_mm"],
+                        )
+                    )
+            blocks.append((f"roll_{program.lower()}", anchors))
+
+    continuation = [
+        (f"continuation_program.{choice['program']}", choice["x_mm"], choice["y_mm"])
+        for choice in manifest["continuation_program_choices"]
+        if choice.get("page", 1) == page_index
+    ]
+    if continuation:
+        blocks.append(("continuation_program", continuation))
+
+    return blocks
+
+
+def _summarize_anchor_residuals(
+    residuals_px: list[float],
+    missing: list[str],
+    expected_count: int,
+    scale: float,
+) -> dict[str, Any]:
+    matched_count = len(residuals_px)
+    matched_fraction = matched_count / expected_count if expected_count else 1.0
+    mean_residual_px = float(np.mean(residuals_px)) if residuals_px else 0.0
+    max_residual_px = max(residuals_px, default=0.0)
+    return {
+        "expected": expected_count,
+        "matched": matched_count,
+        "matched_fraction": round(matched_fraction, 3),
+        "missing_sample": missing[:12],
+        "missing_count": len(missing),
+        "mean_residual_px": round(mean_residual_px, 2),
+        "max_residual_px": round(max_residual_px, 2),
+        "mean_residual_mm": round(mean_residual_px / scale, 3),
+        "max_residual_mm": round(max_residual_px / scale, 3),
+    }
+
+
 def _measure_marker_quality(
     gray: np.ndarray,
     manifest: dict,
@@ -399,51 +490,56 @@ def _measure_bubble_anchors(
     review_flags: list[str],
 ) -> dict[str, Any]:
     scale = px_per_mm(dpi)
-    anchors = _expected_bubble_anchors(manifest, page_index)
+    anchor_blocks = _expected_bubble_anchor_blocks(manifest, page_index)
+    anchors = [anchor for _name, block_anchors in anchor_blocks for anchor in block_anchors]
     residuals_px: list[float] = []
     missing: list[str] = []
+    blocks: dict[str, Any] = {}
 
-    for label, x_mm, y_mm in anchors:
-        center = _nearest_bubble_center(gray, x_mm, y_mm, dpi)
-        if center is None:
-            missing.append(label)
-            continue
-        expected_x, expected_y = mm_to_px(x_mm, y_mm, dpi)
-        residuals_px.append(math.hypot(center[0] - expected_x, center[1] - expected_y))
+    for block_name, block_anchors in anchor_blocks:
+        block_residuals: list[float] = []
+        block_missing: list[str] = []
+        for label, x_mm, y_mm in block_anchors:
+            center = _nearest_bubble_center(gray, x_mm, y_mm, dpi)
+            if center is None:
+                block_missing.append(label)
+                continue
+            expected_x, expected_y = mm_to_px(x_mm, y_mm, dpi)
+            block_residuals.append(math.hypot(center[0] - expected_x, center[1] - expected_y))
+        blocks[block_name] = _summarize_anchor_residuals(
+            block_residuals,
+            block_missing,
+            len(block_anchors),
+            scale,
+        )
+        residuals_px.extend(block_residuals)
+        missing.extend(block_missing)
 
-    expected_count = len(anchors)
-    matched_count = len(residuals_px)
-    matched_fraction = matched_count / expected_count if expected_count else 1.0
-    mean_residual_px = float(np.mean(residuals_px)) if residuals_px else 0.0
-    max_residual_px = max(residuals_px, default=0.0)
+    summary = _summarize_anchor_residuals(residuals_px, missing, len(anchors), scale)
+    matched_count = int(summary["matched"])
+    expected_count = int(summary["expected"])
+    matched_fraction = float(summary["matched_fraction"])
+    mean_residual_mm = float(summary["mean_residual_mm"])
+    max_residual_mm = float(summary["max_residual_mm"])
 
     if expected_count >= 8 and matched_fraction < 0.72:
         review_flags.append(
             "bubble anchor detection is weak "
             f"({matched_count}/{expected_count} printed bubbles re-detected)"
         )
-    if residuals_px and mean_residual_px / scale > 0.85:
+    if residuals_px and mean_residual_mm > 0.85:
         review_flags.append(
             "bubble grid is locally shifted "
-            f"(mean residual {mean_residual_px / scale:.2f}mm)"
+            f"(mean residual {mean_residual_mm:.2f}mm)"
         )
-    if residuals_px and max_residual_px / scale > 1.75:
+    if residuals_px and max_residual_mm > 1.75:
         review_flags.append(
             "at least one bubble anchor is far from its manifest position "
-            f"(max residual {max_residual_px / scale:.2f}mm)"
+            f"(max residual {max_residual_mm:.2f}mm)"
         )
 
-    return {
-        "expected": expected_count,
-        "matched": matched_count,
-        "matched_fraction": round(matched_fraction, 3),
-        "missing_sample": missing[:12],
-        "missing_count": len(missing),
-        "mean_residual_px": round(mean_residual_px, 2),
-        "max_residual_px": round(max_residual_px, 2),
-        "mean_residual_mm": round(mean_residual_px / scale, 3),
-        "max_residual_mm": round(max_residual_px / scale, 3),
-    }
+    summary["blocks"] = blocks
+    return summary
 
 
 def _measure_image_quality(gray: np.ndarray, warnings: list[str], review_flags: list[str]) -> dict[str, Any]:
@@ -490,6 +586,14 @@ def _score_report(metrics: dict[str, Any], review_flags: list[str], warnings: li
     return round(max(0.0, min(1.0, score)), 3)
 
 
+def _quality_status(review_flags: list[str], warnings: list[str] | None = None) -> str:
+    if review_flags:
+        return "needs_review"
+    if warnings:
+        return "warning"
+    return "ready"
+
+
 def assess_alignment_quality(
     image: object,
     manifest: dict,
@@ -500,21 +604,41 @@ def assess_alignment_quality(
     gray = _gray_array(image)
     warnings: list[str] = []
     review_flags: list[str] = []
+    geometry_flags: list[str] = []
+    local_flags: list[str] = []
+    image_flags: list[str] = []
     metrics: dict[str, Any] = {}
 
     expected_size = canonical_size_px(manifest, dpi)
     actual_size = (gray.shape[1], gray.shape[0])
     metrics["page_size"] = {"expected_px": list(expected_size), "actual_px": list(actual_size)}
     if abs(actual_size[0] - expected_size[0]) > 2 or abs(actual_size[1] - expected_size[1]) > 2:
-        review_flags.append(
+        geometry_flags.append(
             f"canonical page size is {actual_size[0]}x{actual_size[1]}px, "
             f"expected {expected_size[0]}x{expected_size[1]}px"
         )
 
-    metrics["registration_markers"] = _measure_marker_quality(gray, manifest, page_index, dpi, review_flags)
-    metrics["page_marks"] = _measure_page_marks(gray, manifest, page_index, dpi, review_flags)
-    metrics["bubble_anchors"] = _measure_bubble_anchors(gray, manifest, page_index, dpi, review_flags)
-    metrics["image_quality"] = _measure_image_quality(gray, warnings, review_flags)
+    metrics["registration_markers"] = _measure_marker_quality(gray, manifest, page_index, dpi, geometry_flags)
+    metrics["page_marks"] = _measure_page_marks(gray, manifest, page_index, dpi, geometry_flags)
+    metrics["bubble_anchors"] = _measure_bubble_anchors(gray, manifest, page_index, dpi, local_flags)
+    metrics["image_quality"] = _measure_image_quality(gray, warnings, image_flags)
+    metrics["image_quality"]["status"] = _quality_status(image_flags, warnings)
+
+    review_flags.extend(geometry_flags)
+    review_flags.extend(local_flags)
+    review_flags.extend(image_flags)
+    metrics["geometry_quality"] = {
+        "status": _quality_status(geometry_flags),
+        "review_flags": geometry_flags,
+        "page_size": metrics["page_size"],
+        "registration_markers": metrics["registration_markers"],
+        "page_marks": metrics["page_marks"],
+    }
+    metrics["local_quality"] = {
+        "status": _quality_status(local_flags),
+        "review_flags": local_flags,
+        "bubble_anchors": metrics["bubble_anchors"],
+    }
 
     score = _score_report(metrics, review_flags, warnings)
     status = "ready" if not review_flags else "needs_review"
@@ -559,6 +683,45 @@ def _draw_circle_mm(
     draw.ellipse([cx - radius, cy - radius, cx + radius, cy + radius], outline=color, width=width)
 
 
+def _draw_circle_px(
+    draw: ImageDraw.ImageDraw,
+    cx: float,
+    cy: float,
+    radius_px: float,
+    color: tuple[int, int, int, int],
+    width: int = 2,
+) -> None:
+    radius = int(round(radius_px))
+    draw.ellipse(
+        [
+            int(round(cx)) - radius,
+            int(round(cy)) - radius,
+            int(round(cx)) + radius,
+            int(round(cy)) + radius,
+        ],
+        outline=color,
+        width=width,
+    )
+
+
+def _local_overlay_points(
+    gray: np.ndarray,
+    manifest: dict,
+    page_index: int,
+    dpi: float,
+) -> list[tuple[float, float]]:
+    entries = [entry for entry in manifest["mcq_block"] if entry.get("page", 1) == page_index]
+    centers = [
+        (float(cx), float(cy))
+        for cx, cy in mcq_sample_centers(gray, entries, manifest, dpi).values()
+    ]
+    centers.extend(
+        (float(cx), float(cy))
+        for cx, cy in roll_sample_centers(gray, manifest, dpi, page_index).values()
+    )
+    return centers
+
+
 def save_alignment_overlay(
     image: object,
     manifest: dict,
@@ -568,7 +731,7 @@ def save_alignment_overlay(
 ) -> Path:
     """Save a visual overlay of the manifest's expected alignment anchors."""
     gray = _gray_array(image)
-    base = Image.fromarray(gray, mode="L").convert("RGB")
+    base = Image.fromarray(_rgb_display_array(image), mode="RGB")
     overlay = Image.new("RGBA", base.size, (255, 255, 255, 0))
     draw = ImageDraw.Draw(overlay)
 
@@ -612,7 +775,38 @@ def save_alignment_overlay(
 
     bubble_radius = manifest["bubble_radius_mm"]
     for _label, x_mm, y_mm in _expected_bubble_anchors(manifest, page_index):
-        _draw_circle_mm(draw, x_mm, y_mm, bubble_radius, dpi, (220, 30, 40, 180), width=2)
+        _draw_circle_mm(draw, x_mm, y_mm, bubble_radius, dpi, (220, 30, 40, 95), width=1)
+
+    local_radius_px = bubble_radius * px_per_mm(dpi)
+    for cx, cy in _local_overlay_points(gray, manifest, page_index, dpi):
+        _draw_circle_px(draw, cx, cy, local_radius_px, (0, 175, 155, 210), width=2)
+
+    composed = Image.alpha_composite(base.convert("RGBA"), overlay).convert("RGB")
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    composed.save(path)
+    return path
+
+
+def save_sampling_overlay(
+    image: object,
+    manifest: dict,
+    page_index: int,
+    dpi: float,
+    path: str | Path,
+) -> Path:
+    """Save the exact bubble sample regions used by MCQ/roll readers."""
+    gray = _gray_array(image)
+    base = Image.fromarray(_rgb_display_array(image), mode="RGB")
+    overlay = Image.new("RGBA", base.size, (255, 255, 255, 0))
+    draw = ImageDraw.Draw(overlay)
+
+    sample_radius_px = max(1, round(manifest["bubble_sample_radius_mm"] * px_per_mm(dpi)))
+    core_radius_px = max(1, round(sample_radius_px * STUDENT_MARK_CORE_RATIO))
+
+    for cx, cy in _local_overlay_points(gray, manifest, page_index, dpi):
+        _draw_circle_px(draw, cx, cy, sample_radius_px, (255, 176, 0, 210), width=2)
+        _draw_circle_px(draw, cx, cy, core_radius_px, (0, 205, 80, 240), width=2)
 
     composed = Image.alpha_composite(base.convert("RGBA"), overlay).convert("RGB")
     path = Path(path)

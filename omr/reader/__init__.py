@@ -14,7 +14,7 @@ from .scan import (
     detect_page_index,
     load_scan_pages,
 )
-from .quality import assess_alignment_quality, save_alignment_overlay, save_alignment_report
+from .quality import assess_alignment_quality, save_alignment_overlay, save_alignment_report, save_sampling_overlay
 from .written import crop_written_responses
 
 __all__ = [
@@ -27,6 +27,7 @@ __all__ = [
     "load_scan_pages",
     "save_alignment_overlay",
     "save_alignment_report",
+    "save_sampling_overlay",
     "crop_written_responses",
     "read_roll_number",
 ]

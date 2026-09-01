@@ -35,7 +35,7 @@ def test_a_normal_pen_mark_round_trips_completely(tmp_path):
     result = verify_sheet(manifest_path)
     assert result.ok, result.format()
     assert result.recovered == result.total_questions == 20
-    assert result.marks_awarded == 40  # 20 questions x 2 marks, all correct
+    assert result.marks_awarded == 40
     assert not result.flagged
 
 
@@ -72,7 +72,6 @@ def test_a_mark_too_faint_to_read_is_reported_not_passed(tmp_path):
     assert not result.ok
     assert result.recovered == 0
     assert "MISMATCH" in result.format()
-    # ...but every one is still flagged for a human rather than silently lost.
     assert len(result.flagged) == result.total_questions
 
 
@@ -95,32 +94,28 @@ def test_a_manifest_whose_pdf_is_missing_fails_loudly(tmp_path):
         verify_sheet(manifest_path)
 
 
-def test_a_uniform_manifest_drift_is_explicitly_not_what_this_catches(tmp_path):
-    """Documents a real limit instead of pretending it away.
+def test_a_uniform_manifest_drift_still_needs_preflight(tmp_path):
+    """Documents a remaining limit instead of pretending it away.
 
-    The verifier fills bubbles at the manifest's coordinates and reads them
-    back at the same coordinates, so a manifest that has drifted uniformly
-    away from the printed sheet still round-trips perfectly. Manifest-vs-PDF
-    agreement is preflight's job — a drifted coordinate lands on printed ink
-    or bare paper where a bubble should be, and its empty-bubble check sees
-    that. This tool checks the generate -> read -> grade path agrees with
-    itself on your config; the two are complementary, and neither alone is
-    sufficient.
+    The verifier fills bubbles at the manifest coordinates and reads them
+    back through the same manifest-guided pipeline, so a uniform manifest
+    drift can still round-trip. Preflight compares the manifest against the
+    rendered PDF and remains the check for print/layout agreement.
     """
     import json
 
     manifest_path, pdf_path = build(tmp_path)
     manifest = json.loads(manifest_path.read_text())
     for entry in manifest["mcq_block"]:
-        entry["y_mm"] += 4.0  # half a row out of alignment with the print
+        entry["y_mm"] += 4.0
     manifest_path.write_text(json.dumps(manifest))
 
-    assert verify_sheet(manifest_path).ok, "round-trip is self-consistent by construction"
+    result = verify_sheet(manifest_path)
+    assert result.ok, "round-trip is self-consistent by construction"
 
-    # The same drift, pushed onto printed ink, is caught by preflight.
     from omr.generator.preflight import check_sheet
 
     for entry in manifest["mcq_block"]:
-        entry["y_mm"] -= 8.5  # onto the option-letter header row
+        entry["y_mm"] -= 8.5
     report = check_sheet(pdf_path, manifest)
     assert not report.ok, report.format()

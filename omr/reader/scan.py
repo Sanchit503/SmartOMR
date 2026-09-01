@@ -49,28 +49,47 @@ class _SquareCandidate:
     bbox: tuple[int, int, int, int]
 
 
+@dataclass(frozen=True)
+class _AlignmentSource:
+    label: str
+    detection_image: np.ndarray
+    source_confidence: float
+    marker_estimates: np.ndarray | None
+    points_to_original: np.ndarray | None = None
+
+
 CORNER_ORDER = ("TL", "TR", "BR", "BL")
 CORNER_INDEX = {corner: index for index, corner in enumerate(CORNER_ORDER)}
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"}
 SMARTOMR_VALIDATION_PREFIX = "could not validate this as a SmartOMR sheet"
 
 
+def _final_warp_interpolation(cv2_module: object) -> int:
+    """Interpolation used for the one final warp from the untouched source."""
+    return cv2_module.INTER_CUBIC
+
+
 def load_scan_pages(path: str | Path, dpi: float) -> list[np.ndarray]:
-    """Load a scanned image or PDF as grayscale page arrays."""
+    """Load a scanned image or PDF page array.
+
+    Images are decoded in color so the final perspective warp can work from
+    the original pixels. PDF pages are rendered grayscale because scanned PDFs
+    already arrive as page rasters and the reader only measures ink intensity.
+    """
     cv2 = _cv2()
     path = Path(path)
     suffix = path.suffix.lower()
     if suffix == ".pdf":
         try:
-            import fitz
+            import pymupdf
         except ImportError as exc:
             raise RuntimeError("PyMuPDF is required to read scanned PDFs") from exc
-        doc = fitz.open(path)
+        doc = pymupdf.open(path)
         pages: list[np.ndarray] = []
         zoom = dpi / 72.0
-        matrix = fitz.Matrix(zoom, zoom)
+        matrix = pymupdf.Matrix(zoom, zoom)
         for page in doc:
-            pix = page.get_pixmap(matrix=matrix, colorspace=fitz.csGRAY, alpha=False)
+            pix = page.get_pixmap(matrix=matrix, colorspace=pymupdf.csGRAY, alpha=False)
             pages.append(np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width).copy())
         if not pages:
             raise ScanError(f"{path} has no pages")
@@ -78,12 +97,20 @@ def load_scan_pages(path: str | Path, dpi: float) -> list[np.ndarray]:
 
     if suffix in IMAGE_EXTENSIONS:
         data = np.fromfile(path, dtype=np.uint8)
-        image = cv2.imdecode(data, cv2.IMREAD_GRAYSCALE)
+        image = cv2.imdecode(data, cv2.IMREAD_COLOR)
         if image is None:
             raise ScanError(f"could not decode image {path}")
         return [image]
 
     raise ScanError(f"unsupported scan type {suffix!r}; use an image or PDF")
+
+
+def _as_image_array(image: np.ndarray) -> np.ndarray:
+    cv2 = _cv2()
+    array = np.asarray(image)
+    if array.ndim == 3 and array.shape[2] == 4:
+        array = cv2.cvtColor(array, cv2.COLOR_BGRA2BGR)
+    return array.astype(np.uint8, copy=False)
 
 
 def _binary_dark(gray: np.ndarray) -> np.ndarray:
@@ -93,6 +120,12 @@ def _binary_dark(gray: np.ndarray) -> np.ndarray:
     blur = cv2.GaussianBlur(gray, (5, 5), 0)
     _threshold, binary = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU)
     return binary
+
+
+def _denoise_for_detection(gray: np.ndarray) -> np.ndarray:
+    """Light working copy for geometry detection; never used for final reading."""
+    cv2 = _cv2()
+    return cv2.GaussianBlur(gray, (3, 3), 0)
 
 
 def _edge_map(gray: np.ndarray) -> np.ndarray:
@@ -519,7 +552,7 @@ def _rough_page_warp(
     manifest: dict,
     dpi: float,
     page_quad: tuple[np.ndarray, float] | None = None,
-) -> tuple[np.ndarray, float] | None:
+) -> tuple[np.ndarray, float, np.ndarray] | None:
     cv2 = _cv2()
     page_quad = page_quad if page_quad is not None else _find_page_quad(gray, manifest)
     if page_quad is None:
@@ -528,6 +561,7 @@ def _rough_page_warp(
     target_points = _page_target_corners_px(manifest, dpi)
     width, height = canonical_size_px(manifest, dpi)
     transform = cv2.getPerspectiveTransform(source_points.astype(np.float32), target_points)
+    inverse_transform = cv2.getPerspectiveTransform(target_points, source_points.astype(np.float32))
     warped = cv2.warpPerspective(
         gray,
         transform,
@@ -536,25 +570,41 @@ def _rough_page_warp(
         borderMode=cv2.BORDER_CONSTANT,
         borderValue=255,
     )
-    return warped, confidence
+    return warped, confidence, inverse_transform
 
 
 def _alignment_sources(
-    gray: np.ndarray,
+    gray_raw: np.ndarray,
+    gray_detection: np.ndarray,
     manifest: dict,
     dpi: float,
-) -> list[tuple[str, np.ndarray, float, np.ndarray | None]]:
-    sources: list[tuple[str, np.ndarray, float, np.ndarray | None]] = []
-    page_quad = _find_page_quad(gray, manifest)
+) -> list[_AlignmentSource]:
+    sources: list[_AlignmentSource] = []
+    page_quad = _find_page_quad(gray_detection, manifest)
     if page_quad is not None:
         marker_estimates = _project_expected_fiducials_from_page_quad(page_quad[0], manifest, dpi)
-        sources.append(("marker geometry plus page boundary", gray, 1.0, marker_estimates))
+        sources.append(
+            _AlignmentSource(
+                label="marker geometry plus page boundary",
+                detection_image=gray_raw,
+                source_confidence=1.0,
+                marker_estimates=marker_estimates,
+            )
+        )
 
-    rough = _rough_page_warp(gray, manifest, dpi, page_quad=page_quad)
+    rough = _rough_page_warp(gray_raw, manifest, dpi, page_quad=page_quad)
     if rough is not None:
-        rough_image, confidence = rough
-        sources.append(("rough page contour", rough_image, confidence, _expected_fiducials_px(manifest, dpi)))
-    sources.append(("marker geometry", gray, 1.0, None))
+        rough_image, confidence, rough_to_original = rough
+        sources.append(
+            _AlignmentSource(
+                label="rough page contour",
+                detection_image=rough_image,
+                source_confidence=confidence,
+                marker_estimates=_expected_fiducials_px(manifest, dpi),
+                points_to_original=rough_to_original,
+            )
+        )
+    sources.append(_AlignmentSource("marker geometry", gray_raw, 1.0, None))
     return sources
 
 
@@ -592,6 +642,7 @@ def _rect_dark_fraction(
     shrink: float = 1.0,
     threshold: int = 150,
 ) -> float:
+    gray = _as_gray_array(gray)
     cx, cy = mm_to_px(x_mm, y_mm, dpi)
     half_w = max(1, int(round(width_mm * px_per_mm(dpi) * shrink / 2)))
     half_h = max(1, int(round(height_mm * px_per_mm(dpi) * shrink / 2)))
@@ -627,13 +678,14 @@ def _warp_with_best_orientation(gray: np.ndarray, source_points: np.ndarray, man
     for shift in range(4):
         rotated_source = np.roll(source_points, shift, axis=0).astype(np.float32)
         transform = cv2.getPerspectiveTransform(rotated_source, target_points)
+        border_value = (255,) * gray.shape[2] if gray.ndim == 3 else 255
         warped = cv2.warpPerspective(
             gray,
             transform,
             (width, height),
-            flags=cv2.INTER_LINEAR,
+            flags=_final_warp_interpolation(cv2),
             borderMode=cv2.BORDER_CONSTANT,
-            borderValue=255,
+            borderValue=border_value,
         )
         score = _orientation_score(warped, manifest, dpi)
         if score > best_score:
@@ -645,6 +697,14 @@ def _warp_with_best_orientation(gray: np.ndarray, source_points: np.ndarray, man
             "orientation marker is unreadable after alignment; rescan the full page with all corner markers visible"
         )
     return best_image, best_score
+
+
+def _map_points_to_original(points: np.ndarray, transform: np.ndarray | None) -> np.ndarray:
+    if transform is None:
+        return points.astype(np.float32)
+    cv2 = _cv2()
+    projected = cv2.perspectiveTransform(points.reshape(-1, 1, 2).astype(np.float32), transform)
+    return projected.reshape(-1, 2).astype(np.float32)
 
 
 def _page_mark_templates(manifest: dict) -> list[dict]:
@@ -682,39 +742,44 @@ def detect_page_index(gray: np.ndarray, manifest: dict, dpi: float) -> tuple[int
 
 
 def align_scan_page(gray: np.ndarray, manifest: dict, dpi: float, source_index: int = 1) -> AlignedPage:
-    gray = _as_gray_array(gray)
+    original = _as_image_array(gray)
+    gray_raw = _as_gray_array(original)
+    gray_detection = _denoise_for_detection(gray_raw)
     errors: list[str] = []
     best_page: AlignedPage | None = None
     best_quality = (-1.0, -1.0)
-    for label, candidate_image, source_confidence, marker_estimates in _alignment_sources(gray, manifest, dpi):
+    for source in _alignment_sources(gray_raw, gray_detection, manifest, dpi):
         try:
             source_points, marker_confidence = _select_fiducials(
-                candidate_image,
+                source.detection_image,
                 manifest,
                 allow_inferred=True,
-                marker_estimates=marker_estimates,
+                marker_estimates=source.marker_estimates,
             )
+            original_points = _map_points_to_original(source_points, source.points_to_original)
             canonical, orientation_confidence = _warp_with_best_orientation(
-                candidate_image,
-                source_points,
+                original,
+                original_points,
                 manifest,
                 dpi,
             )
-            page_index, page_confidence, _scores = detect_page_index(canonical, manifest, dpi)
-            confidence = min(source_confidence, marker_confidence, orientation_confidence)
+            canonical_gray = _as_gray_array(canonical)
+            page_index, page_confidence, _scores = detect_page_index(canonical_gray, manifest, dpi)
+            confidence = min(source.source_confidence, marker_confidence, orientation_confidence)
             aligned_page = AlignedPage(
                 page_index=page_index,
                 source_index=source_index,
-                image=canonical,
+                image=canonical_gray,
                 alignment_confidence=confidence,
                 page_mark_confidence=page_confidence,
+                debug_image=canonical,
             )
             quality = (confidence, page_confidence)
             if quality > best_quality:
                 best_quality = quality
                 best_page = aligned_page
         except ScanError as exc:
-            errors.append(f"{label}: {exc}")
+            errors.append(f"{source.label}: {exc}")
 
     if best_page is not None:
         return best_page

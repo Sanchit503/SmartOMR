@@ -26,6 +26,7 @@ from omr.reader.quality import (
     assess_alignment_quality,
     save_alignment_overlay,
     save_alignment_report,
+    save_sampling_overlay,
 )
 from omr.reader.identity import read_roll_number
 from omr.reader.scan import IMAGE_EXTENSIONS, ScanError, align_scan_pages, load_scan_pages
@@ -75,6 +76,17 @@ def _save_gray_image(image: object, path: Path) -> None:
     Image.fromarray(gray.astype(np.uint8, copy=False), mode="L").save(path)
 
 
+def _save_debug_image(image: object, path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    array = np.asarray(image)
+    if array.ndim == 3 and array.shape[2] >= 3:
+        rgb = array[:, :, :3][:, :, ::-1]
+        Image.fromarray(rgb.astype(np.uint8, copy=False), mode="RGB").save(path)
+        return
+    gray = array.mean(axis=2) if array.ndim == 3 else array
+    Image.fromarray(gray.astype(np.uint8, copy=False), mode="L").convert("RGB").save(path)
+
+
 def _page_artifacts(
     aligned_pages: dict[int, Any],
     manifest: dict,
@@ -92,11 +104,18 @@ def _page_artifacts(
         images_by_page[page_no] = image
         image_path = pages_dir / f"page_{page_no}.png"
         _save_gray_image(image, image_path)
+        debug_image = getattr(page, "debug_image", None)
+        debug_image_path = None
+        if debug_image is not None:
+            debug_image_path = debug_dir / f"page_{page_no}_aligned_color.png"
+            _save_debug_image(debug_image, debug_image_path)
 
         report = assess_alignment_quality(image, manifest, page_no, dpi)
         overlay_path = debug_dir / f"page_{page_no}_alignment_overlay.png"
+        sampling_overlay_path = debug_dir / f"page_{page_no}_sampling_overlay.png"
         report_path = debug_dir / f"page_{page_no}_alignment.json"
-        save_alignment_overlay(image, manifest, page_no, dpi, overlay_path)
+        save_alignment_overlay(debug_image if debug_image is not None else image, manifest, page_no, dpi, overlay_path)
+        save_sampling_overlay(debug_image if debug_image is not None else image, manifest, page_no, dpi, sampling_overlay_path)
         report = report.with_paths(
             report_path=_json_path(report_path, output_dir),
             overlay_path=_json_path(overlay_path, output_dir),
@@ -109,12 +128,14 @@ def _page_artifacts(
                 page_index=page.page_index,
                 source_index=page.source_index,
                 canonical_image_path=_json_path(image_path, output_dir),
+                debug_image_path=_json_path(debug_image_path, output_dir) if debug_image_path is not None else None,
                 alignment_confidence=page.alignment_confidence,
                 page_mark_confidence=page.page_mark_confidence,
                 alignment_quality_status=report.status,
                 alignment_quality_score=report.score,
                 alignment_report_path=report.report_path,
                 alignment_overlay_path=report.overlay_path,
+                sampling_overlay_path=_json_path(sampling_overlay_path, output_dir),
             )
         )
 
@@ -409,6 +430,7 @@ def parse_scans(
                         "score": page.get("alignment_quality_score"),
                         "report_path": page.get("alignment_report_path"),
                         "overlay_path": page.get("alignment_overlay_path"),
+                        "sampling_overlay_path": page.get("sampling_overlay_path"),
                     }
                     for page in result["pages"]
                 ],

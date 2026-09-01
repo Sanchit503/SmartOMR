@@ -30,7 +30,7 @@ from omr.generator.metrics import (
     corner_keepouts,
     identity_box,
 )
-from omr.grading.bubbles import fill_ratio, ink_density
+from omr.grading.bubbles import fill_ratio, ink_density, student_mark_fill_ratio
 
 DPI = 200
 WHITE_FLOOR = 250  # anything above this is blank paper
@@ -135,6 +135,21 @@ def test_sample_radius_stays_inside_the_printed_outline(tmp_path):
     through_outline = fill_ratio(pages[1], cx, cy, round(printed_px) + 2)
     assert inside == pytest.approx(0.0, abs=0.02)
     assert through_outline > 0.1, "expected to find the printed outline just outside the sample radius"
+
+
+def test_student_fill_signal_resists_shifted_empty_bubble_outline(tmp_path):
+    manifest, pages = render(tmp_path, a_config())
+    radius_px = max(1, round(manifest["bubble_sample_radius_mm"] * px_per_mm(DPI)))
+    entry = manifest["mcq_block"][0]
+    x = entry["x_mm"] + manifest["mcq_label_offset_mm"]
+    cx, cy = mm_to_px(x, entry["y_mm"], DPI)
+
+    shifted_x = cx + round(manifest["bubble_radius_mm"] * px_per_mm(DPI) * 0.55)
+    full_ratio = fill_ratio(pages[1], shifted_x, cy, radius_px)
+    student_ratio = student_mark_fill_ratio(pages[1], shifted_x, cy, radius_px)
+
+    assert full_ratio > 0.02, "test setup should include leaked outline ink"
+    assert student_ratio < 0.02
 
 
 # ---------------------------------------------------------------------------

@@ -20,7 +20,7 @@ from PIL import Image, ImageDraw
 from omr.contracts.geometry import mm_to_px, px_per_mm
 from omr.generator.config import ExamConfig
 from omr.generator.generate import generate_exam
-from omr.grading.mcq import Confidence, MCQOutcome, grade_mcq_responses, read_mcq_responses
+from omr.grading.mcq import Confidence, MCQOutcome, grade_mcq_responses, mcq_sample_centers, read_mcq_responses
 
 DPI = 200
 
@@ -87,6 +87,19 @@ def test_an_untouched_question_reads_blank_with_confidence(sheet):
     assert max(r.fill_ratios.values()) == pytest.approx(0.0, abs=0.02)
 
 
+def test_uniform_gray_haze_on_blank_question_is_not_a_faint_answer(sheet):
+    manifest, img = sheet
+    for option_index in range(4):
+        shade(img, manifest, 3, option_index, coverage=1.0, darkness=178)
+
+    r = read(img, manifest)[3]
+
+    assert r.outcome == MCQOutcome.BLANK
+    assert r.confidence == Confidence.HIGH
+    assert not r.needs_human_review
+    assert min(r.ink_densities.values()) > 0.20
+
+
 def test_shifted_printed_grid_is_locally_calibrated(sheet):
     """A perspective correction can leave the MCQ block a few millimetres off
     even after the page is canonical. The reader should use the printed
@@ -98,8 +111,12 @@ def test_shifted_printed_grid_is_locally_calibrated(sheet):
 
     shifted = Image.new("L", img.size, color=255)
     shifted.paste(img, (24, 32))
+    centers = mcq_sample_centers(np.asarray(shifted), manifest["mcq_block"], manifest, DPI)
     readings = read(shifted, manifest)
+    expected = mm_to_px(*option_xy(manifest, 2, 0), DPI)
 
+    assert centers[(2, "A")][0] == pytest.approx(expected[0] + 24, abs=4)
+    assert centers[(2, "A")][1] == pytest.approx(expected[1] + 32, abs=4)
     assert readings[1].outcome == MCQOutcome.ANSWERED
     assert readings[1].selected_option == "C"
     assert readings[2].outcome == MCQOutcome.ANSWERED

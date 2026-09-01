@@ -15,14 +15,14 @@ written on.
 
 It does not need a printer, a scanner, or a student.
 
-Two things it deliberately does NOT prove, so the green result isn't read as
-more than it is:
+Two things it deliberately does not prove by itself, so the green result
+isn't read as more than it is:
 
-*Manifest-vs-print agreement.* Bubbles are filled at the manifest's
-coordinates and read back at the same coordinates, so a manifest that has
-drifted away from the printed sheet still round-trips perfectly. Preflight
-is what catches that, by checking those coordinates land on blank bubbles
-in the actual rendered page.
+*Complete manifest-vs-print agreement.* This verifier draws simulated marks
+using the manifest and then reads them back using that same manifest, so a
+uniform manifest drift can still round-trip. Preflight is the print contract
+check: it inspects marker quiet zones, page identity marks, answer boxes,
+margins, and all generated page geometry against the rendered PDF.
 
 *Survival on real paper.* There's no perspective here, no lighting
 gradient, no toner spread, no fold. The thresholds are calibrated against

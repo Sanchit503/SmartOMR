@@ -22,9 +22,12 @@ __all__ = [
     "ink_density",
     "mm_to_px",
     "px_per_mm",
+    "STUDENT_MARK_CORE_RATIO",
+    "student_mark_fill_ratio",
 ]
 
 DARK_THRESHOLD = 150
+STUDENT_MARK_CORE_RATIO = 0.45
 
 
 def _as_gray_array(image: np.ndarray) -> np.ndarray:
@@ -63,6 +66,21 @@ def fill_ratio(
     if pixels is None:
         return 0.0
     return float((pixels < dark_threshold).sum()) / pixels.size
+
+
+def student_mark_fill_ratio(
+    gray: np.ndarray, cx_px: int, cy_px: int, radius_px: int, dark_threshold: int = DARK_THRESHOLD
+) -> float:
+    """Boundary-resistant fill signal for answer/roll bubbles.
+
+    Printed bubble outlines live near the edge. If alignment is off by even a
+    little, the outline can leak into the sample disc and inflate a normal
+    fill ratio. A real student fill should be visible in the whole sampled
+    disc and in the inner core, so use the weaker of those two signals.
+    """
+    full = fill_ratio(gray, cx_px, cy_px, radius_px, dark_threshold)
+    core = fill_ratio(gray, cx_px, cy_px, max(1, round(radius_px * STUDENT_MARK_CORE_RATIO)), dark_threshold)
+    return min(full, core)
 
 
 def ink_density(gray: np.ndarray, cx_px: int, cy_px: int, radius_px: int) -> float:
