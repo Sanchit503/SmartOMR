@@ -3,21 +3,18 @@
 OMR-based assessment system. BTP project, IIIT Delhi. Full spec and module boundaries are in
 [PROJECT_SPEC.md](PROJECT_SPEC.md) — read that first, it's the persistent design contract for this codebase.
 
-## Status: deployable batch workflow, backend/UI still pending
+## Status: local batch workflow, backend/UI still pending
 
 Per the roadmap in PROJECT_SPEC.md Section 12:
 
 - [x] **Phase 1** — OMR sheet generator + pure MCQ grading pipeline
-- [x] **Phase 2 deployable batch parser** — scan/PDF loading, fiducial alignment, page-index reading,
+- [x] **Phase 2 local batch parser** — scan/PDF loading, fiducial alignment, page-index reading,
   alignment quality reports, roll-number reading, roster CSV matching, MCQ result export,
-  production package entrypoints, Docker runtime, and health checks
+  production package entrypoints, local diagnostics, and review artifacts
 - [ ] Phase 2 service hardening — upload API, verification email, persistent review queue,
   duplicate-sheet handling, and production scan-calibration dataset
 - [ ] Phase 3 — Written-answer grading (LLM-assisted)
 - [ ] Phase 4 — Marks email, re-eval logging, admin panel
-
-For production install, Docker, health checks, and mounted data folders, see
-[DEPLOYMENT.md](DEPLOYMENT.md).
 
 ## Generate a sheet
 
@@ -136,6 +133,7 @@ sheets/<scan_id>/debug/page_1_aligned_color.png      color-preserved aligned pag
 sheets/<scan_id>/debug/page_1_alignment_overlay.png  visual overlay of expected anchors
 sheets/<scan_id>/debug/page_1_sampling_overlay.png   exact full/core sample regions used by the reader
 sheets/<scan_id>/written/Q11.png  written-answer crop
+sheets/<scan_id>/written_ocr/Q11_lines/Q11_line_1.png  optional OCR line crop
 ```
 
 This is intentionally a parser, not the final grader. Written answers are cropped and saved for the
@@ -145,6 +143,96 @@ Every parsed page also carries `alignment_quality_status`, `alignment_quality_sc
 `alignment_report_path`, and `alignment_overlay_path` in `parse.json`. If the page aligns but the
 markers, page bars, bubble anchors, or image-quality checks look risky, the sheet is marked
 `needs_review` instead of being treated as final.
+
+## Parse a multi-student PDF
+
+For one PDF/folder containing pages from many students, use the batch command:
+
+```bash
+python -m omr.workflows.batch \
+  --exam-id CSE222_ENDSEM_2026 \
+  --scans data/uploads/scanned_bundle.pdf \
+  --data-dir data
+```
+
+`--exam-id` resolves `data/exams/<exam_id>.manifest.json` and, when present,
+`data/answer_keys/<exam_id>_answer_key.csv`. Each PDF page is aligned independently, page identity is
+read, and pages are grouped even when page 1 and page 2 are far apart in the uploaded PDF.
+
+Output is written under `data/parsed/<exam_id>/students/<roll_no>/`:
+
+```text
+parse_index.json                         batch summary
+students/<roll_no>/student.json          full result for one student
+students/<roll_no>/pages/page_1.png      aligned canonical page
+students/<roll_no>/debug/...             alignment/sampling overlays
+students/<roll_no>/identity/page_2_btech_roll_crop.png
+students/<roll_no>/written/Q11.png       written-answer crop
+students/<roll_no>/written_ocr/Q11_lines/Q11_line_1.png
+unmatched_pages/source_0003/page.json    page that could not be safely attached
+page_errors/source_0004.json             page that could not be validated as SmartOMR
+```
+
+Continuation-page handwritten roll reading is local-first. With no OCR provider, the system saves
+the roll crop and sends the page to review. With `--handwritten-roll-ocr local`, it uses offline
+tools only: a trained local digit model when `--digit-model` is supplied, and local Tesseract as
+fallback evidence when installed. No API key is needed:
+
+```bash
+python -m omr.workflows.batch \
+  --exam-id CSE222_ENDSEM_2026 \
+  --scans data/uploads/scanned_bundle.pdf \
+  --data-dir data \
+  --handwritten-roll-ocr local \
+  --digit-model data/models/roll_digit_knn.npz
+```
+
+The local handwritten reader crops both the full roll strip and every digit cell using manifest
+geometry, cleans the cell borders/noise with OpenCV, prefers cell-by-cell agreement, and rejects
+conflicting or non-roster roll numbers instead of attaching a page to the wrong student.
+
+To train the optional digit model, label saved identity cell crops in a CSV:
+
+```csv
+image_path,label
+data/parsed/CSE222_ENDSEM_2026/students/2024587/identity/page_2_btech_roll_cell_1.png,2
+data/parsed/CSE222_ENDSEM_2026/students/2024587/identity/page_2_btech_roll_cell_2.png,0
+```
+
+Then train:
+
+```bash
+python -m omr.reader.digit_model \
+  --labels data/models/roll_digit_labels.csv \
+  --model data/models/roll_digit_knn.npz
+```
+
+Check that it loads:
+
+```bash
+smartomr-doctor --data-dir data --digit-model data/models/roll_digit_knn.npz
+```
+
+Keep at least a few dozen examples per digit before trusting the model for unattended grouping.
+Until then, roster validation and review flags are the guardrails.
+The detailed architecture and parameter notes are in
+[docs/HANDWRITING_ROLL_RECOGNITION.md](docs/HANDWRITING_ROLL_RECOGNITION.md).
+
+Written-answer OCR is also optional. It does not grade answers; it extracts line-level text,
+confidence, and review flags into `student.json` / `parse.json`. The stronger local path is TrOCR:
+
+```bash
+python -m pip install .[htr]
+python -m omr.workflows.batch \
+  --exam-id CSE222_ENDSEM_2026 \
+  --scans data/uploads/scanned_bundle.pdf \
+  --data-dir data \
+  --handwritten-roll-ocr local \
+  --digit-model data/models/roll_digit_knn.npz \
+  --written-answer-ocr trocr
+```
+
+Details are in [docs/WRITTEN_ANSWER_OCR.md](docs/WRITTEN_ANSWER_OCR.md).
 
 ## Printing
 
@@ -323,7 +411,7 @@ python -m venv .venv
 .venv\Scripts\activate
 python -m pip install --upgrade pip
 python -m pip install .[dev]
-smartomr-health --data-dir data
+smartomr-doctor --data-dir data
 ```
 
 ## Run tests
@@ -455,8 +543,9 @@ Worth flagging to your professor:
 - **No question-paper/rubric ingestion** — that's Module 5 (Phase 3); Phase 1 lays out bubbles and
   answer boxes, not question text.
 - **No database** — `Exam`/`Question`/etc. (PROJECT_SPEC.md Section 3) are not wired up yet.
-- **Scan evaluation is deployable as a batch workflow, not yet a hosted web service** — `omr.reader`
+- **Scan evaluation is a local batch workflow, not yet a hosted web service** — `omr.reader`
   writes per-page alignment quality reports, color debug pages, overlays, and review flags, but
-  thresholds still need calibration against a larger real printed-sheet dataset.
+  thresholds and the optional digit model still need calibration against a larger real
+  printed-sheet dataset.
 - **No verification email or review UI yet** — low-confidence identity/MCQ reads are flagged in
   result details, but there is no persistent professor-facing queue yet.

@@ -429,6 +429,59 @@ def _find_three_marker_quad(
     return best_points, max(0.25, min(0.86, confidence))
 
 
+def _find_estimated_marker_quad(
+    candidates: list[_SquareCandidate],
+    gray_shape: tuple[int, ...],
+    manifest: dict,
+    marker_estimates: np.ndarray | None,
+) -> tuple[np.ndarray, float] | None:
+    """Use the page boundary to fill in clipped corner-marker positions.
+
+    This path is intentionally conservative: at least two actual square
+    markers must agree with the page-contour projection. The projected points
+    are only used for corners that are missing or too clipped to detect.
+    """
+    if marker_estimates is None or len(candidates) < 2:
+        return None
+
+    height, width = gray_shape[:2]
+    image_area = float(height * width)
+    max_distance = max(35.0, hypot(width, height) * 0.085)
+    possible: list[tuple[float, int, int]] = []
+    for candidate_index, candidate in enumerate(candidates):
+        distances = np.linalg.norm(marker_estimates - candidate.center, axis=1)
+        corner_index = int(np.argmin(distances))
+        distance = float(distances[corner_index])
+        if distance <= max_distance:
+            possible.append((distance, corner_index, candidate_index))
+
+    used_corners: set[int] = set()
+    used_candidates: set[int] = set()
+    matches: list[tuple[float, int, int]] = []
+    for distance, corner_index, candidate_index in sorted(possible):
+        if corner_index in used_corners or candidate_index in used_candidates:
+            continue
+        used_corners.add(corner_index)
+        used_candidates.add(candidate_index)
+        matches.append((distance, corner_index, candidate_index))
+
+    if len(matches) < 2:
+        return None
+
+    ordered = marker_estimates.astype(np.float32).copy()
+    for _distance, corner_index, candidate_index in matches:
+        ordered[corner_index] = candidates[candidate_index].center
+
+    quad_area = _usable_marker_quad(ordered, manifest, image_area)
+    if quad_area is None:
+        return None
+
+    mean_distance = float(np.mean([distance for distance, _corner, _candidate in matches]))
+    distance_penalty = min(0.22, mean_distance / max_distance * 0.22)
+    confidence = 0.32 + 0.13 * len(matches) - distance_penalty
+    return ordered, max(0.34, min(0.66, confidence))
+
+
 def _select_fiducials(
     gray: np.ndarray,
     manifest: dict,
@@ -439,6 +492,9 @@ def _select_fiducials(
         _find_dark_square_candidates(gray) + _find_edge_square_candidates(gray)
     )[:30]
     if len(candidates) < 3:
+        estimated_quad = _find_estimated_marker_quad(candidates, gray.shape, manifest, marker_estimates)
+        if allow_inferred and estimated_quad is not None:
+            return estimated_quad
         raise ScanError(
             f"found only {len(candidates)} likely filled square marker(s); "
             "this does not look like a full SmartOMR page, or the scan may be cropped, too faint, or blurred"
@@ -452,6 +508,9 @@ def _select_fiducials(
         three_marker_quad = _find_three_marker_quad(candidates, gray.shape, manifest, marker_estimates)
         if three_marker_quad is not None:
             return three_marker_quad
+        estimated_quad = _find_estimated_marker_quad(candidates, gray.shape, manifest, marker_estimates)
+        if estimated_quad is not None:
+            return estimated_quad
 
     raise ScanError(
         "could not form reliable SmartOMR corner markers; the image may not be this OMR, "

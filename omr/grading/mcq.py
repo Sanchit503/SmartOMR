@@ -29,7 +29,7 @@ from enum import Enum
 import numpy as np
 
 from ..contracts.geometry import mm_to_px, px_per_mm
-from ..local_registration import fit_ordered_local_transform
+from ..local_registration import fit_candidate_local_transform, fit_ordered_local_transform
 from .bubbles import ink_density, student_mark_fill_ratio
 
 # Above this, a bubble counts as deliberately filled.
@@ -195,15 +195,32 @@ def _calibrate_mcq_centers(
             for entry in group_entries
             for option in options
         ]
+        expected_points = [center for _key, center in expected_items]
         all_x = [center[0] for _key, center in expected_items]
         all_y = [center[1] for _key, center in expected_items]
 
-        pad = round(8.0 * scale)
+        pad = round(12.0 * scale)
         x0 = max(0, int(min(all_x) - pad))
         x1 = min(gray.shape[1], int(max(all_x) + pad))
         y0 = max(0, int(min(all_y) - pad))
         y1 = min(gray.shape[0], int(max(all_y) + pad))
         candidates = _detect_bubble_center_candidates(gray, (x0, y0, x1, y1), dpi)
+
+        min_candidate_matches = max(4, min(len(expected_points), round(len(expected_points) * 0.45)))
+        transform = fit_candidate_local_transform(
+            expected_points,
+            candidates,
+            max_distance_px=3.6 * scale,
+            min_matches=min_candidate_matches,
+            vote_tolerance_px=1.25 * scale,
+            ransac_reproj_threshold_px=1.15 * scale,
+        )
+        if transform is not None:
+            for key, center in expected_items:
+                cx, cy = transform.apply(center)
+                calibrated[key] = (int(round(cx)), int(round(cy)))
+            continue
+
         if len(candidates) < max(len(options), len(group_entries)):
             continue
 
@@ -216,11 +233,6 @@ def _calibrate_mcq_centers(
         if x_run is None or y_run is None:
             continue
 
-        expected_points = [
-            expected_by_entry[entry["q_no"]][option]
-            for entry in group_entries
-            for option in options
-        ]
         observed_points = [
             (x_run[option_index], y_run[row_index])
             for row_index, _entry in enumerate(group_entries)

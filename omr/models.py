@@ -36,6 +36,20 @@ class RollRead:
 
 
 @dataclass(frozen=True)
+class HandwrittenRollRead:
+    page_index: int
+    program: str | None
+    roll_no: str | None
+    confidence: str
+    provider: str
+    raw_text: str | None
+    crop_paths: dict[str, str]
+    cell_crop_paths: dict[str, list[str]]
+    ocr_results: dict[str, dict[str, object]]
+    review_flags: list[str]
+
+
+@dataclass(frozen=True)
 class AlignedPage:
     page_index: int
     source_index: int
@@ -92,6 +106,7 @@ __all__ = [
     "AlignedPage",
     "AnswerKeyEntry",
     "EvaluationResult",
+    "HandwrittenRollRead",
     "ParsedPage",
     "RollRead",
     "Student",

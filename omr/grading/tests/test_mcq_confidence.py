@@ -123,6 +123,35 @@ def test_shifted_printed_grid_is_locally_calibrated(sheet):
     assert readings[2].selected_option == "A"
 
 
+def test_sheared_printed_grid_is_locally_calibrated(sheet):
+    cv2 = pytest.importorskip("cv2")
+    manifest, img = sheet
+    shade(img, manifest, 1, 2, coverage=0.8)
+    shade(img, manifest, 4, 1, coverage=0.8)
+
+    array = np.asarray(img)
+    matrix = np.array([[1.0, 0.035, 18.0], [-0.025, 1.0, 26.0]], dtype=np.float32)
+    warped = cv2.warpAffine(
+        array,
+        matrix,
+        (array.shape[1], array.shape[0]),
+        flags=cv2.INTER_CUBIC,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=255,
+    )
+
+    centers = mcq_sample_centers(warped, manifest["mcq_block"], manifest, DPI)
+    expected = mm_to_px(*option_xy(manifest, 4, 1), DPI)
+    projected = matrix @ np.array([expected[0], expected[1], 1.0], dtype=np.float32)
+    readings = {r.q_no: r for r in read_mcq_responses({1: warped}, manifest, DPI)}
+
+    assert centers[(4, "B")] == pytest.approx((projected[0], projected[1]), abs=4)
+    assert readings[1].outcome == MCQOutcome.ANSWERED
+    assert readings[1].selected_option == "C"
+    assert readings[4].outcome == MCQOutcome.ANSWERED
+    assert readings[4].selected_option == "B"
+
+
 def test_a_light_pencil_fill_is_flagged_not_silently_blanked(sheet):
     """The dangerous failure, and the reason `ink_density` exists: a light
     pencil answer covers the whole bubble but never gets dark enough to

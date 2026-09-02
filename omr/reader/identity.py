@@ -20,7 +20,7 @@ from omr.grading.mcq import (
 )
 
 from omr.models import RollRead
-from omr.local_registration import LocalTransform, fit_ordered_local_transform
+from omr.local_registration import LocalTransform, fit_candidate_local_transform, fit_ordered_local_transform
 
 
 @dataclass(frozen=True)
@@ -172,10 +172,10 @@ def _calibrate_digit_grid(gray: np.ndarray, manifest: dict, dpi: float, grid: di
         return None
 
     scale = px_per_mm(dpi)
-    x0, y0 = mm_to_px(grid["x_mm"] - 5.0, grid["y_mm"] - 3.0, dpi)
+    x0, y0 = mm_to_px(grid["x_mm"] - 8.0, grid["y_mm"] - 5.0, dpi)
     x1, y1 = mm_to_px(
-        grid["x_mm"] + (grid["columns"] - 1) * grid["col_pitch_mm"] + 5.0,
-        grid["y_mm"] + 9 * grid["row_pitch_mm"] + 5.0,
+        grid["x_mm"] + (grid["columns"] - 1) * grid["col_pitch_mm"] + 8.0,
+        grid["y_mm"] + 9 * grid["row_pitch_mm"] + 7.0,
         dpi,
     )
     x0, x1 = max(0, x0), min(gray.shape[1], x1)
@@ -209,15 +209,8 @@ def _calibrate_digit_grid(gray: np.ndarray, manifest: dict, dpi: float, grid: di
             cy = y0 + y + h / 2
         points.append((cx, cy))
 
-    min_matches = grid["columns"] * 8
+    min_matches = max(10, round(grid["columns"] * 10 * 0.60))
     if len(points) < min_matches:
-        return None
-
-    x_clusters = _cluster_values([p[0] / scale for p in points], tolerance_mm=2.5)
-    y_clusters = _cluster_values([p[1] / scale for p in points], tolerance_mm=2.5)
-    x_centers = _best_regular_run(x_clusters, grid["columns"], grid["col_pitch_mm"])
-    y_centers = _best_regular_run(y_clusters, 10, grid["row_pitch_mm"])
-    if x_centers is None or y_centers is None:
         return None
 
     expected_points = [
@@ -228,6 +221,29 @@ def _calibrate_digit_grid(gray: np.ndarray, manifest: dict, dpi: float, grid: di
         for col in range(grid["columns"])
         for digit in range(10)
     ]
+    transform = fit_candidate_local_transform(
+        expected_points,
+        points,
+        max_distance_px=3.4 * scale,
+        min_matches=min_matches,
+        vote_tolerance_px=1.25 * scale,
+        ransac_reproj_threshold_px=1.10 * scale,
+    )
+    if transform is not None:
+        return _GridCalibration(
+            transform=transform,
+            matched_anchors=transform.matched_count,
+            mean_residual_mm=transform.mean_residual_px / scale,
+            max_residual_mm=transform.max_residual_px / scale,
+        )
+
+    x_clusters = _cluster_values([p[0] / scale for p in points], tolerance_mm=2.5)
+    y_clusters = _cluster_values([p[1] / scale for p in points], tolerance_mm=2.5)
+    x_centers = _best_regular_run(x_clusters, grid["columns"], grid["col_pitch_mm"])
+    y_centers = _best_regular_run(y_clusters, 10, grid["row_pitch_mm"])
+    if x_centers is None or y_centers is None:
+        return None
+
     observed_points = [
         (x_centers[col] * scale, y_centers[digit] * scale)
         for col in range(grid["columns"])

@@ -1,7 +1,0 @@
-services:
-  smartomr:
-    build: .
-    image: smartomr:local
-    volumes:
-      - ./data:/app/data
-    command: ["smartomr-health", "--data-dir", "/app/data"]

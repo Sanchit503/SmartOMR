@@ -31,6 +31,12 @@ from omr.reader.quality import (
 from omr.reader.identity import read_roll_number
 from omr.reader.scan import IMAGE_EXTENSIONS, ScanError, align_scan_pages, load_scan_pages
 from omr.reader.written import crop_written_responses
+from omr.reader.written_ocr import (
+    WrittenAnswerOcr,
+    WrittenOcrBackend,
+    build_written_ocr_backend,
+    read_written_answer_texts,
+)
 
 SCAN_EXTENSIONS = IMAGE_EXTENSIONS | {".pdf"}
 DEFAULT_OUTPUT_ROOT = Path("data") / "parsed"
@@ -256,6 +262,33 @@ def _mcq_answer_summary(result: dict) -> list[dict]:
     ]
 
 
+def _relative_written_ocr_payload(read: WrittenAnswerOcr, output_dir: Path) -> dict:
+    payload = read.to_json()
+    payload["crop_path"] = _json_path(Path(str(payload["crop_path"])), output_dir)
+    line_results = []
+    for line in payload.get("line_results", []):
+        line_payload = dict(line)
+        line_payload["crop_path"] = _json_path(Path(str(line_payload["crop_path"])), output_dir)
+        line_results.append(line_payload)
+    payload["line_results"] = line_results
+    return payload
+
+
+def _written_payload(
+    written_crops: list,
+    output_dir: Path,
+    written_ocr_reads: dict[int, WrittenAnswerOcr] | None = None,
+) -> list[dict]:
+    payload = []
+    for crop in written_crops:
+        item = asdict(crop)
+        item["crop_path"] = _json_path(Path(crop.crop_path), output_dir)
+        if written_ocr_reads and crop.q_no in written_ocr_reads:
+            item["ocr"] = _relative_written_ocr_payload(written_ocr_reads[crop.q_no], output_dir)
+        payload.append(item)
+    return payload
+
+
 def parse_scan(
     scan_path: str | Path,
     manifest_path: str | Path,
@@ -265,6 +298,7 @@ def parse_scan(
     dpi: float = 200,
     written_padding_mm: float = 0.0,
     allow_partial: bool = True,
+    written_ocr_backend: WrittenOcrBackend | None = None,
 ) -> dict:
     """Parse one filled OMR scan/PDF and write its artifacts.
 
@@ -319,11 +353,12 @@ def parse_scan(
         dpi,
         padding_mm=written_padding_mm,
     )
-    written_payload = []
-    for crop in written_crops:
-        item = asdict(crop)
-        item["crop_path"] = _json_path(Path(crop.crop_path), output_dir)
-        written_payload.append(item)
+    written_ocr_reads = read_written_answer_texts(
+        written_crops,
+        output_dir / "written_ocr",
+        written_ocr_backend,
+    )
+    written_payload = _written_payload(written_crops, output_dir, written_ocr_reads)
 
     status = "ready" if not review_flags else "needs_review"
     details_path = output_dir / "parse.json"
@@ -376,6 +411,7 @@ def parse_scans(
     course_id: str | None = None,
     written_padding_mm: float = 0.0,
     allow_partial: bool = True,
+    written_ocr_backend: WrittenOcrBackend | None = None,
 ) -> tuple[list[dict], Path]:
     """Parse one scan file or every scan file in a folder."""
     manifest = load_manifest(manifest_path)
@@ -400,6 +436,7 @@ def parse_scans(
                     dpi=dpi,
                     written_padding_mm=written_padding_mm,
                     allow_partial=allow_partial,
+                    written_ocr_backend=written_ocr_backend,
                 )
             )
         except Exception as exc:
@@ -470,12 +507,45 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Fail sheets that are missing any page instead of saving a partial needs-review result",
     )
+    parser.add_argument(
+        "--written-answer-ocr",
+        default="none",
+        choices=["none", "tesseract", "trocr"],
+        help="Optional offline OCR provider for written-answer crops",
+    )
+    parser.add_argument(
+        "--written-ocr-model",
+        default=None,
+        help="Model name/path for --written-answer-ocr trocr",
+    )
+    parser.add_argument(
+        "--written-ocr-device",
+        default=None,
+        help="Torch device for --written-answer-ocr trocr, e.g. cpu or cuda",
+    )
+    parser.add_argument(
+        "--written-ocr-local-files-only",
+        action="store_true",
+        help="Load the TrOCR model only from the local Hugging Face cache/path",
+    )
+    parser.add_argument(
+        "--tesseract-cmd",
+        default=None,
+        help="Optional path to tesseract.exe/tesseract for Tesseract OCR",
+    )
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
+        written_ocr_backend = build_written_ocr_backend(
+            args.written_answer_ocr,
+            tesseract_cmd=args.tesseract_cmd,
+            model_name=args.written_ocr_model,
+            device=args.written_ocr_device,
+            local_files_only=args.written_ocr_local_files_only,
+        )
         results, index_path = parse_scans(
             manifest_path=args.manifest,
             scans_path=args.scans,
@@ -486,8 +556,9 @@ def main(argv: list[str] | None = None) -> int:
             course_id=args.course_id,
             written_padding_mm=args.written_padding_mm,
             allow_partial=not args.strict_complete,
+            written_ocr_backend=written_ocr_backend,
         )
-    except (OSError, ScanError, ValueError) as exc:
+    except (OSError, RuntimeError, ScanError, ValueError) as exc:
         print(str(exc), file=sys.stderr)
         return 1
 

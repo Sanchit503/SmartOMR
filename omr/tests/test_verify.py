@@ -94,13 +94,12 @@ def test_a_manifest_whose_pdf_is_missing_fails_loudly(tmp_path):
         verify_sheet(manifest_path)
 
 
-def test_a_uniform_manifest_drift_still_needs_preflight(tmp_path):
-    """Documents a remaining limit instead of pretending it away.
+def test_manifest_drift_against_the_pdf_is_caught_by_local_reader(tmp_path):
+    """Local registration compares the manifest against printed bubbles.
 
-    The verifier fills bubbles at the manifest coordinates and reads them
-    back through the same manifest-guided pipeline, so a uniform manifest
-    drift can still round-trip. Preflight compares the manifest against the
-    rendered PDF and remains the check for print/layout agreement.
+    If the manifest drifts after the PDF was rendered, simulated marks land
+    away from the real bubble centers and the reader should no longer
+    round-trip them by blindly trusting the same bad coordinates.
     """
     import json
 
@@ -111,7 +110,9 @@ def test_a_uniform_manifest_drift_still_needs_preflight(tmp_path):
     manifest_path.write_text(json.dumps(manifest))
 
     result = verify_sheet(manifest_path)
-    assert result.ok, "round-trip is self-consistent by construction"
+    assert not result.ok
+    assert result.recovered == 0
+    assert "MISMATCH" in result.format()
 
     from omr.generator.preflight import check_sheet
 

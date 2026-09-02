@@ -18,11 +18,11 @@ It does not need a printer, a scanner, or a student.
 Two things it deliberately does not prove by itself, so the green result
 isn't read as more than it is:
 
-*Complete manifest-vs-print agreement.* This verifier draws simulated marks
-using the manifest and then reads them back using that same manifest, so a
-uniform manifest drift can still round-trip. Preflight is the print contract
-check: it inspects marker quiet zones, page identity marks, answer boxes,
-margins, and all generated page geometry against the rendered PDF.
+*Complete manifest-vs-print agreement.* The reader now locally registers to
+printed bubble outlines, so ordinary MCQ drift between a PDF and manifest is
+caught. Preflight is still the full print contract check: it inspects marker
+quiet zones, page identity marks, answer boxes, margins, and all generated
+page geometry against the rendered PDF.
 
 *Survival on real paper.* There's no perspective here, no lighting
 gradient, no toner spread, no fold. The thresholds are calibrated against
