@@ -147,7 +147,7 @@ def _find_dark_square_candidates(gray: np.ndarray) -> list[_SquareCandidate]:
     binary = _binary_dark(gray)
     kernel = np.ones((3, 3), dtype=np.uint8)
     binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
-    contours, _hierarchy = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    contours, _hierarchy = cv2.findContours(binary, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
 
     image_area = gray.shape[0] * gray.shape[1]
     min_area = max(50.0, image_area * 0.00002)

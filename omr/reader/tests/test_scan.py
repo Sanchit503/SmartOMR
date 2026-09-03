@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import numpy as np
+import pymupdf
 import pytest
 
 from omr.contracts.geometry import canonical_size_px, mm_to_px, px_per_mm
 from omr.generator.config import ExamConfig
+from omr.generator.generate import generate_exam
 from omr.generator.layout import build_layout
 from omr.generator.manifest import build_manifest
 from omr.reader.scan import ScanError, align_scan_page
@@ -90,3 +92,28 @@ def test_four_random_black_squares_are_not_enough_to_be_an_omr():
 
     with pytest.raises(ScanError, match="SmartOMR"):
         align_scan_page(image, _manifest(), dpi=DPI)
+
+
+def test_dark_background_photo_still_finds_inner_marker_contours(tmp_path):
+    result = generate_exam(
+        ExamConfig(
+            exam_id="DARK_BACKGROUND_SCAN_TEST",
+            course_code="CSE101",
+            exam_name="Scan Test",
+            exam_type="quiz",
+            num_mcq=4,
+            mcq_options=4,
+            marks_per_mcq=1,
+            written_questions=[],
+        ),
+        tmp_path,
+    )
+    with pymupdf.open(result["pdf_path"]) as doc:
+        pix = doc[0].get_pixmap(dpi=DPI, colorspace=pymupdf.csGRAY)
+    page = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width).copy()
+    photo = np.full((page.shape[0] + 260, page.shape[1] + 180), 92, dtype=np.uint8)
+    photo[120 : 120 + page.shape[0], 80 : 80 + page.shape[1]] = page
+
+    aligned = align_scan_page(photo, result["manifest"], dpi=DPI)
+
+    assert aligned.page_index == 1

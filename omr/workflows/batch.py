@@ -7,18 +7,24 @@ grouped into `students/<roll_no>/` before scoring/cropping.
 from __future__ import annotations
 
 import argparse
+import csv
+import html
+import io
 import json
 import sys
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any
 
 import numpy as np
+from PIL import Image
 
 from omr.contracts import load_manifest
+from omr.contracts.geometry import MM_PER_INCH, mm_to_px, px_per_mm
 from omr.grading.mcq import read_mcq_responses
 from omr.io.csv import load_answer_key, load_students, normalize_roll
 from omr.models import AlignedPage, Student
+from omr.reader.digit_model import extract_digit_feature
 from omr.reader.handwriting import (
     RollOcrBackend,
     build_roll_ocr_backend,
@@ -47,6 +53,40 @@ from omr.reader.written_ocr import WrittenOcrBackend, build_written_ocr_backend,
 
 
 CONFIDENCE_RANK = {"low": 0, "medium": 1, "high": 2}
+GROUPING_MODES = {"auto", "identity", "page-major", "sheet-major", "write-in-similarity"}
+HANDWRITTEN_OCR_NOT_CONFIGURED_FLAG = "handwritten roll OCR is not configured; saved roll crop(s) for manual review"
+PAGE_MAJOR_IDENTITY_KIND = "page_major_order"
+SHEET_MAJOR_IDENTITY_KIND = "sheet_major_order"
+WRITE_IN_SIMILARITY_IDENTITY_KIND = "write_in_similarity"
+GROUPED_IDENTITY_KINDS = {
+    PAGE_MAJOR_IDENTITY_KIND,
+    SHEET_MAJOR_IDENTITY_KIND,
+    WRITE_IN_SIMILARITY_IDENTITY_KIND,
+}
+WRITE_IN_SIMILARITY_MIN_SCORE = 0.88
+WRITE_IN_SIMILARITY_REVIEW_MARGIN = 0.03
+REVIEW_REPORT_COLUMNS = [
+    "item_type",
+    "status",
+    "roll_no",
+    "program",
+    "student_name",
+    "student_email",
+    "pages_found",
+    "expected_pages",
+    "missing_pages",
+    "source_indices",
+    "grouping_mode",
+    "identity_kinds",
+    "mcq_score",
+    "mcq_total",
+    "review_flag_count",
+    "review_flags",
+    "sheet_pdf_path",
+    "details_path",
+    "source_path",
+    "error_type",
+]
 
 
 @dataclass
@@ -60,6 +100,22 @@ class _PageRecord:
     confidence: str
     identity_payload: dict[str, Any] | None
     review_flags: list[str]
+
+
+@dataclass(frozen=True)
+class _WriteInSignature:
+    program: str
+    features: np.ndarray
+    foreground_fractions: list[float]
+
+
+@dataclass(frozen=True)
+class _WriteInMatch:
+    anchor: _PageRecord
+    continuation: _PageRecord
+    score: float
+    anchor_margin: float
+    continuation_margin: float
 
 
 def _resolve_manifest_path(exam_id: str, data_dir: Path) -> Path:
@@ -160,6 +216,485 @@ def _best_page(existing: _PageRecord, challenger: _PageRecord) -> _PageRecord:
     return challenger if challenger_score > existing_score else existing
 
 
+def _group_records_by_identity(
+    records: list[_PageRecord],
+    min_group_confidence: str,
+) -> tuple[dict[str, list[_PageRecord]], list[_PageRecord]]:
+    grouped: dict[str, list[_PageRecord]] = {}
+    unmatched: list[_PageRecord] = []
+    for record in records:
+        if record.roll_no and _strong_enough(record.confidence, min_group_confidence):
+            grouped.setdefault(record.roll_no, []).append(record)
+        else:
+            unmatched.append(record)
+    return grouped, unmatched
+
+
+def _page_sequence(records: list[_PageRecord]) -> list[int]:
+    return [record.aligned_page.page_index for record in sorted(records, key=lambda item: item.source_index)]
+
+
+def _matches_page_major_sequence(page_sequence: list[int], num_pages: int) -> bool:
+    if num_pages <= 1 or not page_sequence:
+        return False
+    student_count = page_sequence.count(1)
+    if student_count == 0:
+        return False
+    expected = [page_index for page_index in range(1, num_pages + 1) for _ in range(student_count)]
+    return page_sequence == expected
+
+
+def _matches_sheet_major_sequence(page_sequence: list[int], num_pages: int) -> bool:
+    if num_pages <= 1 or not page_sequence or len(page_sequence) % num_pages != 0:
+        return False
+    student_count = len(page_sequence) // num_pages
+    expected = list(range(1, num_pages + 1)) * student_count
+    return page_sequence == expected
+
+
+def _infer_grouping_mode(records: list[_PageRecord], manifest: dict) -> str:
+    page_sequence = _page_sequence(records)
+    num_pages = manifest["num_pages"]
+    if _matches_sheet_major_sequence(page_sequence, num_pages):
+        return "sheet-major"
+    if _matches_page_major_sequence(page_sequence, num_pages):
+        return "page-major"
+    return "identity"
+
+
+def _roll_write_in_field(manifest: dict, page_index: int, program: str | None) -> dict | None:
+    if not program:
+        return None
+    program = program.upper()
+    return next(
+        (
+            field
+            for field in manifest.get("write_in_fields", [])
+            if field.get("page", 1) == page_index
+            and field.get("name") == "roll_number"
+            and str(field.get("program", "")).upper() == program
+        ),
+        None,
+    )
+
+
+def _write_in_signature(
+    record: _PageRecord,
+    manifest: dict,
+    dpi: float,
+    program: str | None,
+    cache: dict[tuple[int, str], _WriteInSignature | None],
+) -> _WriteInSignature | None:
+    if not program:
+        return None
+    program = program.upper()
+    key = (record.source_index, program)
+    if key in cache:
+        return cache[key]
+
+    field = _roll_write_in_field(manifest, record.aligned_page.page_index, program)
+    if field is None:
+        cache[key] = None
+        return None
+
+    gray = np.asarray(record.aligned_page.image)
+    if gray.ndim == 3:
+        gray = gray.mean(axis=2)
+    gray = gray.astype(np.uint8, copy=False)
+    padding_mm = 0.5
+    features: list[np.ndarray] = []
+    foreground_fractions: list[float] = []
+    for index in range(int(field["cells"])):
+        x0, y0 = mm_to_px(
+            field["x_mm"] + index * field["cell_pitch_mm"] - padding_mm,
+            field["y_mm"] - padding_mm,
+            dpi,
+        )
+        width_px = round((field["cell_width_mm"] + 2 * padding_mm) * px_per_mm(dpi))
+        height_px = round((field["height_mm"] + 2 * padding_mm) * px_per_mm(dpi))
+        x1 = min(gray.shape[1], x0 + width_px)
+        y1 = min(gray.shape[0], y0 + height_px)
+        crop = gray[max(0, y0) : y1, max(0, x0) : x1]
+        if crop.size == 0:
+            cache[key] = None
+            return None
+        digit = extract_digit_feature(crop)
+        if digit.is_blank:
+            cache[key] = None
+            return None
+        features.append(digit.feature)
+        foreground_fractions.append(digit.foreground_fraction)
+
+    if not features:
+        cache[key] = None
+        return None
+    signature = _WriteInSignature(
+        program=program,
+        features=np.stack(features).astype(np.float32, copy=False),
+        foreground_fractions=foreground_fractions,
+    )
+    cache[key] = signature
+    return signature
+
+
+def _roll_digits_for_similarity(roll_no: str | None, cell_count: int) -> str | None:
+    if not roll_no:
+        return None
+    digits = "".join(char for char in roll_no if char.isdigit())
+    if len(digits) < cell_count:
+        return None
+    return digits[-cell_count:]
+
+
+def _write_in_similarity_weights(anchors: list[_PageRecord], cell_count: int) -> np.ndarray:
+    rolls = [
+        digits
+        for digits in (_roll_digits_for_similarity(anchor.roll_no, cell_count) for anchor in anchors)
+        if digits is not None
+    ]
+    if len(rolls) < 2:
+        return np.ones(cell_count, dtype=np.float32)
+    weights = np.full(cell_count, 0.20, dtype=np.float32)
+    for index in range(cell_count):
+        if len({roll[index] for roll in rolls}) > 1:
+            weights[index] = 1.0
+    if float(np.sum(weights)) <= 0:
+        return np.ones(cell_count, dtype=np.float32)
+    return weights
+
+
+def _write_in_similarity_score(
+    anchor: _WriteInSignature,
+    continuation: _WriteInSignature,
+    weights: np.ndarray,
+) -> float:
+    if anchor.features.shape != continuation.features.shape:
+        return 0.0
+    cell_scores = 1.0 - np.mean((anchor.features - continuation.features) ** 2, axis=1)
+    if weights.shape[0] != cell_scores.shape[0]:
+        weights = np.ones(cell_scores.shape[0], dtype=np.float32)
+    return float(np.clip(np.average(cell_scores, weights=weights), 0.0, 1.0))
+
+
+def _write_in_similarity_matches(
+    anchors: list[_PageRecord],
+    continuations: list[_PageRecord],
+    manifest: dict,
+    dpi: float,
+) -> list[_WriteInMatch]:
+    cache: dict[tuple[int, str], _WriteInSignature | None] = {}
+    scores: dict[tuple[int, int], float] = {}
+    weights_by_cell_count: dict[int, np.ndarray] = {}
+    for anchor in anchors:
+        for continuation in continuations:
+            if anchor.program and continuation.program and anchor.program != continuation.program:
+                continue
+            program = continuation.program or anchor.program
+            anchor_signature = _write_in_signature(anchor, manifest, dpi, program, cache)
+            continuation_signature = _write_in_signature(continuation, manifest, dpi, program, cache)
+            if anchor_signature is None or continuation_signature is None:
+                continue
+            cell_count = anchor_signature.features.shape[0]
+            weights = weights_by_cell_count.setdefault(
+                cell_count,
+                _write_in_similarity_weights(anchors, cell_count),
+            )
+            scores[(anchor.source_index, continuation.source_index)] = _write_in_similarity_score(
+                anchor_signature,
+                continuation_signature,
+                weights,
+            )
+
+    if not scores:
+        return []
+
+    anchor_by_source = {record.source_index: record for record in anchors}
+    continuation_by_source = {record.source_index: record for record in continuations}
+    matches: list[_WriteInMatch] = []
+    used_anchors: set[int] = set()
+    used_continuations: set[int] = set()
+    ranked = sorted(scores.items(), key=lambda item: item[1], reverse=True)
+    for (anchor_index, continuation_index), score in ranked:
+        if score < WRITE_IN_SIMILARITY_MIN_SCORE:
+            continue
+        if anchor_index in used_anchors or continuation_index in used_continuations:
+            continue
+        anchor_next = max(
+            (
+                other_score
+                for (other_anchor, other_continuation), other_score in scores.items()
+                if other_anchor == anchor_index and other_continuation != continuation_index
+            ),
+            default=0.0,
+        )
+        continuation_next = max(
+            (
+                other_score
+                for (other_anchor, other_continuation), other_score in scores.items()
+                if other_anchor != anchor_index and other_continuation == continuation_index
+            ),
+            default=0.0,
+        )
+        matches.append(
+            _WriteInMatch(
+                anchor=anchor_by_source[anchor_index],
+                continuation=continuation_by_source[continuation_index],
+                score=score,
+                anchor_margin=score - anchor_next,
+                continuation_margin=score - continuation_next,
+            )
+        )
+        used_anchors.add(anchor_index)
+        used_continuations.add(continuation_index)
+    return matches
+
+
+def _write_in_similarity_record(record: _PageRecord, match: _WriteInMatch) -> _PageRecord:
+    anchor = match.anchor
+    review_flags = [
+        flag for flag in record.review_flags if flag != HANDWRITTEN_OCR_NOT_CONFIGURED_FLAG
+    ]
+    margin = min(match.anchor_margin, match.continuation_margin)
+    if margin < WRITE_IN_SIMILARITY_REVIEW_MARGIN:
+        review_flags.append(
+            "continuation page attached by write-in roll similarity with a close match margin "
+            f"(score {match.score:.3f}, margin {margin:.3f}); review before using for final grading/email"
+        )
+    if record.roll_no and anchor.roll_no and record.roll_no != anchor.roll_no:
+        review_flags.append(
+            f"write-in similarity attached page {record.aligned_page.page_index} to roll {anchor.roll_no}, "
+            f"but continuation-page OCR read {record.roll_no}"
+        )
+    if record.program and anchor.program and record.program != anchor.program:
+        review_flags.append(
+            f"write-in similarity attached page {record.aligned_page.page_index} to roll {anchor.roll_no}, "
+            f"but continuation program reads {record.program} while page 1 reads {anchor.program}"
+        )
+
+    identity_payload = dict(record.identity_payload or {})
+    identity_payload.update(
+        {
+            "grouping_mode": "write-in-similarity",
+            "grouped_roll_no": anchor.roll_no,
+            "grouped_program": anchor.program,
+            "grouped_from_page1_source_index": anchor.source_index,
+            "similarity_score": match.score,
+            "similarity_margin": margin,
+            "original_identity_kind": record.identity_kind,
+            "original_roll_no": record.roll_no,
+            "original_confidence": record.confidence,
+        }
+    )
+    return replace(
+        record,
+        identity_kind=WRITE_IN_SIMILARITY_IDENTITY_KIND,
+        roll_no=anchor.roll_no,
+        program=record.program or anchor.program,
+        confidence="high" if margin >= WRITE_IN_SIMILARITY_REVIEW_MARGIN else "medium",
+        identity_payload=identity_payload,
+        review_flags=review_flags,
+    )
+
+
+def _group_records_by_write_in_similarity(
+    records: list[_PageRecord],
+    manifest: dict,
+    min_group_confidence: str,
+    dpi: float,
+) -> tuple[dict[str, list[_PageRecord]], list[_PageRecord]]:
+    grouped: dict[str, list[_PageRecord]] = {}
+    unmatched: list[_PageRecord] = []
+    anchors = [
+        record
+        for record in sorted(records, key=lambda item: item.source_index)
+        if record.aligned_page.page_index == manifest["roll_number_block"].get("page", 1)
+        and record.roll_no
+        and _strong_enough(record.confidence, min_group_confidence)
+    ]
+    anchor_sources = {record.source_index for record in anchors}
+    for anchor in anchors:
+        grouped.setdefault(anchor.roll_no or "", []).append(anchor)
+
+    assigned_continuations: set[int] = set()
+    for page_index in range(1, manifest["num_pages"] + 1):
+        if page_index == manifest["roll_number_block"].get("page", 1):
+            continue
+        continuations = [
+            record
+            for record in sorted(records, key=lambda item: item.source_index)
+            if record.aligned_page.page_index == page_index
+            and record.source_index not in assigned_continuations
+        ]
+        for match in _write_in_similarity_matches(anchors, continuations, manifest, dpi):
+            grouped.setdefault(match.anchor.roll_no or "", []).append(
+                _write_in_similarity_record(match.continuation, match)
+            )
+            assigned_continuations.add(match.continuation.source_index)
+
+    for record in sorted(records, key=lambda item: item.source_index):
+        if record.source_index in anchor_sources or record.source_index in assigned_continuations:
+            continue
+        if record.roll_no and _strong_enough(record.confidence, min_group_confidence):
+            grouped.setdefault(record.roll_no, []).append(record)
+            continue
+        if record.aligned_page.page_index != manifest["roll_number_block"].get("page", 1):
+            record.review_flags.append("continuation page could not be matched by write-in roll similarity")
+        unmatched.append(record)
+
+    return grouped, unmatched
+
+
+def _positional_sequence_review_flag(grouping_mode: str, manifest: dict, page_sequence: list[int]) -> str:
+    expected = (
+        f"P1...P1, P2...P2 up to P{manifest['num_pages']}"
+        if grouping_mode == "page-major"
+        else f"P1 P2 ... P{manifest['num_pages']} repeated for each student"
+    )
+    return (
+        f"{grouping_mode} grouping skipped: expected scanner order {expected}, "
+        f"but detected page sequence {page_sequence}"
+    )
+
+
+def _positional_record(record: _PageRecord, anchor: _PageRecord, grouping_mode: str) -> _PageRecord:
+    review_flags = [
+        flag for flag in record.review_flags if flag != HANDWRITTEN_OCR_NOT_CONFIGURED_FLAG
+    ]
+    if record.roll_no and anchor.roll_no and record.roll_no != anchor.roll_no:
+        review_flags.append(
+            f"{grouping_mode} grouping attached page {record.aligned_page.page_index} to roll {anchor.roll_no}, "
+            f"but continuation-page roll OCR read {record.roll_no}"
+        )
+    if record.program and anchor.program and record.program != anchor.program:
+        review_flags.append(
+            f"{grouping_mode} grouping attached page {record.aligned_page.page_index} to roll {anchor.roll_no}, "
+            f"but continuation program reads {record.program} while page 1 reads {anchor.program}"
+        )
+
+    identity_payload = dict(record.identity_payload or {})
+    identity_payload.update(
+        {
+            "grouping_mode": grouping_mode,
+            "grouped_roll_no": anchor.roll_no,
+            "grouped_program": anchor.program,
+            "grouped_from_page1_source_index": anchor.source_index,
+            "original_identity_kind": record.identity_kind,
+            "original_roll_no": record.roll_no,
+            "original_confidence": record.confidence,
+        }
+    )
+    confidence = "high" if _strong_enough(anchor.confidence, "high") else "medium"
+    return replace(
+        record,
+        identity_kind=PAGE_MAJOR_IDENTITY_KIND if grouping_mode == "page-major" else SHEET_MAJOR_IDENTITY_KIND,
+        roll_no=anchor.roll_no,
+        program=record.program or anchor.program,
+        confidence=confidence,
+        identity_payload=identity_payload,
+        review_flags=review_flags,
+    )
+
+
+def _group_records_by_page_major(
+    records: list[_PageRecord],
+    manifest: dict,
+    min_group_confidence: str,
+) -> tuple[dict[str, list[_PageRecord]], list[_PageRecord]]:
+    if manifest["num_pages"] <= 1:
+        return _group_records_by_identity(records, min_group_confidence)
+
+    ordered = sorted(records, key=lambda item: item.source_index)
+    page_sequence = _page_sequence(ordered)
+    page_one_records = [record for record in ordered if record.aligned_page.page_index == 1]
+    student_count = len(page_one_records)
+    if student_count == 0:
+        for record in ordered:
+            record.review_flags.append("page-major grouping skipped: no page 1 records were detected")
+        return _group_records_by_identity(ordered, min_group_confidence)
+
+    if not _matches_page_major_sequence(page_sequence, manifest["num_pages"]):
+        flag = _positional_sequence_review_flag("page-major", manifest, page_sequence)
+        for record in ordered:
+            if record.aligned_page.page_index != 1:
+                record.review_flags.append(flag)
+        return _group_records_by_identity(ordered, min_group_confidence)
+
+    grouped: dict[str, list[_PageRecord]] = {}
+    unmatched: list[_PageRecord] = []
+    records_by_page: dict[int, list[_PageRecord]] = {
+        page_index: [
+            record for record in ordered if record.aligned_page.page_index == page_index
+        ]
+        for page_index in range(1, manifest["num_pages"] + 1)
+    }
+
+    for student_index, page_one_record in enumerate(records_by_page[1]):
+        roll_no = page_one_record.roll_no
+        if not roll_no or not _strong_enough(page_one_record.confidence, min_group_confidence):
+            flag = (
+                "page-major grouping skipped for this sheet: matching page 1 did not have a "
+                f"{min_group_confidence}-confidence roll number"
+            )
+            for page_index in range(1, manifest["num_pages"] + 1):
+                record = records_by_page[page_index][student_index]
+                record.review_flags.append(flag)
+                unmatched.append(record)
+            continue
+
+        student_records = [page_one_record]
+        for page_index in range(2, manifest["num_pages"] + 1):
+            student_records.append(
+                _positional_record(records_by_page[page_index][student_index], page_one_record, "page-major")
+            )
+        grouped.setdefault(roll_no, []).extend(student_records)
+
+    return grouped, unmatched
+
+
+def _group_records_by_sheet_major(
+    records: list[_PageRecord],
+    manifest: dict,
+    min_group_confidence: str,
+) -> tuple[dict[str, list[_PageRecord]], list[_PageRecord]]:
+    if manifest["num_pages"] <= 1:
+        return _group_records_by_identity(records, min_group_confidence)
+
+    ordered = sorted(records, key=lambda item: item.source_index)
+    page_sequence = _page_sequence(ordered)
+    num_pages = manifest["num_pages"]
+    if not _matches_sheet_major_sequence(page_sequence, num_pages):
+        flag = _positional_sequence_review_flag("sheet-major", manifest, page_sequence)
+        for record in ordered:
+            if record.aligned_page.page_index != 1:
+                record.review_flags.append(flag)
+        return _group_records_by_identity(ordered, min_group_confidence)
+
+    student_count = len(ordered) // num_pages
+    grouped: dict[str, list[_PageRecord]] = {}
+    unmatched: list[_PageRecord] = []
+    for student_index in range(student_count):
+        offset = student_index * num_pages
+        sheet_records = ordered[offset : offset + num_pages]
+        page_one_record = sheet_records[0]
+        roll_no = page_one_record.roll_no
+        if not roll_no or not _strong_enough(page_one_record.confidence, min_group_confidence):
+            flag = (
+                "sheet-major grouping skipped for this sheet: page 1 did not have a "
+                f"{min_group_confidence}-confidence roll number"
+            )
+            for record in sheet_records:
+                record.review_flags.append(flag)
+            unmatched.extend(sheet_records)
+            continue
+
+        student_records = [page_one_record]
+        for record in sheet_records[1:]:
+            student_records.append(_positional_record(record, page_one_record, "sheet-major"))
+        grouped.setdefault(roll_no, []).extend(student_records)
+
+    return grouped, unmatched
+
+
 def _write_page_error(root: Path, source_path: Path, source_index: int, error: Exception) -> dict[str, Any]:
     error_dir = root / "page_errors"
     error_dir.mkdir(parents=True, exist_ok=True)
@@ -215,6 +750,36 @@ def _write_unmatched_page(
     return payload
 
 
+def _save_student_pdf(
+    images_by_page: dict[int, np.ndarray],
+    manifest: dict,
+    output_dir: Path,
+) -> Path | None:
+    if not images_by_page:
+        return None
+
+    import pymupdf
+
+    page = manifest["page"]
+    width_pt = float(page["width_mm"]) / MM_PER_INCH * 72
+    height_pt = float(page["height_mm"]) / MM_PER_INCH * 72
+    pdf_path = output_dir / "sheet.pdf"
+    doc = pymupdf.open()
+    try:
+        for page_no in sorted(images_by_page):
+            pdf_page = doc.new_page(width=width_pt, height=height_pt)
+            gray = np.asarray(images_by_page[page_no])
+            if gray.ndim == 3:
+                gray = gray.mean(axis=2)
+            buffer = io.BytesIO()
+            Image.fromarray(gray.astype(np.uint8, copy=False), mode="L").save(buffer, format="PNG")
+            pdf_page.insert_image(pdf_page.rect, stream=buffer.getvalue())
+        doc.save(pdf_path)
+    finally:
+        doc.close()
+    return pdf_path
+
+
 def _write_student_group(
     roll_no: str,
     records: list[_PageRecord],
@@ -247,6 +812,7 @@ def _write_student_group(
 
     aligned_pages = {page_no: record.aligned_page for page_no, record in selected_by_page.items()}
     images_by_page, page_records, quality_reports = _page_artifacts(aligned_pages, manifest, output_dir, dpi)
+    sheet_pdf_path = _save_student_pdf(images_by_page, manifest, output_dir)
     for report in quality_reports:
         review_flags.extend(f"page {report.page_index}: {flag}" for flag in report.review_flags)
 
@@ -306,7 +872,7 @@ def _write_student_group(
     for record in sorted(records, key=lambda item: item.source_index):
         identity_payload = record.identity_payload
         if record.aligned_page.page_index in images_by_page and (
-            record.identity_kind in {"handwritten", "write_in"}
+            record.identity_kind in {"handwritten", "write_in"} | GROUPED_IDENTITY_KINDS
             or (identity_payload is not None and "write_in_roll_read" in identity_payload)
         ):
             crops, cell_crops = save_roll_number_crop_sets(
@@ -318,7 +884,7 @@ def _write_student_group(
             )
             if identity_payload is not None:
                 identity_payload = dict(identity_payload)
-                if record.identity_kind in {"handwritten", "write_in"}:
+                if record.identity_kind in {"handwritten", "write_in"} | GROUPED_IDENTITY_KINDS:
                     identity_payload = {**identity_payload, "crop_paths": crops, "cell_crop_paths": cell_crops}
                 if "write_in_roll_read" in identity_payload and isinstance(
                     identity_payload["write_in_roll_read"],
@@ -357,6 +923,7 @@ def _write_student_group(
             }
             for record in sorted(records, key=lambda item: item.source_index)
         ],
+        "sheet_pdf_path": _json_path(sheet_pdf_path, output_dir) if sheet_pdf_path is not None else None,
         "pages": [asdict(page) for page in page_records],
         "mcq_score": mcq_score,
         "mcq_total": mcq_total,
@@ -367,6 +934,446 @@ def _write_student_group(
     }
     details_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     return payload
+
+
+def _student_artifact_path(result: dict[str, Any], key: str) -> Path | None:
+    value = result.get(key)
+    if not value:
+        return None
+    path = Path(value)
+    if path.is_absolute():
+        return path
+    return Path(result["details_path"]).parent / path
+
+
+def _report_path(path: Path | str | None, root: Path) -> str:
+    if path is None:
+        return ""
+    return _json_path(Path(path), root)
+
+
+def _join_values(values: list[Any]) -> str:
+    return ",".join(str(value) for value in values)
+
+
+def _join_flags(flags: list[Any]) -> str:
+    return " | ".join(str(flag).replace("\r", " ").replace("\n", " ") for flag in flags)
+
+
+def _score_value(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, float) and value.is_integer():
+        return str(int(value))
+    return str(value)
+
+
+def _identity_roll(identity: dict[str, Any] | None) -> str:
+    if not identity:
+        return ""
+    roll_no = identity.get("roll_no")
+    if roll_no:
+        return str(roll_no)
+    nested = identity.get("write_in_roll_read")
+    if isinstance(nested, dict) and nested.get("roll_no"):
+        return str(nested["roll_no"])
+    return ""
+
+
+def _identity_program(identity: dict[str, Any] | None) -> str:
+    if not identity:
+        return ""
+    program = identity.get("program")
+    if program:
+        return str(program)
+    nested = identity.get("write_in_roll_read")
+    if isinstance(nested, dict) and nested.get("program"):
+        return str(nested["program"])
+    return ""
+
+
+def _student_report_row(
+    result: dict[str, Any],
+    manifest: dict,
+    root: Path,
+    grouping_mode: str,
+) -> dict[str, Any]:
+    expected_pages = list(range(1, int(manifest["num_pages"]) + 1))
+    pages_found = sorted({int(page["page_index"]) for page in result.get("pages", [])})
+    missing_pages = [page for page in expected_pages if page not in pages_found]
+    source_indices = sorted(int(page["source_index"]) for page in result.get("source_pages", []))
+    identity_kinds = [
+        f"p{read.get('page_index')}:{read.get('kind')}:{read.get('confidence')}"
+        for read in result.get("identity_reads", [])
+    ]
+    flags = list(result.get("review_flags", []))
+    student = dict(result.get("student", {}))
+    return {
+        "item_type": "student",
+        "status": result.get("status", ""),
+        "roll_no": student.get("roll_no") or "",
+        "program": student.get("program") or "",
+        "student_name": student.get("name") or "",
+        "student_email": student.get("email") or "",
+        "pages_found": _join_values(pages_found),
+        "expected_pages": str(len(expected_pages)),
+        "missing_pages": _join_values(missing_pages),
+        "source_indices": _join_values(source_indices),
+        "grouping_mode": grouping_mode,
+        "identity_kinds": "; ".join(identity_kinds),
+        "mcq_score": _score_value(result.get("mcq_score")),
+        "mcq_total": _score_value(result.get("mcq_total")),
+        "review_flag_count": len(flags),
+        "review_flags": _join_flags(flags),
+        "sheet_pdf_path": _report_path(_student_artifact_path(result, "sheet_pdf_path"), root),
+        "details_path": _report_path(result.get("details_path"), root),
+        "source_path": "",
+        "error_type": "",
+    }
+
+
+def _unmatched_report_row(
+    result: dict[str, Any],
+    manifest: dict,
+    root: Path,
+    grouping_mode: str,
+) -> dict[str, Any]:
+    identity = result.get("identity") if isinstance(result.get("identity"), dict) else None
+    flags = list(result.get("review_flags", []))
+    page_index = result.get("page_index")
+    source_index = result.get("source_index")
+    confidence = identity.get("confidence") if identity else ""
+    identity_kind = result.get("identity_kind") or ""
+    return {
+        "item_type": "unmatched_page",
+        "status": result.get("status", "needs_review"),
+        "roll_no": _identity_roll(identity),
+        "program": _identity_program(identity),
+        "student_name": "",
+        "student_email": "",
+        "pages_found": str(page_index or ""),
+        "expected_pages": str(manifest["num_pages"]),
+        "missing_pages": "",
+        "source_indices": str(source_index or ""),
+        "grouping_mode": grouping_mode,
+        "identity_kinds": f"p{page_index}:{identity_kind}:{confidence}",
+        "mcq_score": "",
+        "mcq_total": "",
+        "review_flag_count": len(flags),
+        "review_flags": _join_flags(flags),
+        "sheet_pdf_path": "",
+        "details_path": _report_path(result.get("details_path"), root),
+        "source_path": str(result.get("source_path") or ""),
+        "error_type": "",
+    }
+
+
+def _page_error_report_row(
+    result: dict[str, Any],
+    manifest: dict,
+    root: Path,
+    grouping_mode: str,
+) -> dict[str, Any]:
+    flags = list(result.get("review_flags", []))
+    return {
+        "item_type": "page_error",
+        "status": result.get("status", "error"),
+        "roll_no": "",
+        "program": "",
+        "student_name": "",
+        "student_email": "",
+        "pages_found": "",
+        "expected_pages": str(manifest["num_pages"]),
+        "missing_pages": "",
+        "source_indices": str(result.get("source_index") or ""),
+        "grouping_mode": grouping_mode,
+        "identity_kinds": "",
+        "mcq_score": "",
+        "mcq_total": "",
+        "review_flag_count": len(flags),
+        "review_flags": _join_flags(flags),
+        "sheet_pdf_path": "",
+        "details_path": _report_path(result.get("details_path"), root),
+        "source_path": str(result.get("source_path") or ""),
+        "error_type": str(result.get("error_type") or ""),
+    }
+
+
+def _review_report_rows(
+    student_results: list[dict[str, Any]],
+    unmatched_results: list[dict[str, Any]],
+    page_errors: list[dict[str, Any]],
+    manifest: dict,
+    root: Path,
+    grouping_mode: str,
+) -> list[dict[str, Any]]:
+    rows = [
+        _student_report_row(result, manifest, root, grouping_mode)
+        for result in sorted(student_results, key=lambda item: str(item["student"].get("roll_no") or ""))
+    ]
+    rows.extend(_unmatched_report_row(result, manifest, root, grouping_mode) for result in unmatched_results)
+    rows.extend(_page_error_report_row(result, manifest, root, grouping_mode) for result in page_errors)
+    return rows
+
+
+def _write_review_csv(path: Path, rows: list[dict[str, Any]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=REVIEW_REPORT_COLUMNS, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def _html_link(value: str) -> str:
+    if not value:
+        return ""
+    escaped = html.escape(value)
+    href = html.escape(Path(value).as_posix(), quote=True)
+    return f'<a href="{href}">{escaped}</a>'
+
+
+def _status_class(status: str) -> str:
+    if status == "ready":
+        return "ready"
+    if status == "error":
+        return "error"
+    return "review"
+
+
+def _render_report_table(title: str, rows: list[dict[str, Any]], columns: list[str]) -> str:
+    headers = "".join(f"<th>{html.escape(column.replace('_', ' ').title())}</th>" for column in columns)
+    body_rows = []
+    for row in rows:
+        cells = []
+        for column in columns:
+            value = str(row.get(column, ""))
+            if column in {"sheet_pdf_path", "details_path"}:
+                cell = _html_link(value)
+            elif column == "status":
+                status = html.escape(value)
+                cell = f'<span class="badge {_status_class(value)}">{status}</span>'
+            elif column == "review_flags":
+                cell = f'<span class="flags">{html.escape(value)}</span>'
+            else:
+                cell = html.escape(value)
+            cells.append(f"<td>{cell}</td>")
+        body_rows.append(f"<tr>{''.join(cells)}</tr>")
+    if not body_rows:
+        body_rows.append(f'<tr><td colspan="{len(columns)}" class="empty">None</td></tr>')
+    return f"""
+      <section>
+        <h2>{html.escape(title)}</h2>
+        <table>
+          <thead><tr>{headers}</tr></thead>
+          <tbody>{''.join(body_rows)}</tbody>
+        </table>
+      </section>
+    """
+
+
+def _write_review_html(
+    path: Path,
+    manifest: dict,
+    index: dict[str, Any],
+    rows: list[dict[str, Any]],
+) -> None:
+    status_counts = dict(index.get("status_counts", {}))
+    student_rows = [row for row in rows if row["item_type"] == "student"]
+    unmatched_rows = [row for row in rows if row["item_type"] == "unmatched_page"]
+    error_rows = [row for row in rows if row["item_type"] == "page_error"]
+    metric_items = [
+        ("Ready", status_counts.get("ready", 0)),
+        ("Needs Review", status_counts.get("needs_review", 0)),
+        ("Unmatched Pages", status_counts.get("unmatched_pages", 0)),
+        ("Page Errors", status_counts.get("page_errors", 0)),
+        ("Grouping", index.get("grouping_mode", "")),
+        ("Page Sequence", _join_values(index.get("detected_page_sequence", []))),
+    ]
+    metrics = "".join(
+        f"<div class=\"metric\"><span>{html.escape(label)}</span><strong>{html.escape(str(value))}</strong></div>"
+        for label, value in metric_items
+    )
+    student_columns = [
+        "status",
+        "roll_no",
+        "program",
+        "student_name",
+        "pages_found",
+        "source_indices",
+        "mcq_score",
+        "mcq_total",
+        "review_flag_count",
+        "review_flags",
+        "sheet_pdf_path",
+        "details_path",
+    ]
+    unmatched_columns = [
+        "status",
+        "pages_found",
+        "source_indices",
+        "roll_no",
+        "program",
+        "identity_kinds",
+        "review_flags",
+        "details_path",
+        "source_path",
+    ]
+    error_columns = ["status", "source_indices", "error_type", "review_flags", "details_path", "source_path"]
+    document = f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{html.escape(manifest["exam_id"])} Review Report</title>
+  <style>
+    :root {{
+      color-scheme: light;
+      font-family: Arial, Helvetica, sans-serif;
+      background: #f7f8fa;
+      color: #172033;
+    }}
+    body {{
+      margin: 0;
+      padding: 24px;
+    }}
+    main {{
+      max-width: 1280px;
+      margin: 0 auto;
+    }}
+    h1 {{
+      margin: 0 0 6px;
+      font-size: 24px;
+      line-height: 1.2;
+    }}
+    h2 {{
+      margin: 28px 0 12px;
+      font-size: 17px;
+    }}
+    .subtitle {{
+      margin: 0 0 18px;
+      color: #5c667a;
+    }}
+    .metrics {{
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+      gap: 10px;
+      margin: 18px 0 22px;
+    }}
+    .metric {{
+      border: 1px solid #d9dde6;
+      border-radius: 6px;
+      background: #ffffff;
+      padding: 10px 12px;
+    }}
+    .metric span {{
+      display: block;
+      color: #667085;
+      font-size: 12px;
+      margin-bottom: 5px;
+    }}
+    .metric strong {{
+      display: block;
+      font-size: 16px;
+      overflow-wrap: anywhere;
+    }}
+    table {{
+      width: 100%;
+      border-collapse: collapse;
+      background: #ffffff;
+      border: 1px solid #d9dde6;
+      font-size: 13px;
+    }}
+    th, td {{
+      border-bottom: 1px solid #edf0f5;
+      padding: 8px 9px;
+      text-align: left;
+      vertical-align: top;
+    }}
+    th {{
+      background: #f0f3f8;
+      color: #344054;
+      font-size: 12px;
+      white-space: nowrap;
+    }}
+    a {{
+      color: #1f5fbf;
+      text-decoration: none;
+    }}
+    a:hover {{
+      text-decoration: underline;
+    }}
+    .badge {{
+      display: inline-block;
+      border-radius: 999px;
+      padding: 2px 8px;
+      font-size: 12px;
+      font-weight: 700;
+      white-space: nowrap;
+    }}
+    .ready {{
+      background: #e8f5ee;
+      color: #166534;
+    }}
+    .review {{
+      background: #fff7df;
+      color: #8a4b08;
+    }}
+    .error {{
+      background: #feeceb;
+      color: #b42318;
+    }}
+    .flags {{
+      display: inline-block;
+      min-width: 220px;
+      max-width: 520px;
+      overflow-wrap: anywhere;
+    }}
+    .empty {{
+      color: #667085;
+      text-align: center;
+      padding: 18px;
+    }}
+  </style>
+</head>
+<body>
+  <main>
+    <h1>{html.escape(manifest["exam_id"])} Review Report</h1>
+    <p class="subtitle">Generated from local SmartOMR batch parsing artifacts.</p>
+    <div class="metrics">{metrics}</div>
+    {_render_report_table("Students", student_rows, student_columns)}
+    {_render_report_table("Unmatched Pages", unmatched_rows, unmatched_columns)}
+    {_render_report_table("Page Errors", error_rows, error_columns)}
+  </main>
+</body>
+</html>
+"""
+    path.write_text(document, encoding="utf-8")
+
+
+def _write_review_reports(
+    root: Path,
+    manifest: dict,
+    index: dict[str, Any],
+    student_results: list[dict[str, Any]],
+    unmatched_results: list[dict[str, Any]],
+    page_errors: list[dict[str, Any]],
+) -> dict[str, str]:
+    rows = _review_report_rows(
+        student_results,
+        unmatched_results,
+        page_errors,
+        manifest,
+        root,
+        str(index.get("grouping_mode") or ""),
+    )
+    csv_path = root / "review_report.csv"
+    html_path = root / "review_report.html"
+    _write_review_csv(csv_path, rows)
+    _write_review_html(html_path, manifest, index, rows)
+    return {
+        "csv": _json_path(csv_path, root),
+        "html": _json_path(html_path, root),
+    }
 
 
 def parse_exam_bundle(
@@ -382,8 +1389,14 @@ def parse_exam_bundle(
     allow_partial: bool = True,
     ocr_backend: RollOcrBackend | None = None,
     min_group_confidence: str = "high",
+    grouping_mode: str = "auto",
     written_ocr_backend: WrittenOcrBackend | None = None,
 ) -> tuple[list[dict[str, Any]], Path]:
+    if min_group_confidence not in CONFIDENCE_RANK:
+        raise ValueError(f"unknown minimum group confidence: {min_group_confidence}")
+    if grouping_mode not in GROUPING_MODES:
+        raise ValueError(f"unknown grouping mode: {grouping_mode}")
+
     manifest = load_manifest(manifest_path)
     course_id = _safe_id(course_id) if course_id else _safe_id(manifest["exam_id"])
     root = Path(output_root) / course_id
@@ -394,8 +1407,7 @@ def parse_exam_bundle(
     default_marks = float(manifest["exam"].get("marks_per_mcq", 1.0))
     answer_key = load_answer_key(answer_key_path, default_marks=default_marks) if answer_key_path else None
 
-    grouped: dict[str, list[_PageRecord]] = {}
-    unmatched: list[_PageRecord] = []
+    page_records_for_bundle: list[_PageRecord] = []
     page_errors: list[dict[str, Any]] = []
 
     source_counter = 0
@@ -429,17 +1441,49 @@ def parse_exam_bundle(
                 identity_payload=identity_payload,
                 review_flags=flags,
             )
-            if roll_no and _strong_enough(confidence, min_group_confidence):
-                grouped.setdefault(roll_no, []).append(record)
-            else:
-                unmatched.append(record)
+            page_records_for_bundle.append(record)
+
+    applied_grouping_mode = (
+        _infer_grouping_mode(page_records_for_bundle, manifest) if grouping_mode == "auto" else grouping_mode
+    )
+    identity_grouped, identity_unmatched = _group_records_by_identity(
+        page_records_for_bundle,
+        min_group_confidence,
+    )
+    if applied_grouping_mode == "identity" and grouping_mode == "auto":
+        similarity_grouped, similarity_unmatched = _group_records_by_write_in_similarity(
+            page_records_for_bundle,
+            manifest,
+            min_group_confidence,
+            dpi,
+        )
+        if sum(len(group_records) for group_records in similarity_grouped.values()) > sum(
+            len(group_records) for group_records in identity_grouped.values()
+        ):
+            applied_grouping_mode = "write-in-similarity"
+            grouped, unmatched = similarity_grouped, similarity_unmatched
+        else:
+            grouped, unmatched = identity_grouped, identity_unmatched
+    elif applied_grouping_mode == "write-in-similarity":
+        grouped, unmatched = _group_records_by_write_in_similarity(
+            page_records_for_bundle,
+            manifest,
+            min_group_confidence,
+            dpi,
+        )
+    elif applied_grouping_mode == "page-major":
+        grouped, unmatched = _group_records_by_page_major(page_records_for_bundle, manifest, min_group_confidence)
+    elif applied_grouping_mode == "sheet-major":
+        grouped, unmatched = _group_records_by_sheet_major(page_records_for_bundle, manifest, min_group_confidence)
+    else:
+        grouped, unmatched = identity_grouped, identity_unmatched
 
     student_results: list[dict[str, Any]] = []
-    for roll_no, records in sorted(grouped.items()):
+    for roll_no, student_page_records in sorted(grouped.items()):
         student_results.append(
             _write_student_group(
                 roll_no,
-                records,
+                student_page_records,
                 manifest,
                 root,
                 students,
@@ -457,6 +1501,9 @@ def parse_exam_bundle(
     index = {
         "exam_id": manifest["exam_id"],
         "mode": "multi_student_bundle",
+        "requested_grouping_mode": grouping_mode,
+        "grouping_mode": applied_grouping_mode,
+        "detected_page_sequence": _page_sequence(page_records_for_bundle),
         "status_counts": {
             "ready": sum(1 for result in student_results if result["status"] == "ready"),
             "needs_review": sum(1 for result in student_results if result["status"] == "needs_review"),
@@ -468,6 +1515,11 @@ def parse_exam_bundle(
                 "roll_no": result["student"]["roll_no"],
                 "status": result["status"],
                 "student_name": result["student"]["name"],
+                "sheet_pdf_path": (
+                    str(Path(result["details_path"]).parent / result["sheet_pdf_path"])
+                    if result.get("sheet_pdf_path")
+                    else None
+                ),
                 "mcq_score": result["mcq_score"],
                 "mcq_total": result["mcq_total"],
                 "mcq_answers": _mcq_answer_summary(result),
@@ -490,6 +1542,10 @@ def parse_exam_bundle(
         "unmatched_pages": unmatched_results,
         "page_errors": page_errors,
     }
+    report_paths = _write_review_reports(root, manifest, index, student_results, unmatched_results, page_errors)
+    index["reports"] = report_paths
+    index["review_report_csv_path"] = report_paths["csv"]
+    index["review_report_html_path"] = report_paths["html"]
     index_path.write_text(json.dumps(index, indent=2), encoding="utf-8")
     return student_results, index_path
 
@@ -556,6 +1612,15 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["medium", "high"],
         help="Minimum identity confidence required before a page is attached to a student",
     )
+    parser.add_argument(
+        "--grouping-mode",
+        default="auto",
+        choices=sorted(GROUPING_MODES),
+        help=(
+            "auto detects scanner order from page-index bars; identity groups pages by read roll number; "
+            "page-major expects A1 B1 ... A2 B2 ...; sheet-major expects A1 A2 ... B1 B2 ..."
+        ),
+    )
     return parser
 
 
@@ -588,6 +1653,7 @@ def main(argv: list[str] | None = None) -> int:
             allow_partial=not args.strict_complete,
             ocr_backend=ocr_backend,
             min_group_confidence=args.min_group_confidence,
+            grouping_mode=args.grouping_mode,
             written_ocr_backend=written_ocr_backend,
         )
     except (OSError, ScanError, ValueError, RuntimeError) as exc:
@@ -597,6 +1663,19 @@ def main(argv: list[str] | None = None) -> int:
     ready = sum(1 for result in results if result["status"] == "ready")
     review = sum(1 for result in results if result["status"] == "needs_review")
     print(f"Wrote {index_path}")
+    index_payload = json.loads(index_path.read_text(encoding="utf-8"))
+    review_report_html = index_payload.get("review_report_html_path")
+    review_report_csv = index_payload.get("review_report_csv_path")
+    if review_report_html:
+        report_path = Path(review_report_html)
+        if not report_path.is_absolute():
+            report_path = index_path.parent / report_path
+        print(f"review_report_html={report_path}")
+    if review_report_csv:
+        report_path = Path(review_report_csv)
+        if not report_path.is_absolute():
+            report_path = index_path.parent / report_path
+        print(f"review_report_csv={report_path}")
     print(f"students_ready={ready} students_needs_review={review}")
     return 0
 

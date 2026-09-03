@@ -159,11 +159,33 @@ python -m omr.workflows.batch \
 `data/answer_keys/<exam_id>_answer_key.csv`. Each PDF page is aligned independently, page identity is
 read, and pages are grouped even when page 1 and page 2 are far apart in the uploaded PDF.
 
+By default, `smartomr-batch` uses `--grouping-mode auto`: it aligns every page, reads the machine
+page-index bars, detects the scanner order, and groups continuation pages automatically when the
+evidence is clean.
+
+```bash
+python -m omr.workflows.batch \
+  --exam-id CSE222_ENDSEM_2026 \
+  --scans data/uploads/scanned_bundle.pdf \
+  --data-dir data
+```
+
+Auto mode recognizes `A1 B1 C1 A2 B2 C2` as `page-major` and `A1 A2 B1 B2 C1 C2` as
+`sheet-major`. If the detected page sequence is irregular, it compares the boxed roll-number
+write-ins across pages and can attach continuation pages by visual similarity to page 1. If neither
+page order nor write-in similarity is safe enough, it falls back to roll-identity grouping and leaves
+uncertain pages in review. Manual overrides are still available with `--grouping-mode identity`,
+`--grouping-mode page-major`, `--grouping-mode sheet-major`, or `--grouping-mode write-in-similarity`
+for debugging a scanner workflow.
+
 Output is written under `data/parsed/<exam_id>/students/<roll_no>/`:
 
 ```text
 parse_index.json                         batch summary
+review_report.csv                        spreadsheet-friendly review queue
+review_report.html                       local browser review report
 students/<roll_no>/student.json          full result for one student
+students/<roll_no>/sheet.pdf             aligned multi-page PDF for verification/email
 students/<roll_no>/pages/page_1.png      aligned canonical page
 students/<roll_no>/debug/...             alignment/sampling overlays
 students/<roll_no>/identity/page_2_btech_roll_crop.png
@@ -172,6 +194,10 @@ students/<roll_no>/written_ocr/Q11_lines/Q11_line_1.png
 unmatched_pages/source_0003/page.json    page that could not be safely attached
 page_errors/source_0004.json             page that could not be validated as SmartOMR
 ```
+
+Open `review_report.html` first after a bulk scan. It lists ready students, needs-review students,
+unmatched pages, hard page errors, the generated `sheet.pdf`, and the exact review flags that must
+be cleared before any verification email/final grading step should trust the result.
 
 Continuation-page handwritten roll reading is local-first. With no OCR provider, the system saves
 the roll crop and sends the page to review. With `--handwritten-roll-ocr local`, it uses offline
@@ -355,8 +381,10 @@ sits nearest is the true top-left, at any rotation and any scale.
 ### Identity on every page
 
 A multi-page sheet is scanned as a loose batch, so every page has to say who it belongs to and
-which page it is. Attributing a page by its position in the scan queue is a guess, and principle 4
-says a guess doesn't get to produce a grade.
+which page it is. The default parser groups by roll identity. Separate page-major and sheet-major
+scanner modes are available only when the operator knows the scan order; in those modes, the
+page-index bars must confirm the exact selected sequence before continuation pages are attached by
+position.
 
 | On every page | Read by | What it's for |
 |---|---|---|
