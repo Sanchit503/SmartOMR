@@ -203,6 +203,11 @@ The current file-based workflow also writes `review_report.csv` and `review_repo
 students, needs-review students, unmatched pages, page errors, generated `sheet.pdf` links, and the
 exact flags that must be cleared before emailing or final grading.
 
+The human verification step writes a separate `verified_index.json`; it does not rewrite the raw
+parser output. A reviewer can verify a student, reject a grouping, keep a student on hold, assign an
+unmatched continuation page to a roll number, or ignore a stray page. Only rows marked `verified`
+with a generated verified sheet become eligible for later email/grading automation.
+
 ---
 
 ## 6. Module 3 — Identity resolution & verification email
@@ -229,8 +234,13 @@ Straightforward once Module 5/6 give you canonical images and manifest coordinat
 ## 8. Module 5 — Written-answer grading (LLM-assisted)
 
 1. Crop each written answer region using the manifest's `written_block` coordinates from the canonical image.
-2. For each cropped answer, call a vision-capable LLM with: the question text (from the ingested question paper), the max marks, the professor's rubric/model answer, and the cropped image.
-3. Require **structured JSON output** — don't parse free text.
+2. Export a manual written-grading packet for verified students: crop links, OCR text/confidence
+   when available, `manual_marks_template.csv`, and a browser review page. Import professor/TA
+   marks only after validating `0 <= marks_awarded <= max_marks`.
+3. Store written grades separately from raw parser output in structured JSON/CSV, then produce a
+   combined `final_scores.csv` with MCQ + written totals.
+4. For AI-assisted grading, call a vision-capable LLM with: the question text (from the ingested question paper), the max marks, the professor's rubric/model answer, and the cropped image.
+5. Require **structured JSON output** — don't parse free text.
 
 **Example prompt (adapt to whichever vision-capable LLM provider you use; most accept an image + text prompt in broadly the same shape):**
 
@@ -260,8 +270,8 @@ Marking guideline: {rubric_text}
 [attached: cropped handwritten-answer image]
 ```
 
-4. Anything returned with `needs_human_review: true` (or a parse failure) goes into the same review queue as Module 3/4's flagged items — don't silently accept it.
-5. This module should be built behind a small provider-agnostic interface (`grade_written(image, question, rubric, max_marks) -> GradeResult`) so you can swap LLM providers without touching the rest of the pipeline — useful since API access/budget for a BTP can change.
+6. Anything returned with `needs_human_review: true` (or a parse failure) goes into the same review queue as Module 3/4's flagged items — don't silently accept it.
+7. This module should be built behind a small provider-agnostic interface (`grade_written(image, question, rubric, max_marks) -> GradeResult`) so you can swap LLM providers without touching the rest of the pipeline — useful since API access/budget for a BTP can change. The provider should emit the same grade-record shape as the manual marks importer.
 
 ---
 
@@ -328,8 +338,9 @@ omr/
                page-index reading, and roll-number/program decoding.
   io/          Roster CSV, answer-key CSV, and result CSV helpers.
   workflows/  File-based workflows that compose contracts + reader + grading + I/O,
-               currently parse.py for canonical pages, alignment diagnostics,
-               identity, MCQs, written crops and JSON artifacts; evaluate.py
+               currently parse.py for one-sheet parsing, batch.py for
+               multi-student PDFs, review.py for human verification artifacts,
+               written.py for written marks packets/import, and evaluate.py
                for the older MCQ summary professor-demo flow.
 
 prototype_eval/

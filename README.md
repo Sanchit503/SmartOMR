@@ -199,6 +199,103 @@ Open `review_report.html` first after a bulk scan. It lists ready students, need
 unmatched pages, hard page errors, the generated `sheet.pdf`, and the exact review flags that must
 be cleared before any verification email/final grading step should trust the result.
 
+## Verify parsed results
+
+After checking `review_report.html`, create the separate human-verification artifact:
+
+```bash
+python -m omr.workflows.review init \
+  --parsed-dir data/parsed/CSE222_ENDSEM_2026
+```
+
+This writes:
+
+```text
+verified_index.json                     final human review state
+verification_report.csv                 spreadsheet-friendly verification state
+verification_report.html                local browser verification report
+verified/students/<roll_no>/sheet.pdf   human-approved sheet for later email
+```
+
+The parser output remains unchanged. The verifier starts parser-ready students as
+`pending_verification`, flagged students as `needs_review` or `missing_pages`, and only explicit
+human approval changes a student to `verified`.
+
+Useful commands:
+
+```bash
+python -m omr.workflows.review summary --parsed-dir data/parsed/CSE222_ENDSEM_2026
+
+python -m omr.workflows.review verify \
+  --parsed-dir data/parsed/CSE222_ENDSEM_2026 \
+  --roll-no 2024503 \
+  --reviewer "TA" \
+  --note "Checked roll number, pages, and review flags"
+
+python -m omr.workflows.review reject \
+  --parsed-dir data/parsed/CSE222_ENDSEM_2026 \
+  --roll-no 2024544 \
+  --reviewer "TA" \
+  --reason "Wrong page grouping"
+
+python -m omr.workflows.review assign-page \
+  --parsed-dir data/parsed/CSE222_ENDSEM_2026 \
+  --source-index 17 \
+  --roll-no 2024503 \
+  --page 2 \
+  --reviewer "TA" \
+  --note "Manual match from review report"
+```
+
+Later email/grading automation must use `verified_index.json`, not raw `parse_index.json`.
+
+## Grade written answers manually
+
+For production safety, written grading starts with a manual marks packet. Only `verified` students
+are exported by default.
+
+```bash
+python -m omr.workflows.written export \
+  --parsed-dir data/parsed/CSE222_ENDSEM_2026
+```
+
+This writes under `data/parsed/<exam_id>/written_grading/`:
+
+```text
+written_packet.json              structured list of exported written answers
+written_answer_index.csv         all crop links plus OCR text/confidence when available
+manual_marks_template.csv        marks-entry template for professor/TA
+written_review.html              local browser page with answer-crop previews
+```
+
+Fill only these columns in `manual_marks_template.csv`:
+
+```text
+marks_awarded
+needs_human_review
+grader_comment
+```
+
+Then import the filled CSV:
+
+```bash
+python -m omr.workflows.written import-marks \
+  --parsed-dir data/parsed/CSE222_ENDSEM_2026 \
+  --marks-csv data/parsed/CSE222_ENDSEM_2026/written_grading/manual_marks_template.csv \
+  --grader "TA"
+```
+
+The importer validates every mark against that question's `max_marks` and writes:
+
+```text
+written_grades.json              structured written grades
+written_grades_report.csv        one row per written answer
+final_scores.csv                 MCQ + written totals per verified student
+```
+
+If you need to inspect crops before verification is complete, use `--include-unverified` on export,
+but those rows are for debugging only and should not become final marks.
+
 Continuation-page handwritten roll reading is local-first. With no OCR provider, the system saves
 the roll crop and sends the page to review. With `--handwritten-roll-ocr local`, it uses offline
 tools only: a trained local digit model when `--digit-model` is supplied, and local Tesseract as
@@ -332,6 +429,8 @@ omr/
   workflows/     File-based scan evaluation workflow that composes reader + grading + CSV I/O
     parse.py       Official parser: canonical pages, alignment diagnostics, identity, MCQs,
                      written crops, JSON artifacts
+    batch.py       Multi-student PDF parser: page grouping, per-student sheets, review reports
+    review.py      Human verification layer: verified_index, audit decisions, verified sheets
     evaluate.py    Older MCQ summary/evaluation workflow retained for compatibility
   verify.py      Round-trips a generated sheet: fills it in, grades it, checks it came back
 prototype_eval/  Backward-compatible professor-demo CLI and sample CSVs; implementation is in omr/

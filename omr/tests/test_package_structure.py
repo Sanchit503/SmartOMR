@@ -7,6 +7,8 @@ from omr.reader.identity import read_roll_number
 from omr.reader.scan import ScanError
 from omr.workflows.evaluate import batch_evaluate, evaluate_scan
 from omr.workflows.parse import parse_scan, parse_scans
+from omr.workflows.review import initialize_verification_index, verify_student
+from omr.workflows.written import export_written_grading_packet, import_written_marks
 
 
 def test_promoted_scan_evaluation_modules_are_importable_from_omr():
@@ -17,6 +19,10 @@ def test_promoted_scan_evaluation_modules_are_importable_from_omr():
     assert callable(batch_evaluate)
     assert callable(parse_scan)
     assert callable(parse_scans)
+    assert callable(initialize_verification_index)
+    assert callable(verify_student)
+    assert callable(export_written_grading_packet)
+    assert callable(import_written_marks)
 
 
 def test_prototype_eval_is_only_a_compatibility_path_now():

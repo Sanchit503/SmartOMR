@@ -1504,6 +1504,7 @@ def parse_exam_bundle(
         "requested_grouping_mode": grouping_mode,
         "grouping_mode": applied_grouping_mode,
         "detected_page_sequence": _page_sequence(page_records_for_bundle),
+        "expected_pages": manifest["num_pages"],
         "status_counts": {
             "ready": sum(1 for result in student_results if result["status"] == "ready"),
             "needs_review": sum(1 for result in student_results if result["status"] == "needs_review"),

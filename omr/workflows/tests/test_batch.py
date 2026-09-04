@@ -166,6 +166,7 @@ def test_batch_pdf_groups_unordered_pages_by_page_identity(tmp_path: Path):
     assert payload["mode"] == "multi_student_bundle"
     assert payload["requested_grouping_mode"] == "auto"
     assert payload["grouping_mode"] == "identity"
+    assert payload["expected_pages"] == 2
     assert payload["status_counts"]["unmatched_pages"] == 0
     assert Path(student["details_path"]).exists()
     sheet_pdf_path = Path(student["details_path"]).parent / student["sheet_pdf_path"]
@@ -434,6 +435,7 @@ def test_batch_auto_groups_three_page_arbitrary_order_by_write_in_similarity(tmp
     payload = json.loads(index_path.read_text(encoding="utf-8"))
     assert payload["requested_grouping_mode"] == "auto"
     assert payload["grouping_mode"] == "write-in-similarity"
+    assert payload["expected_pages"] == 3
     assert payload["detected_page_sequence"] == [2, 3, 1, 3, 2, 1, 1, 3, 2]
     assert payload["status_counts"]["unmatched_pages"] == 0
     assert payload["status_counts"]["page_errors"] == 0

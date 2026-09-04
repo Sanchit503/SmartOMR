@@ -22,6 +22,8 @@ build-backend = "setuptools.build_meta"
 smartomr-generate = "omr.generator.main:main"
 smartomr-parse = "omr.workflows.parse:main"
 smartomr-batch = "omr.workflows.batch:main"
+smartomr-review = "omr.workflows.review:main"
+smartomr-written = "omr.workflows.written:main"
 smartomr-doctor = "omr.health:main"
 smartomr-train-digits = "omr.reader.digit_model:main"
 
