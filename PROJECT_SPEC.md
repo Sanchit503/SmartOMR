@@ -240,8 +240,13 @@ Straightforward once Module 5/6 give you canonical images and manifest coordinat
    `0 <= marks_awarded <= max_marks`.
 3. Store written grades separately from raw parser output in structured JSON/CSV, then produce a
    combined `final_scores.csv` with MCQ + written totals.
-4. For AI-assisted grading, call a vision-capable LLM with: the question text (from the ingested question paper), the max marks, the professor's rubric/model answer, and the cropped image.
-5. Require **structured JSON output** — don't parse free text.
+4. Written grading now goes through `omr.grading.written.WrittenGrader`. The as-built provider is
+   a deterministic `mock` provider for workflow testing; it defaults to `needs_human_review` and
+   must not be used as real marks.
+5. For AI-assisted grading, add a real provider behind that interface and call a vision-capable
+   LLM with: the question text (from the ingested question paper), the max marks, the professor's
+   rubric/model answer, and the cropped image.
+6. Require **structured JSON output** — don't parse free text.
 
 **Example prompt (adapt to whichever vision-capable LLM provider you use; most accept an image + text prompt in broadly the same shape):**
 
@@ -271,8 +276,11 @@ Marking guideline: {rubric_text}
 [attached: cropped handwritten-answer image]
 ```
 
-6. Anything returned with `needs_human_review: true` (or a parse failure) goes into the same review queue as Module 3/4's flagged items — don't silently accept it.
-7. This module should be built behind a small provider-agnostic interface (`grade_written(image, question, rubric, max_marks) -> GradeResult`) so you can swap LLM providers without touching the rest of the pipeline — useful since API access/budget for a BTP can change. The provider should emit the same grade-record shape as the manual marks importer.
+7. Anything returned with `needs_human_review: true` (or a parse failure) goes into the same review queue as Module 3/4's flagged items — don't silently accept it.
+8. Every provider must emit the same grade-record shape as the manual marks importer: transcript,
+   marks, max marks, justification, confidence, provider/method, review flags, and final status.
+   That keeps `written_grades.json`, `written_grades_report.csv`, `final_scores.csv`, and
+   `written_review.html` stable across manual, mock, and future LLM grading.
 
 ---
 
@@ -333,7 +341,7 @@ omr/
                  main.py       entry point (terminal wizard / --config)
                Run it with `python -m omr.generator.main`.
   grading/     Modules 4/5 (Sections 7-8). Bubble reading + MCQ grading; written-answer
-               LLM grading lands here in Phase 3.
+               grading contracts and safe mock provider.
   reader/      Modules 2/3 prototype (Sections 5-6): scan/PDF loading,
                fiducial alignment to canonical A4, alignment quality reports,
                page-index reading, and roll-number/program decoding.

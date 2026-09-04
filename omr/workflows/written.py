@@ -16,6 +16,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from omr.grading.written import (
+    WrittenGradeRequest,
+    WrittenGradeResult,
+    WrittenGrader,
+    build_written_grader,
+    grade_written_answers,
+)
 from omr.io.csv import load_written_question_metadata
 from omr.models import WrittenQuestionMeta
 from omr.workflows.parse import _json_path
@@ -73,14 +80,19 @@ WRITTEN_GRADES_COLUMNS = [
     "question_text",
     "rubric",
     "model_answer",
+    "transcribed_answer",
+    "justification",
+    "confidence",
     "marks_awarded",
     "max_marks",
     "needs_human_review",
     "method",
+    "provider",
     "grader",
     "grader_comment",
     "crop_path",
     "student_status",
+    "review_flags",
 ]
 FINAL_SCORES_COLUMNS = [
     "roll_no",
@@ -105,7 +117,7 @@ def _now() -> str:
 
 
 def _load_json(path: Path) -> dict[str, Any]:
-    return json.loads(path.read_text(encoding="utf-8"))
+    return json.loads(path.read_text(encoding="utf-8-sig"))
 
 
 def _write_json(path: Path, payload: dict[str, Any]) -> None:
@@ -401,13 +413,16 @@ def _write_written_review_html(
             f"<td>{html.escape(_format_number(answer['max_marks']))}</td>"
             f"<td>{html.escape(str(grade.get('status', 'pending')))}</td>"
             f"<td>{html.escape(_format_number(grade.get('marks_awarded')))}</td>"
-            f"<td>{html.escape(str(grade.get('grader_comment') or ''))}</td>"
+            f"<td>{html.escape(str(grade.get('confidence') or ''))}</td>"
+            f"<td>{html.escape(_join_flags(grade.get('review_flags', [])))}</td>"
+            f"<td>{html.escape(str(grade.get('grader_comment') or grade.get('justification') or ''))}</td>"
             f"<td>{_html_link(crop_path)}{img}</td>"
             f"<td>{html.escape(str(answer.get('ocr_text') or ''))}</td>"
+            f"<td>{html.escape(str(grade.get('transcribed_answer') or ''))}</td>"
             "</tr>"
         )
     if not rows:
-        rows.append('<tr><td class="empty" colspan="11">No written answers exported.</td></tr>')
+        rows.append('<tr><td class="empty" colspan="14">No written answers exported.</td></tr>')
     document = f"""<!doctype html>
 <html lang="en">
 <head>
@@ -490,9 +505,12 @@ def _write_written_review_html(
           <th>Max</th>
           <th>Status</th>
           <th>Marks</th>
+          <th>Confidence</th>
+          <th>Review Flags</th>
           <th>Comment</th>
           <th>Crop</th>
           <th>OCR Text</th>
+          <th>Transcript</th>
         </tr>
       </thead>
       <tbody>{''.join(rows)}</tbody>
@@ -572,14 +590,19 @@ def _pending_grade(answer: dict[str, Any]) -> dict[str, Any]:
         "question_text": answer.get("question_text") or "",
         "rubric": answer.get("rubric") or "",
         "model_answer": answer.get("model_answer") or "",
+        "transcribed_answer": "",
+        "justification": "",
+        "confidence": "",
         "marks_awarded": None,
         "max_marks": float(answer["max_marks"]),
         "needs_human_review": False,
         "method": "manual",
+        "provider": "manual",
         "grader": "",
         "grader_comment": "",
         "crop_path": answer.get("crop_path") or "",
         "student_status": answer.get("student_status") or "",
+        "review_flags": [],
         "updated_at": None,
     }
 
@@ -613,6 +636,7 @@ def _apply_manual_mark(
                 "needs_human_review": needs_review,
                 "grader": grader,
                 "grader_comment": comment,
+                "review_flags": ["manual grade marked for human review"] if needs_review else [],
                 "updated_at": _now(),
             }
         )
@@ -633,9 +657,65 @@ def _apply_manual_mark(
             "needs_human_review": needs_review,
             "grader": grader,
             "grader_comment": comment,
+            "review_flags": ["manual grade marked for human review"] if needs_review else [],
             "updated_at": _now(),
         }
     )
+
+
+def _request_from_answer(answer: dict[str, Any], parsed_root: Path) -> WrittenGradeRequest:
+    crop_path = _resolve_path(answer.get("crop_path"), parsed_root)
+    if crop_path is None or not crop_path.exists():
+        raise FileNotFoundError(f"written crop not found for {answer['roll_no']} Q{answer['q_no']}: {crop_path}")
+    return WrittenGradeRequest(
+        roll_no=str(answer["roll_no"]),
+        q_no=int(answer["q_no"]),
+        crop_path=crop_path,
+        max_marks=float(answer["max_marks"]),
+        question_text=str(answer.get("question_text") or ""),
+        rubric=str(answer.get("rubric") or ""),
+        model_answer=str(answer.get("model_answer") or ""),
+        ocr_text=str(answer.get("ocr_text") or ""),
+        metadata={
+            "student_status": answer.get("student_status") or "",
+            "student_name": answer.get("student_name") or "",
+            "student_email": answer.get("student_email") or "",
+            "crop_path": answer.get("crop_path") or "",
+        },
+    )
+
+
+def _grade_record_from_result(
+    answer: dict[str, Any],
+    result: WrittenGradeResult,
+    *,
+    grader: str,
+) -> dict[str, Any]:
+    status = "needs_review" if result.needs_human_review else "graded"
+    if result.marks_awarded is None:
+        status = "pending"
+    return {
+        "roll_no": str(answer["roll_no"]),
+        "q_no": int(answer["q_no"]),
+        "status": status,
+        "question_text": answer.get("question_text") or "",
+        "rubric": answer.get("rubric") or "",
+        "model_answer": answer.get("model_answer") or "",
+        "transcribed_answer": result.transcribed_answer,
+        "justification": result.justification,
+        "confidence": result.confidence,
+        "marks_awarded": result.marks_awarded,
+        "max_marks": float(result.max_marks),
+        "needs_human_review": result.needs_human_review,
+        "method": result.method,
+        "provider": result.provider,
+        "grader": grader,
+        "grader_comment": result.justification,
+        "crop_path": answer.get("crop_path") or "",
+        "student_status": answer.get("student_status") or "",
+        "review_flags": list(result.review_flags),
+        "updated_at": _now(),
+    }
 
 
 def _student_aggregates(packet: dict[str, Any], grades: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -695,6 +775,7 @@ def _write_written_grades_csv(path: Path, grades: list[dict[str, Any]]) -> None:
             row["marks_awarded"] = _format_number(grade.get("marks_awarded"))
             row["max_marks"] = _format_number(grade.get("max_marks"))
             row["needs_human_review"] = str(bool(grade.get("needs_human_review"))).lower()
+            row["review_flags"] = _join_flags(grade.get("review_flags", []))
             writer.writerow(row)
 
 
@@ -709,6 +790,71 @@ def _write_final_scores_csv(path: Path, rows: list[dict[str, Any]]) -> None:
             formatted["grading_complete"] = str(bool(row.get("grading_complete"))).lower()
             formatted["eligible_for_email"] = str(bool(row.get("eligible_for_email"))).lower()
             writer.writerow(formatted)
+
+
+def _grade_status_counts(
+    grades: list[dict[str, Any]],
+    student_scores: list[dict[str, Any]],
+) -> dict[str, dict[str, int]]:
+    return {
+        "answers": {
+            "graded": sum(1 for grade in grades if grade["status"] == "graded"),
+            "pending": sum(1 for grade in grades if grade["status"] == "pending"),
+            "needs_review": sum(1 for grade in grades if grade["status"] == "needs_review"),
+        },
+        "students": {
+            "complete": sum(1 for student in student_scores if student["written_status"] == "complete"),
+            "pending": sum(1 for student in student_scores if student["written_status"] == "pending"),
+            "needs_review": sum(1 for student in student_scores if student["written_status"] == "needs_review"),
+        },
+    }
+
+
+def _write_grade_artifacts(
+    parsed_root: Path,
+    packet: dict[str, Any],
+    grades: list[dict[str, Any]],
+    *,
+    mode: str,
+    grader: str,
+    source_marks_csv: str | Path | None = None,
+    provider: str | None = None,
+) -> tuple[dict[str, Any], Path]:
+    student_scores = _student_aggregates(packet, grades)
+    payload = {
+        "schema_version": WRITTEN_SCHEMA_VERSION,
+        "exam_id": packet.get("exam_id"),
+        "mode": mode,
+        "source_packet_path": f"{WRITTEN_DIR_NAME}/{WRITTEN_PACKET_JSON}",
+        "source_marks_csv": str(source_marks_csv) if source_marks_csv is not None else None,
+        "provider": provider,
+        "grader": grader,
+        "updated_at": _now(),
+        "grades": grades,
+        "students": student_scores,
+        "status_counts": _grade_status_counts(grades, student_scores),
+        "reports": {
+            "written_grades_report_csv": WRITTEN_GRADES_REPORT_CSV,
+            "final_scores_csv": FINAL_SCORES_CSV,
+            "review_html": WRITTEN_REVIEW_HTML,
+        },
+    }
+    if source_marks_csv is not None:
+        payload["imported_at"] = payload["updated_at"]
+    else:
+        payload["graded_at"] = payload["updated_at"]
+
+    output_dir = _written_dir(parsed_root)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    _write_json(output_dir / WRITTEN_GRADES_JSON, payload)
+    _write_written_grades_csv(output_dir / WRITTEN_GRADES_REPORT_CSV, grades)
+    _write_final_scores_csv(output_dir / FINAL_SCORES_CSV, student_scores)
+    _write_written_review_html(
+        output_dir / WRITTEN_REVIEW_HTML,
+        packet,
+        {(grade["roll_no"], grade["q_no"]): grade for grade in grades},
+    )
+    return payload, output_dir / WRITTEN_GRADES_JSON
 
 
 def import_written_marks(
@@ -737,47 +883,50 @@ def import_written_marks(
         _apply_manual_mark(grades_by_key[key], row, row_no=row_no, grader=grader)
 
     grades = [grades_by_key[key] for key in sorted(grades_by_key)]
-    student_scores = _student_aggregates(packet, grades)
-    payload = {
-        "schema_version": WRITTEN_SCHEMA_VERSION,
-        "exam_id": packet.get("exam_id"),
-        "mode": "written_manual_grades",
-        "source_packet_path": f"{WRITTEN_DIR_NAME}/{WRITTEN_PACKET_JSON}",
-        "source_marks_csv": str(marks_path),
-        "grader": grader,
-        "imported_at": _now(),
-        "grades": grades,
-        "students": student_scores,
-        "status_counts": {
-            "answers": {
-                "graded": sum(1 for grade in grades if grade["status"] == "graded"),
-                "pending": sum(1 for grade in grades if grade["status"] == "pending"),
-                "needs_review": sum(1 for grade in grades if grade["status"] == "needs_review"),
-            },
-            "students": {
-                "complete": sum(1 for student in student_scores if student["written_status"] == "complete"),
-                "pending": sum(1 for student in student_scores if student["written_status"] == "pending"),
-                "needs_review": sum(1 for student in student_scores if student["written_status"] == "needs_review"),
-            },
-        },
-        "reports": {
-            "written_grades_report_csv": WRITTEN_GRADES_REPORT_CSV,
-            "final_scores_csv": FINAL_SCORES_CSV,
-            "review_html": WRITTEN_REVIEW_HTML,
-        },
-    }
-
-    output_dir = _written_dir(parsed_root)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    _write_json(output_dir / WRITTEN_GRADES_JSON, payload)
-    _write_written_grades_csv(output_dir / WRITTEN_GRADES_REPORT_CSV, grades)
-    _write_final_scores_csv(output_dir / FINAL_SCORES_CSV, student_scores)
-    _write_written_review_html(
-        output_dir / WRITTEN_REVIEW_HTML,
+    return _write_grade_artifacts(
+        parsed_root,
         packet,
-        {(grade["roll_no"], grade["q_no"]): grade for grade in grades},
+        grades,
+        mode="written_manual_grades",
+        grader=grader,
+        source_marks_csv=marks_path,
+        provider="manual",
     )
-    return payload, output_dir / WRITTEN_GRADES_JSON
+
+
+def auto_grade_written_answers(
+    parsed_dir: str | Path,
+    *,
+    provider: str = "mock",
+    grader: WrittenGrader | None = None,
+    grader_name: str | None = None,
+    mock_marks_fraction: float = 0.0,
+    mock_confidence: str = "low",
+    mock_final: bool = False,
+) -> tuple[dict[str, Any], Path]:
+    parsed_root = _parsed_root(parsed_dir)
+    packet = _load_packet(parsed_root)
+    active_grader = grader or build_written_grader(
+        provider,
+        mock_marks_fraction=mock_marks_fraction,
+        mock_confidence=mock_confidence,
+        mock_final=mock_final,
+    )
+    requests = [_request_from_answer(answer, parsed_root) for answer in packet.get("answers", [])]
+    results = grade_written_answers(requests, active_grader)
+    grades = [
+        _grade_record_from_result(answer, result, grader=grader_name or active_grader.method)
+        for answer, result in zip(packet.get("answers", []), results, strict=True)
+    ]
+    return _write_grade_artifacts(
+        parsed_root,
+        packet,
+        grades,
+        mode="written_provider_grades",
+        grader=grader_name or active_grader.method,
+        provider=active_grader.provider,
+    )
+
 
 
 def load_written_summary(parsed_dir: str | Path) -> str:
@@ -812,7 +961,7 @@ def load_written_summary(parsed_dir: str | Path) -> str:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="smartomr-written",
-        description="Export written-answer crops and import manual written marks.",
+        description="Export written-answer crops, import manual marks, and run written-answer graders.",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -834,6 +983,35 @@ def build_parser() -> argparse.ArgumentParser:
     import_cmd.add_argument("--parsed-dir", required=True, type=Path)
     import_cmd.add_argument("--marks-csv", required=True, type=Path)
     import_cmd.add_argument("--grader", required=True)
+
+    auto_grade = subparsers.add_parser(
+        "auto-grade",
+        help="Run a configured written-answer grader over written_packet.json",
+    )
+    auto_grade.add_argument("--parsed-dir", required=True, type=Path)
+    auto_grade.add_argument("--provider", default="mock", choices=["mock"])
+    auto_grade.add_argument(
+        "--grader",
+        default=None,
+        help="Optional label written into reports; defaults to the provider method",
+    )
+    auto_grade.add_argument(
+        "--mock-marks-fraction",
+        type=float,
+        default=0.0,
+        help="Mock-only: fraction of each question's max marks to emit",
+    )
+    auto_grade.add_argument(
+        "--mock-confidence",
+        default="low",
+        choices=["high", "medium", "low"],
+        help="Mock-only: confidence label to emit",
+    )
+    auto_grade.add_argument(
+        "--mock-final",
+        action="store_true",
+        help="Mock-only: allow mock marks to be treated as final; use for tests/demos only",
+    )
 
     summary = subparsers.add_parser("summary", help="Print written grading status")
     summary.add_argument("--parsed-dir", required=True, type=Path)
@@ -873,6 +1051,26 @@ def main(argv: list[str] | None = None) -> int:
                 f"answers_pending={counts['pending']} "
                 f"answers_needs_review={counts['needs_review']}"
             )
+        elif args.command == "auto-grade":
+            payload, path = auto_grade_written_answers(
+                args.parsed_dir,
+                provider=args.provider,
+                grader_name=args.grader,
+                mock_marks_fraction=args.mock_marks_fraction,
+                mock_confidence=args.mock_confidence,
+                mock_final=args.mock_final,
+            )
+            print(f"Wrote {path}")
+            print(f"written_grades_report_csv={path.parent / WRITTEN_GRADES_REPORT_CSV}")
+            print(f"final_scores_csv={path.parent / FINAL_SCORES_CSV}")
+            counts = payload["status_counts"]["answers"]
+            print(
+                f"answers_graded={counts['graded']} "
+                f"answers_pending={counts['pending']} "
+                f"answers_needs_review={counts['needs_review']}"
+            )
+            if args.provider == "mock":
+                print("mock_provider=true do_not_use_for_real_marks=true")
         elif args.command == "summary":
             print(load_written_summary(args.parsed_dir))
         else:  # pragma: no cover - argparse enforces the command set

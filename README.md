@@ -303,6 +303,21 @@ written_grades_report.csv        one row per written answer
 final_scores.csv                 MCQ + written totals per verified student
 ```
 
+The written-grading workflow also has a provider interface for future LLM/vision graders. Right
+now the only shipped provider is `mock`, which is for plumbing tests only. By default it marks every
+answer as `needs_review`, so it cannot accidentally become final college marks:
+
+```bash
+python -m omr.workflows.written auto-grade \
+  --parsed-dir data/parsed/CSE222_ENDSEM_2026 \
+  --provider mock
+```
+
+This writes the same `written_grades.json`, `written_grades_report.csv`, `final_scores.csv`, and
+`written_review.html` artifacts as manual grading. A real provider should be added behind
+`omr.grading.written.WrittenGrader` and must emit the same structured grade records: transcript,
+marks, max marks, justification, confidence, provider/method, and review flags.
+
 If you need to inspect crops before verification is complete, use `--include-unverified` on export,
 but those rows are for debugging only and should not become final marks.
 
@@ -431,9 +446,10 @@ omr/
                      real PDF and inspects the pixels
   reader/        Modules 2/3 — scan/PDF loading, fiducial alignment,
                    alignment quality reports, page-index reading, and roll-number/program decoding
-  grading/       Modules 4/5 — everything that READS a sheet (Sections 7-8)
+  grading/       Modules 4/5 — everything that READS/grades a sheet (Sections 7-8)
     bubbles.py     Bubble measurement: fill_ratio (hard threshold) + ink_density (mean darkness)
     mcq.py         MCQ reading + grading — answered/blank/multiple, with confidence
+    written.py     Written-answer grading contracts and safe mock provider
     tests/         Grading correctness, plus test_mcq_confidence.py — imperfect real-world marks
   io/            Roster, answer-key, and result CSV helpers
   workflows/     File-based scan evaluation workflow that composes reader + grading + CSV I/O

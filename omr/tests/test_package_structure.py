@@ -4,17 +4,20 @@ import inspect
 
 from omr.io.csv import load_students
 from omr.io import load_written_question_metadata
+from omr.grading import WrittenGradeRequest, build_written_grader
 from omr.reader.identity import read_roll_number
 from omr.reader.scan import ScanError
 from omr.workflows.evaluate import batch_evaluate, evaluate_scan
 from omr.workflows.parse import parse_scan, parse_scans
 from omr.workflows.review import initialize_verification_index, verify_student
-from omr.workflows.written import export_written_grading_packet, import_written_marks
+from omr.workflows.written import auto_grade_written_answers, export_written_grading_packet, import_written_marks
 
 
 def test_promoted_scan_evaluation_modules_are_importable_from_omr():
     assert callable(load_students)
     assert callable(load_written_question_metadata)
+    assert callable(build_written_grader)
+    assert WrittenGradeRequest.__name__ == "WrittenGradeRequest"
     assert callable(read_roll_number)
     assert issubclass(ScanError, RuntimeError)
     assert callable(evaluate_scan)
@@ -23,6 +26,7 @@ def test_promoted_scan_evaluation_modules_are_importable_from_omr():
     assert callable(parse_scans)
     assert callable(initialize_verification_index)
     assert callable(verify_student)
+    assert callable(auto_grade_written_answers)
     assert callable(export_written_grading_packet)
     assert callable(import_written_marks)
 
