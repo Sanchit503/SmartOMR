@@ -234,9 +234,10 @@ Straightforward once Module 5/6 give you canonical images and manifest coordinat
 ## 8. Module 5 — Written-answer grading (LLM-assisted)
 
 1. Crop each written answer region using the manifest's `written_block` coordinates from the canonical image.
-2. Export a manual written-grading packet for verified students: crop links, OCR text/confidence
-   when available, `manual_marks_template.csv`, and a browser review page. Import professor/TA
-   marks only after validating `0 <= marks_awarded <= max_marks`.
+2. Export a manual written-grading packet for verified students: crop links, question text,
+   rubric/model answer metadata, OCR text/confidence when available, `manual_marks_template.csv`,
+   and a browser review page. Import professor/TA marks only after validating
+   `0 <= marks_awarded <= max_marks`.
 3. Store written grades separately from raw parser output in structured JSON/CSV, then produce a
    combined `final_scores.csv` with MCQ + written totals.
 4. For AI-assisted grading, call a vision-capable LLM with: the question text (from the ingested question paper), the max marks, the professor's rubric/model answer, and the cropped image.

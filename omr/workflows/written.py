@@ -16,6 +16,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from omr.io.csv import load_written_question_metadata
+from omr.models import WrittenQuestionMeta
 from omr.workflows.parse import _json_path
 from omr.workflows.review import VERIFIED_INDEX_NAME
 
@@ -36,10 +38,14 @@ ANSWER_INDEX_COLUMNS = [
     "student_name",
     "student_email",
     "q_no",
+    "question_text",
+    "rubric",
+    "model_answer",
     "page",
     "max_marks",
     "lines",
     "crop_path",
+    "metadata_review_flags",
     "ocr_text",
     "ocr_confidence",
     "ocr_provider",
@@ -49,6 +55,9 @@ ANSWER_INDEX_COLUMNS = [
 MANUAL_MARKS_COLUMNS = [
     "roll_no",
     "q_no",
+    "question_text",
+    "rubric",
+    "model_answer",
     "max_marks",
     "marks_awarded",
     "needs_human_review",
@@ -61,6 +70,9 @@ WRITTEN_GRADES_COLUMNS = [
     "roll_no",
     "q_no",
     "status",
+    "question_text",
+    "rubric",
+    "model_answer",
     "marks_awarded",
     "max_marks",
     "needs_human_review",
@@ -104,10 +116,11 @@ def _write_json(path: Path, payload: dict[str, Any]) -> None:
 def _parsed_root(parsed_dir: str | Path) -> Path:
     path = Path(parsed_dir)
     if path.name in {VERIFIED_INDEX_NAME, WRITTEN_PACKET_JSON, WRITTEN_GRADES_JSON}:
-        return path.parent.parent if path.parent.name == WRITTEN_DIR_NAME else path.parent
+        root = path.parent.parent if path.parent.name == WRITTEN_DIR_NAME else path.parent
+        return root.resolve()
     if path.name == WRITTEN_DIR_NAME:
-        return path.parent
-    return path
+        return path.parent.resolve()
+    return path.resolve()
 
 
 def _written_dir(parsed_root: Path) -> Path:
@@ -121,6 +134,37 @@ def _verified_index_path(parsed_dir: str | Path) -> Path:
     if path.name == WRITTEN_DIR_NAME:
         return path.parent / VERIFIED_INDEX_NAME
     return path / VERIFIED_INDEX_NAME
+
+
+def _default_rubric_candidates(parsed_root: Path, exam_id: str | None) -> list[Path]:
+    candidates = [
+        parsed_root / "written_rubric.csv",
+        parsed_root / "rubric.csv",
+    ]
+    if exam_id:
+        safe_exam_id = "".join(char if char.isalnum() or char in "._-" else "_" for char in exam_id).strip("._")
+        if parsed_root.parent.name == "parsed":
+            data_dir = parsed_root.parent.parent
+            candidates.extend(
+                [
+                    data_dir / "rubrics" / f"{safe_exam_id}_written_rubric.csv",
+                    data_dir / "rubrics" / f"{safe_exam_id}.written_rubric.csv",
+                ]
+            )
+    return candidates
+
+
+def _resolve_rubric_path(
+    parsed_root: Path,
+    exam_id: str | None,
+    explicit: str | Path | None,
+) -> Path | None:
+    if explicit is not None:
+        return Path(explicit)
+    for candidate in _default_rubric_candidates(parsed_root, exam_id):
+        if candidate.exists():
+            return candidate
+    return None
 
 
 def _packet_path(parsed_root: Path) -> Path:
@@ -217,6 +261,7 @@ def _answer_rows_from_student(
     student: dict[str, Any],
     parsed_root: Path,
     include_unverified: bool,
+    question_metadata: dict[int, WrittenQuestionMeta],
 ) -> list[dict[str, Any]]:
     if not _student_is_included(student, include_unverified):
         return []
@@ -226,7 +271,15 @@ def _answer_rows_from_student(
     roll_no = str(student.get("roll_no") or detail_student.get("roll_no") or "")
     answers = []
     for written in sorted(details.get("written_responses", []), key=lambda item: int(item["q_no"])):
+        q_no = int(written["q_no"])
         ocr = _ocr_payload(written)
+        max_marks = float(written["max_marks"])
+        meta = question_metadata.get(q_no)
+        metadata_flags = []
+        if meta and meta.max_marks is not None and abs(float(meta.max_marks) - max_marks) > 0.001:
+            metadata_flags.append(
+                f"rubric max_marks {meta.max_marks:g} does not match manifest max_marks {max_marks:g}"
+            )
         answers.append(
             {
                 "roll_no": roll_no,
@@ -234,11 +287,15 @@ def _answer_rows_from_student(
                 "student_name": student.get("student_name") or detail_student.get("name") or "",
                 "student_email": student.get("student_email") or detail_student.get("email") or "",
                 "eligible_for_email": bool(student.get("eligible_for_email")),
-                "q_no": int(written["q_no"]),
+                "q_no": q_no,
+                "question_text": meta.question_text if meta else "",
+                "rubric": meta.rubric if meta else "",
+                "model_answer": meta.model_answer if meta else "",
                 "page": int(written.get("page", 1)),
-                "max_marks": float(written["max_marks"]),
+                "max_marks": max_marks,
                 "lines": int(written.get("lines", 1)),
                 "crop_path": _relative_path(written.get("crop_path"), parsed_root, student_dir),
+                "metadata_review_flags": metadata_flags,
                 "ocr_text": ocr["text"],
                 "ocr_confidence": ocr["confidence"],
                 "ocr_provider": ocr["provider"],
@@ -279,6 +336,7 @@ def _write_answer_index_csv(path: Path, answers: list[dict[str, Any]]) -> None:
         for answer in answers:
             row = dict(answer)
             row["max_marks"] = _format_number(answer.get("max_marks"))
+            row["metadata_review_flags"] = _join_flags(answer.get("metadata_review_flags", []))
             row["ocr_review_flags"] = _join_flags(answer.get("ocr_review_flags", []))
             writer.writerow(row)
 
@@ -292,6 +350,9 @@ def _write_manual_template_csv(path: Path, answers: list[dict[str, Any]]) -> Non
                 {
                     "roll_no": answer["roll_no"],
                     "q_no": answer["q_no"],
+                    "question_text": answer.get("question_text") or "",
+                    "rubric": answer.get("rubric") or "",
+                    "model_answer": answer.get("model_answer") or "",
                     "max_marks": _format_number(answer["max_marks"]),
                     "marks_awarded": "",
                     "needs_human_review": "",
@@ -334,6 +395,9 @@ def _write_written_review_html(
             "<tr>"
             f"<td>{html.escape(str(answer['roll_no']))}</td>"
             f"<td>Q{html.escape(str(answer['q_no']))}</td>"
+            f"<td>{html.escape(str(answer.get('question_text') or ''))}</td>"
+            f"<td>{html.escape(str(answer.get('rubric') or ''))}</td>"
+            f"<td>{html.escape(str(answer.get('model_answer') or ''))}</td>"
             f"<td>{html.escape(_format_number(answer['max_marks']))}</td>"
             f"<td>{html.escape(str(grade.get('status', 'pending')))}</td>"
             f"<td>{html.escape(_format_number(grade.get('marks_awarded')))}</td>"
@@ -343,7 +407,7 @@ def _write_written_review_html(
             "</tr>"
         )
     if not rows:
-        rows.append('<tr><td class="empty" colspan="8">No written answers exported.</td></tr>')
+        rows.append('<tr><td class="empty" colspan="11">No written answers exported.</td></tr>')
     document = f"""<!doctype html>
 <html lang="en">
 <head>
@@ -420,6 +484,9 @@ def _write_written_review_html(
         <tr>
           <th>Roll No</th>
           <th>Question</th>
+          <th>Question Text</th>
+          <th>Rubric</th>
+          <th>Model Answer</th>
           <th>Max</th>
           <th>Status</th>
           <th>Marks</th>
@@ -441,21 +508,34 @@ def export_written_grading_packet(
     parsed_dir: str | Path,
     *,
     include_unverified: bool = False,
+    rubric_path: str | Path | None = None,
 ) -> tuple[dict[str, Any], Path]:
     parsed_root = _parsed_root(parsed_dir)
     verified_index = _load_verified_index(parsed_root)
+    resolved_rubric_path = _resolve_rubric_path(parsed_root, verified_index.get("exam_id"), rubric_path)
+    question_metadata = (
+        load_written_question_metadata(resolved_rubric_path) if resolved_rubric_path is not None else {}
+    )
     answers: list[dict[str, Any]] = []
     for student in verified_index.get("students", []):
-        answers.extend(_answer_rows_from_student(student, parsed_root, include_unverified))
+        answers.extend(_answer_rows_from_student(student, parsed_root, include_unverified, question_metadata))
     answers.sort(key=lambda item: (str(item["roll_no"]), int(item["q_no"])))
 
     included_rolls = {str(answer["roll_no"]) for answer in answers}
+    exported_q_nos = sorted({int(answer["q_no"]) for answer in answers})
+    metadata_q_nos = set(question_metadata)
     packet = {
         "schema_version": WRITTEN_SCHEMA_VERSION,
         "exam_id": verified_index.get("exam_id"),
         "mode": "written_grading_packet",
         "source_verified_index_path": VERIFIED_INDEX_NAME,
         "include_unverified": include_unverified,
+        "question_metadata": {
+            "path": _json_path(resolved_rubric_path, parsed_root) if resolved_rubric_path is not None else None,
+            "questions_loaded": len(question_metadata),
+            "missing_q_nos": [q_no for q_no in exported_q_nos if q_no not in metadata_q_nos],
+            "extra_q_nos": [q_no for q_no in sorted(metadata_q_nos) if q_no not in exported_q_nos],
+        },
         "created_at": _now(),
         "updated_at": _now(),
         "students": _student_summaries(verified_index, included_rolls),
@@ -489,6 +569,9 @@ def _pending_grade(answer: dict[str, Any]) -> dict[str, Any]:
         "roll_no": str(answer["roll_no"]),
         "q_no": int(answer["q_no"]),
         "status": "pending",
+        "question_text": answer.get("question_text") or "",
+        "rubric": answer.get("rubric") or "",
+        "model_answer": answer.get("model_answer") or "",
         "marks_awarded": None,
         "max_marks": float(answer["max_marks"]),
         "needs_human_review": False,
@@ -736,6 +819,12 @@ def build_parser() -> argparse.ArgumentParser:
     export = subparsers.add_parser("export", help="Create written grading packet/template from verified_index.json")
     export.add_argument("--parsed-dir", required=True, type=Path)
     export.add_argument(
+        "--rubric",
+        default=None,
+        type=Path,
+        help="Optional CSV with q_no, question_text, rubric, model_answer, max_marks",
+    )
+    export.add_argument(
         "--include-unverified",
         action="store_true",
         help="Also export non-rejected students that are not verified yet; use for debugging only",
@@ -758,6 +847,7 @@ def main(argv: list[str] | None = None) -> int:
             packet, path = export_written_grading_packet(
                 args.parsed_dir,
                 include_unverified=args.include_unverified,
+                rubric_path=args.rubric,
             )
             print(f"Wrote {path}")
             print(f"written_review_html={path.parent / WRITTEN_REVIEW_HTML}")
@@ -766,6 +856,12 @@ def main(argv: list[str] | None = None) -> int:
                 f"students_exported={len(packet.get('students', []))} "
                 f"written_answers_exported={len(packet.get('answers', []))}"
             )
+            metadata = packet.get("question_metadata", {})
+            if metadata:
+                print(
+                    f"question_metadata_loaded={metadata.get('questions_loaded', 0)} "
+                    f"missing_question_metadata={len(metadata.get('missing_q_nos', []))}"
+                )
         elif args.command == "import-marks":
             payload, path = import_written_marks(args.parsed_dir, args.marks_csv, grader=args.grader)
             print(f"Wrote {path}")

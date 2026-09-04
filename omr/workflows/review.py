@@ -74,19 +74,19 @@ def _write_json(path: Path, payload: dict[str, Any]) -> None:
 def _parse_index_path(parsed_dir: str | Path) -> Path:
     path = Path(parsed_dir)
     if path.name == "parse_index.json":
-        return path
-    return path / "parse_index.json"
+        return path.resolve()
+    return (path / "parse_index.json").resolve()
 
 
 def _parsed_dir_from_index(parse_index_path: Path) -> Path:
-    return parse_index_path.parent
+    return parse_index_path.parent.resolve()
 
 
 def _verified_index_path(parsed_dir: str | Path) -> Path:
     path = Path(parsed_dir)
     if path.name == VERIFIED_INDEX_NAME:
-        return path
-    return path / VERIFIED_INDEX_NAME
+        return path.resolve()
+    return (path / VERIFIED_INDEX_NAME).resolve()
 
 
 def _resolve_path(value: str | Path | None, parsed_dir: Path, base_dir: Path | None = None) -> Path | None:

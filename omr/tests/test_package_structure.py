@@ -3,6 +3,7 @@ from __future__ import annotations
 import inspect
 
 from omr.io.csv import load_students
+from omr.io import load_written_question_metadata
 from omr.reader.identity import read_roll_number
 from omr.reader.scan import ScanError
 from omr.workflows.evaluate import batch_evaluate, evaluate_scan
@@ -13,6 +14,7 @@ from omr.workflows.written import export_written_grading_packet, import_written_
 
 def test_promoted_scan_evaluation_modules_are_importable_from_omr():
     assert callable(load_students)
+    assert callable(load_written_question_metadata)
     assert callable(read_roll_number)
     assert issubclass(ScanError, RuntimeError)
     assert callable(evaluate_scan)

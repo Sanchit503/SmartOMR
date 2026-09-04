@@ -6,6 +6,7 @@ from pathlib import Path
 
 from PIL import Image
 
+from omr.io import load_written_question_metadata
 from omr.workflows.written import export_written_grading_packet, import_written_marks, load_written_summary
 
 
@@ -135,9 +136,45 @@ def test_export_can_include_unverified_for_debugging(tmp_path: Path):
     assert len(packet["answers"]) == 4
 
 
+def test_export_written_packet_includes_rubric_metadata(tmp_path: Path):
+    parsed_dir = _write_verified_index(tmp_path)
+    rubric_path = parsed_dir / "rubric.csv"
+    rubric_path.write_text(
+        "q_no,question_text,rubric,model_answer,max_marks\n"
+        "11,Define OMR,Award one point for definition and one for use,A scanner-readable form,2\n"
+        "12,Explain alignment,Award partial credit for fiducials,Fiducials correct perspective,2\n",
+        encoding="utf-8",
+    )
+
+    packet, _packet_path = export_written_grading_packet(parsed_dir)
+
+    assert packet["question_metadata"]["path"] == "rubric.csv"
+    assert packet["question_metadata"]["questions_loaded"] == 2
+    assert packet["question_metadata"]["missing_q_nos"] == []
+    first = packet["answers"][0]
+    assert first["question_text"] == "Define OMR"
+    assert first["rubric"].startswith("Award one point")
+    assert first["model_answer"] == "A scanner-readable form"
+    template_rows = _csv_rows(parsed_dir / "written_grading" / "manual_marks_template.csv")
+    assert template_rows[0]["question_text"] == "Define OMR"
+    assert template_rows[0]["rubric"].startswith("Award one point")
+    answer_rows = _csv_rows(parsed_dir / "written_grading" / "written_answer_index.csv")
+    assert answer_rows[1]["question_text"] == "Explain alignment"
+    html_text = (parsed_dir / "written_grading" / "written_review.html").read_text(encoding="utf-8")
+    assert "Define OMR" in html_text
+    assert "Fiducials correct perspective" in html_text
+
+
 def test_import_written_marks_writes_grades_and_final_scores(tmp_path: Path):
     parsed_dir = _write_verified_index(tmp_path)
-    export_written_grading_packet(parsed_dir)
+    rubric_path = parsed_dir / "rubric.csv"
+    rubric_path.write_text(
+        "q_no,question_text,rubric,model_answer,max_marks\n"
+        "11,Define OMR,Award one point for definition and one for use,A scanner-readable form,2\n"
+        "12,Explain alignment,Award partial credit for fiducials,Fiducials correct perspective,2\n",
+        encoding="utf-8",
+    )
+    export_written_grading_packet(parsed_dir, rubric_path=rubric_path)
     marks_csv = parsed_dir / "marks.csv"
     marks_csv.write_text(
         "roll_no,q_no,marks_awarded,needs_human_review,grader_comment\n"
@@ -150,6 +187,8 @@ def test_import_written_marks_writes_grades_and_final_scores(tmp_path: Path):
 
     assert grades_path == parsed_dir / "written_grading" / "written_grades.json"
     assert payload["status_counts"]["answers"] == {"graded": 2, "pending": 0, "needs_review": 0}
+    assert payload["grades"][0]["question_text"] == "Define OMR"
+    assert payload["grades"][1]["rubric"].startswith("Award partial")
     student = payload["students"][0]
     assert student["written_status"] == "complete"
     assert student["written_score"] == 3.5
@@ -179,3 +218,20 @@ def test_import_written_marks_rejects_over_max_marks(tmp_path: Path):
         assert "must be between 0 and 2" in str(exc)
     else:
         raise AssertionError("over-max written marks should fail validation")
+
+
+def test_written_question_metadata_rejects_duplicate_questions(tmp_path: Path):
+    rubric_path = tmp_path / "rubric.csv"
+    rubric_path.write_text(
+        "q_no,question_text,rubric,max_marks\n"
+        "11,Define OMR,Award one point,2\n"
+        "11,Duplicate,Award another point,2\n",
+        encoding="utf-8",
+    )
+
+    try:
+        load_written_question_metadata(rubric_path)
+    except ValueError as exc:
+        assert "duplicates Q11" in str(exc)
+    else:
+        raise AssertionError("duplicate written rubric rows should fail validation")

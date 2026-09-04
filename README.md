@@ -254,18 +254,28 @@ Later email/grading automation must use `verified_index.json`, not raw `parse_in
 For production safety, written grading starts with a manual marks packet. Only `verified` students
 are exported by default.
 
+Add a rubric CSV when question text or marking guidance is available. The command auto-detects
+`data/rubrics/<exam_id>_written_rubric.csv`, or you can pass `--rubric` explicitly:
+
+```csv
+q_no,question_text,rubric,model_answer,max_marks
+11,Define OMR,Award one point for the definition and one for the use,A scanner-readable form,2
+12,Explain alignment,Award partial credit for marker detection and perspective correction,Fiducials correct page warp,2
+```
+
 ```bash
 python -m omr.workflows.written export \
-  --parsed-dir data/parsed/CSE222_ENDSEM_2026
+  --parsed-dir data/parsed/CSE222_ENDSEM_2026 \
+  --rubric data/rubrics/CSE222_ENDSEM_2026_written_rubric.csv
 ```
 
 This writes under `data/parsed/<exam_id>/written_grading/`:
 
 ```text
 written_packet.json              structured list of exported written answers
-written_answer_index.csv         all crop links plus OCR text/confidence when available
+written_answer_index.csv         crop links, question text/rubric, OCR text/confidence
 manual_marks_template.csv        marks-entry template for professor/TA
-written_review.html              local browser page with answer-crop previews
+written_review.html              local browser page with crop/question/rubric previews
 ```
 
 Fill only these columns in `manual_marks_template.csv`:
@@ -667,12 +677,12 @@ Worth flagging to your professor:
 - **`exam_type` is metadata only** — stored, but doesn't currently change the layout.
 - **No answer key in generated exam configs yet** — `grade_mcq_responses()` takes one, and the
   scan-evaluation workflow can load `answer_key.csv`, but `ExamConfig` still has nowhere to store it.
-- **No question-paper/rubric ingestion** — that's Module 5 (Phase 3); Phase 1 lays out bubbles and
-  answer boxes, not question text.
+- **No full question-paper ingestion yet** — written question/rubric metadata can be supplied by CSV
+  for grading packets, but `ExamConfig` still stores only layout-level written question settings.
 - **No database** — `Exam`/`Question`/etc. (PROJECT_SPEC.md Section 3) are not wired up yet.
 - **Scan evaluation is a local batch workflow, not yet a hosted web service** — `omr.reader`
   writes per-page alignment quality reports, color debug pages, overlays, and review flags, but
   thresholds and the optional digit model still need calibration against a larger real
   printed-sheet dataset.
-- **No verification email or review UI yet** — low-confidence identity/MCQ reads are flagged in
-  result details, but there is no persistent professor-facing queue yet.
+- **No verification email or hosted review UI yet** — local verification reports and
+  `verified_index.json` exist, but the professor-facing web queue is still future work.
