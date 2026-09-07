@@ -367,7 +367,17 @@ The detailed architecture and parameter notes are in
 [docs/HANDWRITING_ROLL_RECOGNITION.md](docs/HANDWRITING_ROLL_RECOGNITION.md).
 
 Written-answer OCR is also optional. It does not grade answers; it extracts line-level text,
-confidence, and review flags into `student.json` / `parse.json`. The stronger local path is TrOCR:
+confidence, and review flags into `student.json` / `parse.json`. The implemented Transformer
+backend is TrOCR. Full scans and their original matching manifest are sufficient: answer
+cropping and line preparation are automatic; manually cropped samples are not required.
+
+For another machine or a first real handwriting test, follow the
+[full-sheet pilot guide](docs/WRITTEN_ANSWER_OCR.md#full-sheet-pilot). It covers CPU/GPU setup,
+first-run model downloads, separate output directories, and where to inspect the OCR text.
+The [research decision document](docs/ANSWER_EXTRACTION_AND_GRADING_RESEARCH.md) describes
+proposed improvements, not additional implemented capabilities.
+
+Example with optional handwritten-roll recognition already configured:
 
 ```bash
 python -m pip install .[htr]
