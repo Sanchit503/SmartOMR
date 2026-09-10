@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import importlib
 import json
+import os
 import sys
 import tempfile
 from pathlib import Path
@@ -77,6 +78,9 @@ def _handwriting_ocr_check() -> dict[str, Any]:
             "status": "error",
             "detail": f"pytesseract unavailable: {type(exc).__name__}: {exc}",
         }
+    command = os.environ.get("SMARTOMR_TESSERACT_CMD")
+    if command:
+        pytesseract.pytesseract.tesseract_cmd = command
     try:
         version = str(pytesseract.get_tesseract_version())
     except Exception as exc:
@@ -85,10 +89,35 @@ def _handwriting_ocr_check() -> dict[str, Any]:
             "status": "error",
             "detail": f"tesseract binary unavailable: {type(exc).__name__}: {exc}",
         }
-    return {
+    result = {
         "name": "handwriting_ocr",
         "status": "ready",
         "version": version,
+    }
+    if command:
+        result["command"] = command
+    return result
+
+
+def _written_htr_check() -> dict[str, Any]:
+    try:
+        import torch
+        import transformers
+        from transformers import TrOCRProcessor, VisionEncoderDecoderModel
+    except Exception as exc:
+        return {
+            "name": "written_htr",
+            "status": "error",
+            "detail": f"TrOCR dependencies unavailable: {type(exc).__name__}: {exc}",
+        }
+    return {
+        "name": "written_htr",
+        "status": "ready",
+        "torch_version": str(getattr(torch, "__version__", "unknown")),
+        "transformers_version": str(getattr(transformers, "__version__", "unknown")),
+        "processor": TrOCRProcessor.__name__,
+        "model": VisionEncoderDecoderModel.__name__,
+        "device": "cuda" if torch.cuda.is_available() else "cpu",
     }
 
 
@@ -116,12 +145,15 @@ def _digit_model_check(model_path: Path) -> dict[str, Any]:
 def run_checks(
     data_dir: str | Path | None = None,
     check_handwriting_ocr: bool = False,
+    check_written_htr: bool = False,
     digit_model: str | Path | None = None,
 ) -> dict[str, Any]:
     checks = _module_checks()
     checks.append(_writable_check(Path(data_dir) if data_dir else None))
     if check_handwriting_ocr:
         checks.append(_handwriting_ocr_check())
+    if check_written_htr:
+        checks.append(_written_htr_check())
     if digit_model:
         checks.append(_digit_model_check(Path(digit_model)))
     ok = all(check["status"] == "ready" for check in checks)
@@ -150,6 +182,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Also verify local Tesseract handwriting OCR support.",
     )
     parser.add_argument(
+        "--check-written-htr",
+        action="store_true",
+        help="Also verify the optional TrOCR handwritten-text dependency stack.",
+    )
+    parser.add_argument(
         "--digit-model",
         type=Path,
         default=None,
@@ -164,6 +201,7 @@ def main(argv: list[str] | None = None) -> int:
     payload = run_checks(
         args.data_dir,
         check_handwriting_ocr=args.check_handwriting_ocr,
+        check_written_htr=args.check_written_htr,
         digit_model=args.digit_model,
     )
     if args.json:

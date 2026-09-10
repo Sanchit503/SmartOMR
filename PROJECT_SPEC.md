@@ -185,6 +185,24 @@ Pipeline (same for both, this is the convergence point from principle 3):
 
 If fiducials can't be reliably detected (torn corner, extreme blur), or if the page warps but fails the quality gate, flag the sheet `needs_review` rather than guessing a transform.
 
+For sheet-fed scanner bundles, default to automatic grouping. The system first reads the page-index
+bars and infers the clean scanner order:
+- `page-major`: all page 1s first, then all page 2s, etc. (`A1 B1 C1 A2 B2 C2`).
+- `sheet-major`: each student's full sheet stays together (`A1 A2 B1 B2 C1 C2`).
+- `write-in-similarity`: irregular order, but continuation-page boxed roll handwriting visually
+  matches a confident page-1 boxed roll.
+- `identity`: fallback mode; every page is attached only when its own roll identity is read confidently.
+
+Automatic positional grouping still depends on page-1 identity. The kth continuation page is
+attached only to the kth confident page-1 roll in a fully verified sequence. Similarity grouping
+uses a one-to-one best-score assignment between fixed roll boxes and keeps close matches in review.
+If order, similarity, identity, and adaptive digit checks all fail, those pages stay in review.
+
+The current file-based workflow also writes `review_report.csv` and `review_report.html` beside
+`parse_index.json`. These are the local version of the future review queue: they show ready
+students, needs-review students, unmatched pages, page errors, generated `sheet.pdf` links, and the
+exact flags that must be cleared before emailing or final grading.
+
 ---
 
 ## 6. Module 3 — Identity resolution & verification email

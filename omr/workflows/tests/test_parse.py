@@ -154,6 +154,9 @@ def test_parse_scan_saves_canonical_pages_mcqs_and_written_crops(tmp_path: Path)
         crop_path = output_dir / written["crop_path"]
         assert crop_path.exists()
         assert np.asarray(Image.open(crop_path)).min() < 200
+        ocr_crop_path = output_dir / written["ocr_crop_path"]
+        assert ocr_crop_path.exists()
+        assert np.asarray(Image.open(ocr_crop_path)).min() < 200
     assert any(written["page"] == 2 for written in payload["written_responses"])
     assert (output_dir / "parse.json").exists()
 

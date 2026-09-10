@@ -7,6 +7,7 @@ import numpy as np
 import pymupdf
 from PIL import Image
 
+from omr.contracts.geometry import mm_to_px
 from omr.generator.config import ExamConfig, WrittenQuestionConfig
 from omr.generator.generate import generate_exam
 from omr.grading.mcq import mcq_sample_centers
@@ -83,6 +84,26 @@ def test_alignment_debug_artifacts_are_written(tmp_path: Path):
     payload = json.loads(saved_report.read_text(encoding="utf-8"))
     assert payload["status"] == "ready"
     assert payload["overlay_path"] == "debug/page_1_alignment_overlay.png"
+
+
+def test_sampling_overlay_marks_written_answer_regions(tmp_path: Path):
+    manifest, page = _sheet(tmp_path)
+    entry = next(item for item in manifest["written_block"] if item.get("page", 1) == 1)
+
+    sampling_overlay = save_sampling_overlay(
+        page,
+        manifest,
+        page_index=1,
+        dpi=DPI,
+        path=tmp_path / "sampling.png",
+        written_padding_mm=1.25,
+    )
+
+    x, y = mm_to_px(entry["x_mm"], entry["y_mm"], DPI)
+    rendered = np.asarray(Image.open(sampling_overlay).convert("RGB"))
+    original = np.repeat(page[:, :, None], 3, axis=2)
+
+    assert not np.array_equal(rendered[y, x], original[y, x])
 
 
 def test_alignment_overlay_points_match_reader_sample_centers(tmp_path: Path):

@@ -31,7 +31,10 @@ dev = [
 ]
 htr = [
     "torch>=2.2",
-    "transformers>=4.40",
+    "transformers>=4.40,<5",
+    "sentencepiece>=0.2",
+    "protobuf>=4.25",
+    "tiktoken>=0.7",
 ]
 
 [tool.setuptools.packages.find]

@@ -100,6 +100,7 @@ class WrittenCrop:
     y_mm: float
     width_mm: float
     height_mm: float
+    ocr_crop_path: str | None = None
 
 
 __all__ = [

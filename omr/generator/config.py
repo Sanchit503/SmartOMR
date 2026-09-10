@@ -24,6 +24,9 @@ class ExamConfig(BaseModel):
     num_mcq: int = Field(ge=0)
     mcq_options: int = Field(default=4, ge=2, le=6)
     marks_per_mcq: float = 1
+    num_numeric: int = Field(default=0, ge=0)
+    numeric_digits: int = Field(default=2, ge=1, le=4)
+    marks_per_numeric: float = Field(default=1, gt=0)
     written_questions: list[WrittenQuestionConfig] = Field(default_factory=list)
     roster_csv: str | None = None
 
@@ -39,12 +42,14 @@ class ExamConfig(BaseModel):
     @classmethod
     def _q_no_after_mcqs(cls, v: list[WrittenQuestionConfig], info) -> list[WrittenQuestionConfig]:
         num_mcq = info.data.get("num_mcq")
+        num_numeric = info.data.get("num_numeric", 0)
         if num_mcq is not None:
+            first_written_q_no = num_mcq + num_numeric
             for w in v:
-                if w.q_no <= num_mcq:
+                if w.q_no <= first_written_q_no:
                     raise ValueError(
-                        f"written question q_no={w.q_no} collides with MCQ numbering "
-                        f"(num_mcq={num_mcq}); written q_no must be > num_mcq"
+                        f"written question q_no={w.q_no} collides with objective-question numbering "
+                        f"(num_mcq={num_mcq}, num_numeric={num_numeric}); written q_no must be higher"
                     )
         return v
 
@@ -54,8 +59,8 @@ class ExamConfig(BaseModel):
         would otherwise generate a valid-looking single page of identity
         fields — the kind of output that gets printed 200 times before anyone
         notices."""
-        if self.num_mcq == 0 and not self.written_questions:
+        if self.num_mcq == 0 and self.num_numeric == 0 and not self.written_questions:
             raise ValueError(
-                "this exam has no questions: num_mcq is 0 and written_questions is empty"
+                "this exam has no questions: num_mcq and num_numeric are 0 and written_questions is empty"
             )
         return self

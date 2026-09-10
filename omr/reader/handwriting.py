@@ -62,7 +62,8 @@ class LocalDigitModelRollOcr:
             confidences.append(float(read.confidence or 0.0))
             payloads.append(_ocr_result_payload(read))
 
-        text = f"MT{digits}" if program and program.upper() == "MTECH" else digits
+        prefix = _program_prefix(program)
+        text = f"{prefix}{digits}"
         confidence = min(confidences) if "?" not in digits and confidences else 0.0
         return RollOcrResult(
             text=text,
@@ -297,10 +298,19 @@ def normalize_handwritten_roll_text(text: str, program: str | None = None) -> st
             return f"MT{match.group(1)}"
         match = re.search(r"(?<!\d)(\d{5})(?!\d)", cleaned)
         return f"MT{match.group(1)}" if match else None
+    if expected == "PHD":
+        match = re.search(r"PHD(\d{5})(?!\d)", cleaned)
+        if match:
+            return f"PHD{match.group(1)}"
+        match = re.search(r"(?<!\d)(\d{5})(?!\d)", cleaned)
+        return f"PHD{match.group(1)}" if match else None
 
     match = re.search(r"MT(\d{5})(?!\d)", cleaned)
     if match:
         return f"MT{match.group(1)}"
+    match = re.search(r"PHD(\d{5})(?!\d)", cleaned)
+    if match:
+        return f"PHD{match.group(1)}"
     match = re.search(r"(?<!\d)(\d{7})(?!\d)", cleaned)
     if match:
         return match.group(1)
@@ -589,10 +599,7 @@ def _read_roll_from_cells(
 
     if "?" in digits:
         return RollOcrResult(digits, confidence=0.0, raw={"cells": cell_payloads})
-    if program and program.upper() == "MTECH":
-        text = f"MT{digits}"
-    else:
-        text = digits
+    text = f"{_program_prefix(program)}{digits}"
     confidence = min(confidences) if confidences else 0.62
     return RollOcrResult(text, confidence=confidence, raw={"cells": cell_payloads})
 
@@ -763,9 +770,18 @@ def _expected_digit_count(program: str | None) -> int | None:
     expected = (program or "").upper()
     if expected == "BTECH":
         return 7
-    if expected == "MTECH":
+    if expected in {"MTECH", "PHD"}:
         return 5
     return None
+
+
+def _program_prefix(program: str | None) -> str:
+    expected = (program or "").upper()
+    if expected == "MTECH":
+        return "MT"
+    if expected == "PHD":
+        return "PHD"
+    return ""
 
 
 def _segment_digit_cells(image: Image.Image, count: int) -> list[Image.Image]:

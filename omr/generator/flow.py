@@ -40,6 +40,12 @@ from .metrics import (
     MARGIN_MM,
     MCQ_COLUMN_CANDIDATES,
     MCQ_ROW_PITCH_MM,
+    NUMERIC_DIGIT_PITCH_MM,
+    NUMERIC_LABEL_OFFSET_MM,
+    NUMERIC_PLACE_ROW_PITCH_MM,
+    NUMERIC_QUESTION_GAP_MM,
+    NUMERIC_QUESTION_ROW_PITCH_MM,
+    NUMERIC_SECTION_GAP_MM,
     PAGE_BOTTOM_MM,
     SECTION_GAP_MM,
     SECTION_HEADER_MM,
@@ -51,6 +57,11 @@ from .metrics import (
     mcq_first_row_y_mm,
     mcq_rows_that_fit,
     min_mcq_column_width_mm,
+    min_numeric_column_width_mm,
+    numeric_block_bottom_mm,
+    numeric_first_row_y_mm,
+    numeric_question_height_mm,
+    numeric_rows_that_fit,
     usable_width_mm,
     written_box_height_mm,
     written_slot_height_mm,
@@ -85,15 +96,33 @@ class WrittenEntry:
     page: int = 1
 
 
+@dataclass(frozen=True)
+class NumericEntry:
+    """One numeric-answer item. `x_mm` is the question label edge; each digit
+    place is drawn as one 0-9 bubble row, starting at `y_mm`."""
+
+    q_no: int
+    x_mm: float
+    y_mm: float
+    digits: int
+    max_marks: float
+    page: int = 1
+
+
 @dataclass
 class FlowResult:
     mcq_entries: list[MCQEntry] = field(default_factory=list)
+    numeric_entries: list[NumericEntry] = field(default_factory=list)
     written_entries: list[WrittenEntry] = field(default_factory=list)
     num_pages: int = 1
     mcq_columns: int = 0
 
     def pages_with_content(self) -> set[int]:
-        return {e.page for e in self.mcq_entries} | {e.page for e in self.written_entries}
+        return (
+            {e.page for e in self.mcq_entries}
+            | {e.page for e in self.numeric_entries}
+            | {e.page for e in self.written_entries}
+        )
 
 
 class LayoutTooTight(ValueError):
@@ -208,6 +237,47 @@ def _place_written(cur: _Cursor, written_questions, after_mcqs: bool) -> list[Wr
     return entries
 
 
+def _place_numeric(cur: _Cursor, config, after_mcqs: bool) -> list[NumericEntry]:
+    entries: list[NumericEntry] = []
+    if config.num_numeric == 0:
+        return entries
+
+    if after_mcqs:
+        cur.y += NUMERIC_SECTION_GAP_MM
+
+    columns = 2 if usable_width_mm() / 2 >= min_numeric_column_width_mm(config.numeric_digits) else 1
+    col_width = usable_width_mm() / columns
+    remaining = list(range(config.num_mcq + 1, config.num_mcq + config.num_numeric + 1))
+
+    while remaining:
+        rows_available = numeric_rows_that_fit(cur.y, config.numeric_digits)
+        if rows_available < 1:
+            cur.next_page()
+            continue
+
+        take = min(len(remaining), rows_available * columns)
+        rows_used = math.ceil(take / columns)
+        y0 = numeric_first_row_y_mm(cur.y)
+        for i, q_no in enumerate(remaining[:take]):
+            col, row = divmod(i, rows_used)
+            entries.append(
+                NumericEntry(
+                    q_no=q_no,
+                    x_mm=MARGIN_MM + col * col_width,
+                    y_mm=y0 + row * numeric_question_height_mm(config.numeric_digits),
+                    digits=config.numeric_digits,
+                    max_marks=config.marks_per_numeric,
+                    page=cur.page,
+                )
+            )
+        cur.y = numeric_block_bottom_mm(cur.y, rows_used, config.numeric_digits) + NUMERIC_QUESTION_GAP_MM
+        remaining = remaining[take:]
+        if remaining:
+            cur.next_page()
+
+    return entries
+
+
 def _flow_with(config, option_letters: list[str], columns: int) -> FlowResult | None:
     """One full pass at `columns` MCQ columns. None if the columns are too
     narrow for this many options to fit side by side."""
@@ -216,9 +286,15 @@ def _flow_with(config, option_letters: list[str], columns: int) -> FlowResult | 
 
     cur = _Cursor(page=1, y=content_top_mm(1))
     mcq_entries = _place_mcqs(cur, config.num_mcq, option_letters, columns)
-    written_entries = _place_written(cur, config.written_questions, after_mcqs=bool(mcq_entries))
+    numeric_entries = _place_numeric(cur, config, after_mcqs=bool(mcq_entries))
+    written_entries = _place_written(
+        cur,
+        config.written_questions,
+        after_mcqs=bool(mcq_entries or numeric_entries),
+    )
     return FlowResult(
         mcq_entries=mcq_entries,
+        numeric_entries=numeric_entries,
         written_entries=written_entries,
         num_pages=cur.page,
         mcq_columns=columns if config.num_mcq else 0,

@@ -307,14 +307,16 @@ def _read_digit_grid(
     calibration: _GridCalibration | None,
 ) -> tuple[str | None, int, dict[str, dict[str, float]], list[str]]:
     block = manifest["roll_number_block"]
-    grid_key = "btech_digits" if program == "BTECH" else "mtech_digits"
+    grid_key = "digits" if "digits" in block else ("btech_digits" if program == "BTECH" else "mtech_digits")
     grid = block[grid_key]
+    digit_count = int(block.get("program_digit_counts", {}).get(program, grid["columns"]))
+    prefix = str(block.get("program_prefixes", {}).get(program, "MT" if program == "MTECH" else ""))
     digits: list[str] = []
     valid_columns = 0
     ratios_by_col: dict[str, dict[str, float]] = {}
     flags: list[str] = []
 
-    for col in range(grid["columns"]):
+    for col in range(digit_count):
         col_label = str(col + 1)
         signals: dict[int, tuple[float, float]] = {}
         for digit in range(10):
@@ -371,9 +373,7 @@ def _read_digit_grid(
     roll_digits = "".join(digits)
     if "?" in roll_digits:
         return None, valid_columns, ratios_by_col, flags
-    if program == "MTECH":
-        return f"MT{roll_digits}", valid_columns, ratios_by_col, flags
-    return roll_digits, valid_columns, ratios_by_col, flags
+    return f"{prefix}{roll_digits}", valid_columns, ratios_by_col, flags
 
 
 def roll_sample_centers(
@@ -387,10 +387,9 @@ def roll_sample_centers(
     if block.get("page", 1) != page_index:
         return {}
 
-    calibrations = {
-        "BTECH": _calibrate_digit_grid(gray, manifest, dpi, block["btech_digits"]),
-        "MTECH": _calibrate_digit_grid(gray, manifest, dpi, block["mtech_digits"]),
-    }
+    base_grid = block.get("digits") or block["btech_digits"]
+    base_calibration = _calibrate_digit_grid(gray, manifest, dpi, base_grid)
+    calibrations = {program: base_calibration for program in block["program_selector"]}
     centers: dict[str, tuple[int, int]] = {}
 
     for program, coords in block["program_selector"].items():
@@ -401,7 +400,8 @@ def roll_sample_centers(
         else:
             centers[f"program.{program}"] = mm_to_px(coords["x_mm"], coords["y_mm"], dpi)
 
-    for grid_name, program in (("btech_digits", "BTECH"), ("mtech_digits", "MTECH")):
+    grid_items = [("digits", "BTECH")] if "digits" in block else [("btech_digits", "BTECH"), ("mtech_digits", "MTECH")]
+    for grid_name, program in grid_items:
         grid = block[grid_name]
         calibration = calibrations.get(program)
         for col in range(grid["columns"]):
@@ -420,16 +420,18 @@ def roll_sample_centers(
 
 def read_roll_number(gray: np.ndarray, manifest: dict, dpi: float) -> RollRead:
     block = manifest["roll_number_block"]
-    calibrations = {
-        "BTECH": _calibrate_digit_grid(gray, manifest, dpi, block["btech_digits"]),
-        "MTECH": _calibrate_digit_grid(gray, manifest, dpi, block["mtech_digits"]),
-    }
+    base_grid = block.get("digits") or block["btech_digits"]
+    base_calibration = _calibrate_digit_grid(gray, manifest, dpi, base_grid)
+    calibrations = {program: base_calibration for program in block["program_selector"]}
     selected_program, selector_ratios, flags = _read_program_selector(gray, manifest, dpi, calibrations)
     btech_roll, btech_valid, btech_ratios, btech_flags = _read_digit_grid(
         gray, manifest, dpi, "BTECH", calibrations["BTECH"]
     )
     mtech_roll, mtech_valid, mtech_ratios, mtech_flags = _read_digit_grid(
         gray, manifest, dpi, "MTECH", calibrations["MTECH"]
+    )
+    phd_roll, phd_valid, phd_ratios, phd_flags = _read_digit_grid(
+        gray, manifest, dpi, "PHD", calibrations.get("PHD")
     )
 
     program = selected_program
@@ -438,31 +440,49 @@ def read_roll_number(gray: np.ndarray, manifest: dict, dpi: float) -> RollRead:
         "program_selector": selector_ratios,
         "BTECH": btech_ratios,
         "MTECH": mtech_ratios,
+        "PHD": phd_ratios,
     }
 
     if program == "BTECH":
         roll_no = btech_roll
         flags.extend(btech_flags)
-        if mtech_valid:
+        if "digits" not in block and mtech_valid:
             flags.append("BTECH selector is marked, but MTECH roll grid also has marks")
     elif program == "MTECH":
         roll_no = mtech_roll
         flags.extend(mtech_flags)
-        if btech_valid:
+        if "digits" not in block and btech_valid:
             flags.append("MTECH selector is marked, but BTECH roll grid also has marks")
+    elif program == "PHD":
+        roll_no = phd_roll
+        flags.extend(phd_flags)
+        if "digits" not in block and btech_valid:
+            flags.append("PHD selector is marked, but BTECH roll grid also has marks")
     else:
-        if btech_roll and not mtech_valid:
+        completed = [
+            ("BTECH", btech_roll, btech_valid, btech_flags),
+            ("MTECH", mtech_roll, mtech_valid, mtech_flags),
+            ("PHD", phd_roll, phd_valid, phd_flags),
+        ]
+        valid_completed = [item for item in completed if item[1]]
+        if len(valid_completed) == 1:
+            inferred_program, inferred_roll, _valid, inferred_flags = valid_completed[0]
+            program = inferred_program
+            roll_no = inferred_roll
+            flags.append(f"program inferred as {inferred_program} from completed digit grid")
+            flags.extend(inferred_flags)
+        elif btech_roll and not mtech_valid and not phd_valid:
             program = "BTECH"
             roll_no = btech_roll
             flags.append("program inferred as BTECH from completed digit grid")
             flags.extend(btech_flags)
-        elif mtech_roll and not btech_valid:
+        elif mtech_roll and not btech_valid and not phd_valid:
             program = "MTECH"
             roll_no = mtech_roll
             flags.append("program inferred as MTECH from completed digit grid")
             flags.extend(mtech_flags)
         else:
-            flags.extend(btech_flags if btech_valid >= mtech_valid else mtech_flags)
+            flags.extend(max(completed, key=lambda item: item[2])[3])
             flags.append("could not infer a single roll-number grid")
 
     if roll_no:

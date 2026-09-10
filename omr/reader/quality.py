@@ -20,6 +20,7 @@ from PIL import Image, ImageDraw
 from omr.contracts.geometry import canonical_size_px, mm_to_px, px_per_mm
 from omr.grading.bubbles import STUDENT_MARK_CORE_RATIO
 from omr.grading.mcq import mcq_sample_centers
+from omr.grading.numeric import numeric_sample_centers
 from omr.reader.identity import roll_sample_centers
 
 
@@ -227,6 +228,13 @@ def _page_marks(manifest: dict, page_index: int) -> list[dict]:
     )
 
 
+def _page_written_entries(manifest: dict, page_index: int) -> list[dict]:
+    return sorted(
+        [entry for entry in manifest.get("written_block", []) if entry.get("page", 1) == page_index],
+        key=lambda item: int(item["q_no"]),
+    )
+
+
 def _expected_bubble_anchors(manifest: dict, page_index: int) -> list[tuple[str, float, float]]:
     anchors: list[tuple[str, float, float]] = []
     label_offset = manifest["mcq_label_offset_mm"]
@@ -243,6 +251,19 @@ def _expected_bubble_anchors(manifest: dict, page_index: int) -> list[tuple[str,
                     entry["y_mm"],
                 )
             )
+
+    for entry in manifest.get("numeric_block", []):
+        if entry.get("page", 1) != page_index:
+            continue
+        for place_index in range(int(entry["digits"])):
+            for digit in range(10):
+                anchors.append(
+                    (
+                        f"Q{entry['q_no']}.D{place_index + 1}.{digit}",
+                        entry["x_mm"] + manifest["numeric_label_offset_mm"] + digit * manifest["numeric_digit_pitch_mm"],
+                        entry["y_mm"] + place_index * manifest["numeric_place_row_pitch_mm"],
+                    )
+                )
 
     if manifest["roll_number_block"].get("page", 1) == page_index:
         block = manifest["roll_number_block"]
@@ -291,6 +312,26 @@ def _expected_bubble_anchor_blocks(manifest: dict, page_index: int) -> list[tupl
                 )
         if anchors:
             blocks.append((f"mcq_block_{index}", anchors))
+
+    numeric_groups: dict[float, list[dict]] = {}
+    for entry in manifest.get("numeric_block", []):
+        if entry.get("page", 1) != page_index:
+            continue
+        numeric_groups.setdefault(float(entry["x_mm"]), []).append(entry)
+    for index, (_x_mm, entries) in enumerate(sorted(numeric_groups.items()), start=1):
+        anchors = []
+        for entry in sorted(entries, key=lambda item: (item["y_mm"], item["q_no"])):
+            for place_index in range(int(entry["digits"])):
+                for digit in range(10):
+                    anchors.append(
+                        (
+                            f"Q{entry['q_no']}.D{place_index + 1}.{digit}",
+                            entry["x_mm"] + manifest["numeric_label_offset_mm"] + digit * manifest["numeric_digit_pitch_mm"],
+                            entry["y_mm"] + place_index * manifest["numeric_place_row_pitch_mm"],
+                        )
+                    )
+        if anchors:
+            blocks.append((f"numeric_block_{index}", anchors))
 
     if manifest["roll_number_block"].get("page", 1) == page_index:
         block = manifest["roll_number_block"]
@@ -669,6 +710,102 @@ def _draw_rect_mm(
     draw.rectangle([cx - half_w, cy - half_h, cx + half_w, cy + half_h], outline=color, width=width)
 
 
+def _draw_box_mm(
+    draw: ImageDraw.ImageDraw,
+    x_mm: float,
+    y_mm: float,
+    width_mm: float,
+    height_mm: float,
+    dpi: float,
+    color: tuple[int, int, int, int],
+    width: int = 3,
+) -> tuple[int, int, int, int]:
+    x0, y0 = mm_to_px(x_mm, y_mm, dpi)
+    x1, y1 = mm_to_px(x_mm + width_mm, y_mm + height_mm, dpi)
+    draw.rectangle([x0, y0, x1, y1], outline=color, width=width)
+    return x0, y0, x1, y1
+
+
+def _draw_label(
+    draw: ImageDraw.ImageDraw,
+    x_px: int,
+    y_px: int,
+    text: str,
+    color: tuple[int, int, int, int],
+) -> None:
+    padding = 3
+    try:
+        left, top, right, bottom = draw.textbbox((x_px, y_px), text)
+    except AttributeError:
+        right = x_px + 7 * len(text)
+        bottom = y_px + 12
+        left = x_px
+        top = y_px
+    draw.rectangle(
+        [left - padding, top - padding, right + padding, bottom + padding],
+        fill=(255, 255, 255, 220),
+    )
+    draw.text((x_px, y_px), text, fill=color)
+
+
+def _draw_written_overlays(
+    draw: ImageDraw.ImageDraw,
+    manifest: dict,
+    page_index: int,
+    dpi: float,
+    *,
+    crop_padding_mm: float = 0.0,
+    show_line_bands: bool = False,
+) -> None:
+    for entry in _page_written_entries(manifest, page_index):
+        if crop_padding_mm > 0:
+            _draw_box_mm(
+                draw,
+                entry["x_mm"] - crop_padding_mm,
+                entry["y_mm"] - crop_padding_mm,
+                entry["width_mm"] + 2 * crop_padding_mm,
+                entry["height_mm"] + 2 * crop_padding_mm,
+                dpi,
+                (255, 126, 0, 210),
+                width=3,
+            )
+        x0, y0, _x1, _y1 = _draw_box_mm(
+            draw,
+            entry["x_mm"],
+            entry["y_mm"],
+            entry["width_mm"],
+            entry["height_mm"],
+            dpi,
+            (25, 105, 210, 230),
+            width=3,
+        )
+        _draw_label(draw, x0 + 4, max(0, y0 - 16), f"Q{entry['q_no']} written", (25, 105, 210, 255))
+
+        if not show_line_bands:
+            continue
+        lines = max(1, int(entry.get("lines", 1)))
+        line_height_mm = float(entry["height_mm"]) / lines
+        for index in range(lines):
+            line_y_mm = entry["y_mm"] + index * line_height_mm
+            lx0, ly0, _lx1, _ly1 = _draw_box_mm(
+                draw,
+                entry["x_mm"],
+                line_y_mm,
+                entry["width_mm"],
+                line_height_mm,
+                dpi,
+                (0, 170, 120, 145),
+                width=2,
+            )
+            _draw_label(
+                draw,
+                lx0 + 4,
+                ly0 + 3,
+                f"Q{entry['q_no']} L{index + 1}",
+                (0, 115, 86, 255),
+            )
+
+
 def _draw_circle_mm(
     draw: ImageDraw.ImageDraw,
     x_mm: float,
@@ -715,6 +852,11 @@ def _local_overlay_points(
         (float(cx), float(cy))
         for cx, cy in mcq_sample_centers(gray, entries, manifest, dpi).values()
     ]
+    numeric_entries = [entry for entry in manifest.get("numeric_block", []) if entry.get("page", 1) == page_index]
+    centers.extend(
+        (float(cx), float(cy))
+        for cx, cy in numeric_sample_centers(gray, numeric_entries, manifest, dpi).values()
+    )
     centers.extend(
         (float(cx), float(cy))
         for cx, cy in roll_sample_centers(gray, manifest, dpi, page_index).values()
@@ -777,6 +919,8 @@ def save_alignment_overlay(
     for _label, x_mm, y_mm in _expected_bubble_anchors(manifest, page_index):
         _draw_circle_mm(draw, x_mm, y_mm, bubble_radius, dpi, (220, 30, 40, 95), width=1)
 
+    _draw_written_overlays(draw, manifest, page_index, dpi)
+
     local_radius_px = bubble_radius * px_per_mm(dpi)
     for cx, cy in _local_overlay_points(gray, manifest, page_index, dpi):
         _draw_circle_px(draw, cx, cy, local_radius_px, (0, 175, 155, 210), width=2)
@@ -794,8 +938,9 @@ def save_sampling_overlay(
     page_index: int,
     dpi: float,
     path: str | Path,
+    written_padding_mm: float = 0.0,
 ) -> Path:
-    """Save the exact bubble sample regions used by MCQ/roll readers."""
+    """Save the exact bubble and written-answer regions used by readers."""
     gray = _gray_array(image)
     base = Image.fromarray(_rgb_display_array(image), mode="RGB")
     overlay = Image.new("RGBA", base.size, (255, 255, 255, 0))
@@ -807,6 +952,15 @@ def save_sampling_overlay(
     for cx, cy in _local_overlay_points(gray, manifest, page_index, dpi):
         _draw_circle_px(draw, cx, cy, sample_radius_px, (255, 176, 0, 210), width=2)
         _draw_circle_px(draw, cx, cy, core_radius_px, (0, 205, 80, 240), width=2)
+
+    _draw_written_overlays(
+        draw,
+        manifest,
+        page_index,
+        dpi,
+        crop_padding_mm=written_padding_mm,
+        show_line_bands=True,
+    )
 
     composed = Image.alpha_composite(base.convert("RGBA"), overlay).convert("RGB")
     path = Path(path)

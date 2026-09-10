@@ -7,14 +7,20 @@ Phase 3, behind the provider-agnostic `grade_written()` interface.
 """
 from .bubbles import fill_ratio, student_mark_fill_ratio
 from .mcq import MCQGrade, MCQOutcome, MCQReading, grade_mcq_responses, mcq_sample_centers, read_mcq_responses
+from .numeric import NumericOutcome, NumericReading, normalize_numeric_answer, numeric_sample_centers, read_numeric_responses
 
 __all__ = [
     "MCQGrade",
     "MCQOutcome",
     "MCQReading",
+    "NumericOutcome",
+    "NumericReading",
     "fill_ratio",
     "grade_mcq_responses",
     "mcq_sample_centers",
+    "normalize_numeric_answer",
+    "numeric_sample_centers",
     "read_mcq_responses",
+    "read_numeric_responses",
     "student_mark_fill_ratio",
 ]

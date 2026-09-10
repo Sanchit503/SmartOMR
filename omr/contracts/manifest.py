@@ -30,7 +30,10 @@ from pathlib import Path
 # v4 added: continuation_program_choices, so continuation pages carry compact
 #           BTECH/MTECH selectors beside their write-in roll-number boxes
 #           without repeating the full digit grid.
-MANIFEST_SCHEMA_VERSION = 4
+# v5 added: a unified BTECH/MTECH/PHD roll selector/grid, plus numeric-answer
+#           bubble blocks for quizzes whose answers are digits instead of
+#           A/B/C/D choices.
+MANIFEST_SCHEMA_VERSION = 5
 
 _TOP_LEVEL_KEYS = (
     "exam_id",
@@ -41,6 +44,9 @@ _TOP_LEVEL_KEYS = (
     "bubble_sample_radius_mm",
     "mcq_option_pitch_mm",
     "mcq_label_offset_mm",
+    "numeric_digit_pitch_mm",
+    "numeric_place_row_pitch_mm",
+    "numeric_label_offset_mm",
     "fiducial_size_mm",
     "fiducials",
     "orientation_marker",
@@ -49,6 +55,7 @@ _TOP_LEVEL_KEYS = (
     "write_in_fields",
     "roll_number_block",
     "mcq_block",
+    "numeric_block",
     "written_block",
 )
 
@@ -110,10 +117,10 @@ def _validate_page_identity(manifest: dict, page: int) -> None:
             for c in manifest["continuation_program_choices"]
             if c.get("page", 1) == page
         }
-        if programs != {"BTECH", "MTECH"}:
+        if programs != {"BTECH", "MTECH", "PHD"}:
             raise ManifestError(
                 f"page {page} has continuation program choices {sorted(programs)}, expected "
-                "BTECH and MTECH so a separated page can be matched to the right roll-number format"
+                "BTECH, MTECH, and PHD so a separated page can be matched to the right roll-number format"
             )
 
 
@@ -121,6 +128,8 @@ def _validate_page_has_content(manifest: dict, page: int) -> None:
     """No blank pages. A page with no question on it is a layout bug, and in a
     scan batch it is indistinguishable from a page the feeder pulled twice."""
     if any(e.get("page", 1) == page for e in manifest["mcq_block"]):
+        return
+    if any(e.get("page", 1) == page for e in manifest["numeric_block"]):
         return
     if any(e.get("page", 1) == page for e in manifest["written_block"]):
         return
@@ -194,6 +203,19 @@ def validate_manifest(manifest: dict) -> dict:
                 f"mcq_block Q{entry['q_no']} is on page {entry['page']}, "
                 f"but the manifest declares only {num_pages} page(s)"
             )
+
+    for entry in manifest["numeric_block"]:
+        for key in ("q_no", "x_mm", "y_mm", "digits", "max_marks"):
+            if key not in entry:
+                raise ManifestError(f"numeric_block entry is missing '{key}': {entry!r}")
+        if entry.get("page", 1) > num_pages:
+            raise ManifestError(
+                f"numeric_block Q{entry['q_no']} is on page {entry['page']}, "
+                f"but the manifest declares only {num_pages} page(s)"
+            )
+        digits = entry["digits"]
+        if not isinstance(digits, int) or digits < 1:
+            raise ManifestError(f"numeric_block Q{entry['q_no']} has invalid digits={digits!r}")
 
     for entry in manifest["written_block"]:
         # "lines" is required because Section 8's grading prompt interpolates

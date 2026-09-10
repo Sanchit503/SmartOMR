@@ -49,15 +49,16 @@ from __future__ import annotations
 import string
 from dataclasses import dataclass, field
 
-from .flow import FlowResult, LayoutTooTight, MCQEntry, WrittenEntry, flow_sheet
+from .flow import FlowResult, LayoutTooTight, MCQEntry, NumericEntry, WrittenEntry, flow_sheet
 from .metrics import (
     BTECH_GRID_COLUMNS,
-    BTECH_GRID_X_MM,
     BUBBLE_RADIUS_MM,
     CONT_BTECH_SELECTOR_X_MM,
+    CONT_PHD_SELECTOR_X_MM,
     CONT_MTECH_SELECTOR_X_MM,
     CONT_PROGRAM_SELECTOR_Y_MM,
     CONT_BTECH_ROLL_X_MM,
+    CONT_PHD_ROLL_X_MM,
     CONT_MTECH_ROLL_X_MM,
     CONT_ROLL_CELL_PITCH_MM,
     CONT_WRITE_IN_TOP_MM,
@@ -67,7 +68,10 @@ from .metrics import (
     FIDUCIAL_SIZE_MM,
     MARGIN_MM,
     MTECH_GRID_COLUMNS,
-    MTECH_GRID_X_MM,
+    PHD_GRID_COLUMNS,
+    PROGRAMS,
+    PROGRAM_SELECTOR_PITCH_MM,
+    PROGRAM_SELECTOR_X_MM,
     ORIENTATION_MARKER_SIZE_MM,
     ORIENTATION_MARKER_X_MM,
     ORIENTATION_MARKER_Y_MM,
@@ -77,6 +81,8 @@ from .metrics import (
     PAGE_MARK_Y_MM,
     PAGE_WIDTH_MM,
     PROGRAM_SELECTOR_Y_MM,
+    ROLL_GRID_COLUMNS,
+    ROLL_GRID_X_MM,
     ROLL_BLOCK_TOP_MM,
     ROLL_WRITE_IN_TOP_MM,
     WRITE_IN_CELL_W_MM,
@@ -89,6 +95,7 @@ __all__ = [
     "Fiducial",
     "LayoutTooTight",
     "MCQEntry",
+    "NumericEntry",
     "OrientationMarker",
     "PageMark",
     "ProgramChoice",
@@ -202,6 +209,7 @@ class SheetLayout:
     roll_block: RollBlockLayout
     mcq_entries: list[MCQEntry]
     written_entries: list[WrittenEntry]
+    numeric_entries: list[NumericEntry] = field(default_factory=list)
     mcq_options: int = field(default=4)
     mcq_columns: int = field(default=0)
     num_pages: int = field(default=1)
@@ -245,14 +253,17 @@ def _build_roll_block() -> RollBlockLayout:
     return RollBlockLayout(
         page=1,
         program_selector={
-            "BTECH": (BTECH_GRID_X_MM, PROGRAM_SELECTOR_Y_MM),
-            "MTECH": (MTECH_GRID_X_MM, PROGRAM_SELECTOR_Y_MM),
+            program: (
+                PROGRAM_SELECTOR_X_MM + index * PROGRAM_SELECTOR_PITCH_MM,
+                PROGRAM_SELECTOR_Y_MM,
+            )
+            for index, program in enumerate(PROGRAMS)
         },
         btech_digits=DigitGrid(
-            BTECH_GRID_COLUMNS, BTECH_GRID_X_MM, ROLL_BLOCK_TOP_MM, DIGIT_COL_PITCH_MM, DIGIT_ROW_PITCH_MM
+            ROLL_GRID_COLUMNS, ROLL_GRID_X_MM, ROLL_BLOCK_TOP_MM, DIGIT_COL_PITCH_MM, DIGIT_ROW_PITCH_MM
         ),
         mtech_digits=DigitGrid(
-            MTECH_GRID_COLUMNS, MTECH_GRID_X_MM, ROLL_BLOCK_TOP_MM, DIGIT_COL_PITCH_MM, DIGIT_ROW_PITCH_MM
+            MTECH_GRID_COLUMNS, ROLL_GRID_X_MM, ROLL_BLOCK_TOP_MM, DIGIT_COL_PITCH_MM, DIGIT_ROW_PITCH_MM
         ),
     )
 
@@ -301,6 +312,18 @@ def _continuation_write_ins(page: int) -> list[WriteInField]:
             cell_pitch_mm=CONT_ROLL_CELL_PITCH_MM,
             cell_width_mm=WRITE_IN_CELL_W_MM,
         ),
+        WriteInField(
+            page=page,
+            name="roll_number",
+            program="PHD",
+            x_mm=CONT_PHD_ROLL_X_MM,
+            y_mm=CONT_WRITE_IN_TOP_MM,
+            width_mm=(PHD_GRID_COLUMNS - 1) * CONT_ROLL_CELL_PITCH_MM + WRITE_IN_CELL_W_MM,
+            height_mm=WRITE_IN_HEIGHT_MM,
+            cells=PHD_GRID_COLUMNS,
+            cell_pitch_mm=CONT_ROLL_CELL_PITCH_MM,
+            cell_width_mm=WRITE_IN_CELL_W_MM,
+        ),
     ]
 
 
@@ -308,6 +331,7 @@ def _continuation_program_choices(page: int) -> list[ProgramChoice]:
     return [
         ProgramChoice(page=page, program="BTECH", x_mm=CONT_BTECH_SELECTOR_X_MM, y_mm=CONT_PROGRAM_SELECTOR_Y_MM),
         ProgramChoice(page=page, program="MTECH", x_mm=CONT_MTECH_SELECTOR_X_MM, y_mm=CONT_PROGRAM_SELECTOR_Y_MM),
+        ProgramChoice(page=page, program="PHD", x_mm=CONT_PHD_SELECTOR_X_MM, y_mm=CONT_PROGRAM_SELECTOR_Y_MM),
     ]
 
 
@@ -315,6 +339,7 @@ def _build_write_in_fields(roll_block: RollBlockLayout, num_pages: int) -> list[
     fields = [
         _grid_write_in(roll_block.btech_digits, "BTECH"),
         _grid_write_in(roll_block.mtech_digits, "MTECH"),
+        _grid_write_in(roll_block.mtech_digits, "PHD"),
     ]
     for page in range(2, num_pages + 1):
         fields.extend(_continuation_write_ins(page))
@@ -324,7 +349,11 @@ def _build_write_in_fields(roll_block: RollBlockLayout, num_pages: int) -> list[
 # ---------------------------------------------------------------------------
 
 def _total_marks(config) -> float:
-    return config.num_mcq * config.marks_per_mcq + sum(w.max_marks for w in config.written_questions)
+    return (
+        config.num_mcq * config.marks_per_mcq
+        + config.num_numeric * config.marks_per_numeric
+        + sum(w.max_marks for w in config.written_questions)
+    )
 
 
 def build_layout(config) -> SheetLayout:  # config: ExamConfig, typed loosely to avoid a circular import
@@ -352,6 +381,7 @@ def build_layout(config) -> SheetLayout:  # config: ExamConfig, typed loosely to
         write_in_fields=_build_write_in_fields(roll_block, flow.num_pages),
         roll_block=roll_block,
         mcq_entries=flow.mcq_entries,
+        numeric_entries=flow.numeric_entries,
         written_entries=flow.written_entries,
         mcq_options=config.mcq_options,
         mcq_columns=flow.mcq_columns,

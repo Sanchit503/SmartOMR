@@ -107,6 +107,14 @@ def prompt_for_config() -> ExamConfig:
         mcq_options = ask_int_range("How many options per MCQ (A-B up to A-F)?", 2, 6, default="4")
         marks_per_mcq = ask("Marks per correct MCQ", default="1", cast=float)
 
+    print("\n-- Section N: Numeric answers --")
+    num_numeric = ask("How many numeric questions?", default="0", cast=int)
+    numeric_digits = 2
+    marks_per_numeric = 1.0
+    if num_numeric > 0:
+        marks_per_numeric = ask("Marks per numeric question", default="1", cast=float)
+        numeric_digits = ask_int_range("Maximum digits per numeric answer", 1, 4, default="2")
+
     print("\n-- Section B: Written answers --")
     num_written = ask("How many written questions?", default="0", cast=int)
     written_questions: list[WrittenQuestionConfig] = []
@@ -119,12 +127,12 @@ def prompt_for_config() -> ExamConfig:
             max_marks = ask("  Max marks for each", default="5", cast=float)
             lines = ask("  Answer lines for each (2 = a two-line short answer)", default="2", cast=int)
             written_questions = [
-                WrittenQuestionConfig(q_no=num_mcq + i + 1, max_marks=max_marks, lines=lines)
+                WrittenQuestionConfig(q_no=num_mcq + num_numeric + i + 1, max_marks=max_marks, lines=lines)
                 for i in range(num_written)
             ]
         else:
             for i in range(num_written):
-                q_no = num_mcq + i + 1
+                q_no = num_mcq + num_numeric + i + 1
                 print(f"  -- Q{q_no} --")
                 max_marks = ask(f"    Max marks for Q{q_no}", default="5", cast=float)
                 lines = ask(f"    Answer lines for Q{q_no}", default="2", cast=int)
@@ -141,6 +149,9 @@ def prompt_for_config() -> ExamConfig:
         num_mcq=num_mcq,
         mcq_options=mcq_options,
         marks_per_mcq=marks_per_mcq,
+        num_numeric=num_numeric,
+        numeric_digits=numeric_digits,
+        marks_per_numeric=marks_per_numeric,
         written_questions=written_questions,
     )
 
