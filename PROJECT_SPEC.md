@@ -203,6 +203,11 @@ The current file-based workflow also writes `review_report.csv` and `review_repo
 students, needs-review students, unmatched pages, page errors, generated `sheet.pdf` links, and the
 exact flags that must be cleared before emailing or final grading.
 
+The human verification step writes a separate `verified_index.json`; it does not rewrite the raw
+parser output. A reviewer can verify a student, reject a grouping, keep a student on hold, assign an
+unmatched continuation page to a roll number, or ignore a stray page. Only rows marked `verified`
+with a generated verified sheet become eligible for later email/grading automation.
+
 ---
 
 ## 6. Module 3 — Identity resolution & verification email
@@ -229,8 +234,19 @@ Straightforward once Module 5/6 give you canonical images and manifest coordinat
 ## 8. Module 5 — Written-answer grading (LLM-assisted)
 
 1. Crop each written answer region using the manifest's `written_block` coordinates from the canonical image.
-2. For each cropped answer, call a vision-capable LLM with: the question text (from the ingested question paper), the max marks, the professor's rubric/model answer, and the cropped image.
-3. Require **structured JSON output** — don't parse free text.
+2. Export a manual written-grading packet for verified students: crop links, question text,
+   rubric/model answer metadata, OCR text/confidence when available, `manual_marks_template.csv`,
+   and a browser review page. Import professor/TA marks only after validating
+   `0 <= marks_awarded <= max_marks`.
+3. Store written grades separately from raw parser output in structured JSON/CSV, then produce a
+   combined `final_scores.csv` with MCQ + written totals.
+4. Written grading now goes through `omr.grading.written.WrittenGrader`. The as-built provider is
+   a deterministic `mock` provider for workflow testing; it defaults to `needs_human_review` and
+   must not be used as real marks.
+5. For AI-assisted grading, add a real provider behind that interface and call a vision-capable
+   LLM with: the question text (from the ingested question paper), the max marks, the professor's
+   rubric/model answer, and the cropped image.
+6. Require **structured JSON output** — don't parse free text.
 
 **Example prompt (adapt to whichever vision-capable LLM provider you use; most accept an image + text prompt in broadly the same shape):**
 
@@ -260,8 +276,11 @@ Marking guideline: {rubric_text}
 [attached: cropped handwritten-answer image]
 ```
 
-4. Anything returned with `needs_human_review: true` (or a parse failure) goes into the same review queue as Module 3/4's flagged items — don't silently accept it.
-5. This module should be built behind a small provider-agnostic interface (`grade_written(image, question, rubric, max_marks) -> GradeResult`) so you can swap LLM providers without touching the rest of the pipeline — useful since API access/budget for a BTP can change.
+7. Anything returned with `needs_human_review: true` (or a parse failure) goes into the same review queue as Module 3/4's flagged items — don't silently accept it.
+8. Every provider must emit the same grade-record shape as the manual marks importer: transcript,
+   marks, max marks, justification, confidence, provider/method, review flags, and final status.
+   That keeps `written_grades.json`, `written_grades_report.csv`, `final_scores.csv`, and
+   `written_review.html` stable across manual, mock, and future LLM grading.
 
 ---
 
@@ -322,14 +341,15 @@ omr/
                  main.py       entry point (terminal wizard / --config)
                Run it with `python -m omr.generator.main`.
   grading/     Modules 4/5 (Sections 7-8). Bubble reading + MCQ grading; written-answer
-               LLM grading lands here in Phase 3.
+               grading contracts and safe mock provider.
   reader/      Modules 2/3 prototype (Sections 5-6): scan/PDF loading,
                fiducial alignment to canonical A4, alignment quality reports,
                page-index reading, and roll-number/program decoding.
   io/          Roster CSV, answer-key CSV, and result CSV helpers.
   workflows/  File-based workflows that compose contracts + reader + grading + I/O,
-               currently parse.py for canonical pages, alignment diagnostics,
-               identity, MCQs, written crops and JSON artifacts; evaluate.py
+               currently parse.py for one-sheet parsing, batch.py for
+               multi-student PDFs, review.py for human verification artifacts,
+               written.py for written marks packets/import, and evaluate.py
                for the older MCQ summary professor-demo flow.
 
 prototype_eval/

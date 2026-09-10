@@ -27,6 +27,16 @@ class AnswerKeyEntry:
 
 
 @dataclass(frozen=True)
+class WrittenQuestionMeta:
+    q_no: int
+    question_text: str = ""
+    rubric: str = ""
+    model_answer: str = ""
+    max_marks: float | None = None
+    extra: dict[str, str] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
 class RollRead:
     program: str | None
     roll_no: str | None
@@ -112,4 +122,5 @@ __all__ = [
     "RollRead",
     "Student",
     "WrittenCrop",
+    "WrittenQuestionMeta",
 ]

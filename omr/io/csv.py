@@ -1,16 +1,21 @@
-"""CSV loading/writing for rosters, answer keys, and scan-evaluation results."""
+"""CSV loading/writing for rosters, answer keys, rubrics, and results."""
 from __future__ import annotations
 
 import csv
 from pathlib import Path
 
-from omr.models import AnswerKeyEntry, EvaluationResult, Student
+from omr.models import AnswerKeyEntry, EvaluationResult, Student, WrittenQuestionMeta
 
 
 ROLL_HEADERS = ("roll_no", "roll", "roll_number", "student_roll", "student_id")
 NAME_HEADERS = ("name", "student_name")
 EMAIL_HEADERS = ("email", "mail", "student_email")
 PROGRAM_HEADERS = ("program", "degree")
+WRITTEN_Q_HEADERS = ("q_no", "question_no", "question_number", "q")
+QUESTION_TEXT_HEADERS = ("question_text", "question", "prompt")
+RUBRIC_HEADERS = ("rubric", "marking_guideline", "marking_guidelines", "guideline", "guidelines")
+MODEL_ANSWER_HEADERS = ("model_answer", "expected_answer", "sample_answer")
+MAX_MARKS_HEADERS = ("max_marks", "marks", "marks_possible")
 
 
 def normalize_roll(value: str) -> str:
@@ -25,6 +30,14 @@ def _field(row: dict[str, str], names: tuple[str, ...], required: bool = True) -
     if required:
         raise ValueError(f"CSV row is missing one of these columns: {', '.join(names)}")
     return ""
+
+
+def _column(fieldnames: list[str], names: tuple[str, ...]) -> str | None:
+    lowered = {name.strip().lower(): name for name in fieldnames}
+    for name in names:
+        if name in lowered:
+            return lowered[name]
+    return None
 
 
 def load_students(path: str | Path) -> dict[str, Student]:
@@ -93,6 +106,68 @@ def load_answer_key(path: str | Path, default_marks: float = 1.0) -> dict[int, A
     if not key:
         raise ValueError(f"{path} contains no answer key entries")
     return key
+
+
+def load_written_question_metadata(path: str | Path) -> dict[int, WrittenQuestionMeta]:
+    path = Path(path)
+    with path.open(newline="", encoding="utf-8-sig") as f:
+        reader = csv.DictReader(f)
+        if not reader.fieldnames:
+            raise ValueError(f"{path} has no header row")
+
+        q_col = _column(reader.fieldnames, WRITTEN_Q_HEADERS)
+        text_col = _column(reader.fieldnames, QUESTION_TEXT_HEADERS)
+        rubric_col = _column(reader.fieldnames, RUBRIC_HEADERS)
+        model_col = _column(reader.fieldnames, MODEL_ANSWER_HEADERS)
+        marks_col = _column(reader.fieldnames, MAX_MARKS_HEADERS)
+        if not q_col:
+            raise ValueError("written rubric CSV must have a q_no column")
+        known = {
+            name
+            for name in (q_col, text_col, rubric_col, model_col, marks_col)
+            if name is not None
+        }
+
+        metadata: dict[int, WrittenQuestionMeta] = {}
+        for row_no, row in enumerate(reader, start=2):
+            try:
+                q_no = int(str(row.get(q_col, "")).strip())
+            except ValueError as exc:
+                raise ValueError(f"{path}:{row_no} has invalid q_no {row.get(q_col)!r}") from exc
+
+            question_text = str(row.get(text_col, "")).strip() if text_col else ""
+            rubric = str(row.get(rubric_col, "")).strip() if rubric_col else ""
+            model_answer = str(row.get(model_col, "")).strip() if model_col else ""
+            max_marks = None
+            if marks_col and str(row.get(marks_col, "")).strip():
+                try:
+                    max_marks = float(row[marks_col])
+                except ValueError as exc:
+                    raise ValueError(f"{path}:{row_no} has invalid max_marks {row[marks_col]!r}") from exc
+                if max_marks <= 0:
+                    raise ValueError(f"{path}:{row_no} has non-positive max_marks {max_marks:g}")
+
+            if q_no in metadata:
+                raise ValueError(f"{path}:{row_no} duplicates Q{q_no}")
+            if not any((question_text, rubric, model_answer, max_marks is not None)):
+                raise ValueError(f"{path}:{row_no} has no written-question metadata for Q{q_no}")
+
+            extra = {
+                key: value
+                for key, value in row.items()
+                if key and key not in known and value is not None and str(value).strip()
+            }
+            metadata[q_no] = WrittenQuestionMeta(
+                q_no=q_no,
+                question_text=question_text,
+                rubric=rubric,
+                model_answer=model_answer,
+                max_marks=max_marks,
+                extra=extra,
+            )
+    if not metadata:
+        raise ValueError(f"{path} contains no written-question metadata")
+    return metadata
 
 
 def write_results_csv(results: list[EvaluationResult], path: str | Path) -> Path:
