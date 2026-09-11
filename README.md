@@ -7,9 +7,10 @@ OMR-based assessment system. BTP project, IIIT Delhi. Full spec and module bound
 
 Per the roadmap in PROJECT_SPEC.md Section 12:
 
-- [x] **Phase 1** — OMR sheet generator + pure MCQ grading pipeline
+- [x] **Phase 1** — OMR sheet generator + MCQ/numerical grading pipeline
 - [x] **Phase 2 local batch parser** — scan/PDF loading, fiducial alignment, page-index reading,
-  alignment quality reports, roll-number reading, roster CSV matching, MCQ result export,
+  alignment quality reports, BTech/MTech/PhD roll-number reading, roster CSV matching,
+  MCQ and numerical result export,
   production package entrypoints, local diagnostics, and review artifacts
 - [ ] Phase 2 service hardening — upload API, verification email, persistent review queue,
   duplicate-sheet handling, and production scan-calibration dataset
@@ -24,9 +25,9 @@ Run the terminal wizard:
 python -m omr.generator.main
 ```
 
-It asks for the exam requirements one at a time — university name, course code, exam name, how many
-MCQs, how many options each, how many written questions and how many lines each — then writes the printable PDF and
-its template manifest into `data/exams/` and opens the PDF.
+It asks for the exam requirements one at a time — university name, course code, exam name, MCQs,
+non-negative whole-number questions (marks and maximum digits), and written questions (marks and
+lines) — then writes the printable PDF and its template manifest into `data/exams/` and opens the PDF.
 
 For repeatable generation, use a saved config file:
 
@@ -119,8 +120,20 @@ python -m omr.workflows.parse \
 ```
 
 `--scans` can be one image/PDF or a folder of them. `--students` and `--answer-key` are optional:
-without them the parser still aligns pages, reads identity bubbles as far as it can, reads MCQs, and
-crops written answers, but it cannot roster-match or score MCQs.
+without them the parser still aligns pages, decodes the bubbled identity, reads MCQs and numerical
+answers, and crops written answers, but it cannot roster-match names/emails or award objective marks.
+
+The answer-key CSV uses one format for MCQs and numerical answers:
+
+```csv
+q_no,answer,marks
+1,B,1
+6,7,2
+```
+
+For a three-digit numerical grid, the student bubbles `007`; the key may contain `7` or `007`.
+Numerical answers are currently non-negative whole numbers only. Blank grids score zero, while
+incomplete, faint, or multiply marked grids go to review rather than being guessed.
 
 The parser writes to `data/parsed/<exam_id>/` by default:
 
@@ -300,7 +313,7 @@ The importer validates every mark against that question's `max_marks` and writes
 ```text
 written_grades.json              structured written grades
 written_grades_report.csv        one row per written answer
-final_scores.csv                 MCQ + written totals per verified student
+final_scores.csv                 MCQ + numerical + written totals per verified student
 ```
 
 The written-grading workflow also has a provider interface for future LLM/vision graders. Right
@@ -523,17 +536,19 @@ position.
 
 | On every page | Read by | What it's for |
 |---|---|---|
-| **BTECH** choice + 7 boxes, **MTECH** choice + 5 boxes | a human | Reattaching a page that got separated; resolving a flagged bubble read (Section 6, step 5) |
+| **BTECH** choice + 7 boxes; **MTECH/PHD** choices + shared 5 boxes | a human | Reattaching a page that got separated; resolving a flagged bubble read (Section 6, step 5) |
 | **Page-index bars** — one per page, this page's filled solid | the machine | Confirming a batch is a complete sheet in the right order |
 | Bubbled roll-number grid (**page 1 only**) | the machine | Roster lookup (Module 3) |
 
-The BTech write-in row is 7 boxes (`2024503`). The MTech row is 5 boxes because the `MT` prefix is
-implied by the MTECH choice (`MT25001` becomes `25001` in the boxes).
+The BTech write-in row is 7 boxes (`2024503`). MTech and PhD share a 5-box row because the selected
+program supplies the prefix: `MT25001` and `PHD20301` are written/bubbled as `25001` and `20301`.
+The program selector is mandatory for that shared grid; an unselected five-digit grid cannot safely
+be classified as MTech or PhD.
 
 The full 0-9 bubble grid is **not** repeated on continuation pages. It would cost ~85mm of every page, and it
 would ask a student to bubble the same seven digits two or three more times — each repeat being a
 fresh chance to produce a page that *contradicts* page 1, which is a review-queue item rather than
-an improvement. Continuation pages repeat only the compact BTECH/MTECH choices and their write-in
+an improvement. Continuation pages repeat only the compact BTECH/MTECH/PHD choices and their write-in
 boxes.
 
 The page-index bars are deliberately **bars**, not squares: a marker detector rejects candidates by
@@ -598,10 +613,13 @@ Tests live beside the code they cover (`omr/generator/tests/`, `omr/grading/test
   "num_mcq": 20,
   "mcq_options": 4,
   "marks_per_mcq": 1,
+  "numerical_questions": [
+    { "q_no": 21, "max_marks": 2, "digits": 3 }
+  ],
   "written_questions": [
-    { "q_no": 21, "max_marks": 5, "lines": 2 },
     { "q_no": 22, "max_marks": 5, "lines": 2 },
-    { "q_no": 23, "max_marks": 10, "lines": 4 }
+    { "q_no": 23, "max_marks": 5, "lines": 2 },
+    { "q_no": 24, "max_marks": 10, "lines": 4 }
   ]
 }
 ```
@@ -613,31 +631,41 @@ Tests live beside the code they cover (`omr/generator/tests/`, `omr/grading/test
 | `course_code` | any string | Printed in the header |
 | `exam_name` | any string | Printed as the sheet title |
 | `exam_type` | `quiz` \| `midsem` \| `endsem` | Metadata only right now — doesn't change layout |
-| `num_mcq` | any non-negative integer | Number of MCQ rows; layout auto-picks 2/3/4 columns to fit them above the written section |
+| `num_mcq` | any non-negative integer | Number of MCQ rows; layout auto-picks 2/3/4 columns |
 | `mcq_options` | 2–6 | Number of bubbles per MCQ (A–B up to A–F); widens each MCQ row |
 | `marks_per_mcq` | any number | Marks for a correct MCQ — uniform across all MCQs (see limitations below) |
+| `numerical_questions` | list, any length | Non-negative whole-number grids; see below |
 | `written_questions` | list, any length | See below |
 | `roster_csv` | optional string | Reserved for Phase 2 (roster upload for identity resolution) — not used yet |
+
+Each entry in `numerical_questions` is independent:
+
+| Field | What it does |
+|---|---|
+| `q_no` | Printed beside the grid; must follow all MCQ question numbers |
+| `max_marks` | Marks awarded for an exact numeric match |
+| `digits` | 1–8 answer positions. Each position is one labeled place-value row of 0–9 bubbles |
+
+Rows run from the most significant place down to `Ones`, and there is no duplicate handwritten
+digit box. Students fill every row, including leading zeros: answer `7` uses `007` in a three-digit
+grid. Two numerical questions are packed side by side when they fit.
 
 Each entry in `written_questions` is independent:
 
 | Field | What it does |
 |---|---|
-| `q_no` | Printed on the answer box; must be greater than `num_mcq` (numbering continues after the MCQs) |
+| `q_no` | Printed on the answer box; must follow all MCQ and numerical question numbers |
 | `max_marks` | Printed next to the question number |
 | `lines` | How many ruled lines the answer box gets — the box height scales automatically, so a 2-line short-answer box and a 6-line derivation box come out very different sizes on the same sheet |
 
-There's no fixed number of written questions. The layout engine packs the MCQ block first
-(auto-picking however many columns are needed), then stacks the written-answer boxes underneath in
-order, each sized to its own `lines` value.
+There is no fixed count for either section. The layout engine packs MCQs first, horizontal numerical
+grids second, then written-answer boxes, each sized to its own `lines` value.
 
 ### Multi-page exams — how the flow works
 
-**One continuous flow, always.** A cursor walks down page 1, then page 2, and so on. Section A
-(MCQs) is placed first; Section B (written answers) continues from wherever Section A ended — on the
-same page if there's room, on the next page only if there isn't. A page break happens only when the
-next question genuinely doesn't fit, which makes a half-empty page structurally impossible rather
-than something to remember not to produce.
+**One continuous flow, always.** A cursor walks down page 1, then page 2, and so on. MCQs are placed
+first, numerical grids second, and written answers last. Each section continues in the space left on
+the current page and breaks only when its next row or answer box does not fit.
 
 So a 10-MCQ + 10-two-liner quiz comes out as:
 
@@ -653,8 +681,8 @@ Every coordinate assertion passed; what was wrong was *which page* things went o
 the only placement algorithm, and `test_flow.py` asserts the two properties that catch that class of
 bug: a page break happens only when the next question doesn't fit, and no page is ever empty.
 
-Sections still never interleave — all of Section A precedes all of Section B, exactly like a real
-exam paper, and a page break never splits a single answer box.
+Sections never interleave: all MCQs precede all numerical grids, which precede all written answers.
+A page break never splits a numerical grid or a written answer box.
 
 **MCQ column count** (2, 3, or 4) is chosen once for the whole sheet, by running the real flow for
 each candidate and keeping the one that needs the fewest pages. Ties go to the *fewest* columns:
@@ -664,9 +692,9 @@ but not in two, so three wins there.
 
 Every page gets its own four fiducial markers plus an orientation marker (Section 4.3 requires this
 on every physical sheet, since each page is deskewed independently at scan time), its own
-page-index bars, its own compact BTECH/MTECH write-in blocks, and a "Page X of N" label.
+page-index bars, its own compact BTECH/MTECH/PHD write-in blocks, and a "Page X of N" label.
 
-The manifest reflects all of it: every fiducial / MCQ / written / page-mark / write-in entry carries
+The manifest reflects all of it: every fiducial / MCQ / numerical / written / page-mark / write-in entry carries
 a `"page"` field, and there's a top-level `"num_pages"`. Grading (`grading/mcq.py`) takes one
 canonical image *per page* (`{page_no: image}`) rather than a single image, precisely so a multi-page
 sheet can never get graded against the wrong page's image by accident.
@@ -693,6 +721,7 @@ All under `omr/generator/configs/`:
 - `endsem_heavy_written.json` — 8 MCQs + 4 written questions with varying line counts, 1 page
 - `mcq_options_6.json` — 15 MCQs with 6 options each (A–F) instead of the usual 4
 - `multi_page_20q.json` — 10 MCQs + 10 written questions at 3 lines each -> 2 pages
+- `mixed_numerical.json` — MCQ + compact horizontal numerical grids + written answers
 - `example_impossible_question.json` — a single question too tall for any page, to show the hard-stop case
 
 ## Known Phase 1 limitations
@@ -705,6 +734,9 @@ Worth flagging to your professor:
   scan-evaluation workflow can load `answer_key.csv`, but `ExamConfig` still has nowhere to store it.
 - **No full question-paper ingestion yet** — written question/rubric metadata can be supplied by CSV
   for grading packets, but `ExamConfig` still stores only layout-level written question settings.
+- **PhD roster data is still required for names and email** — the sheet/parser support current
+  `PHD` + 5-digit IDs, but public directory entries are not used as an authoritative exam roster.
+  Confirm any older four-digit PhD enrollment format before printing for those students.
 - **No database** — `Exam`/`Question`/etc. (PROJECT_SPEC.md Section 3) are not wired up yet.
 - **Scan evaluation is a local batch workflow, not yet a hosted web service** — `omr.reader`
   writes per-page alignment quality reports, color debug pages, overlays, and review flags, but

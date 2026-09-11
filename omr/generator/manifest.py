@@ -18,7 +18,7 @@ more than the example in PROJECT_SPEC.md spells out:
                            in a scan batch actually is, read with the same
                            ink-measuring primitive as a bubble
   continuation_program_choices
-                           compact BTECH/MTECH selectors on continuation
+                           compact BTECH/MTECH/PHD selectors on continuation
                            pages, paired with write-in boxes instead of the
                            full digit grid
   write_in_fields          handwritten roll-number regions to crop for the
@@ -35,6 +35,7 @@ only knows how to *produce* one.
 from __future__ import annotations
 
 import json
+from dataclasses import asdict
 from pathlib import Path
 
 from ..contracts.manifest import MANIFEST_SCHEMA_VERSION, validate_manifest
@@ -44,9 +45,6 @@ from .metrics import (
     BUBBLE_SAMPLE_RADIUS_MM,
     MCQ_LABEL_OFFSET_MM,
     MCQ_OPTION_PITCH_MM,
-    NUMERIC_DIGIT_PITCH_MM,
-    NUMERIC_LABEL_OFFSET_MM,
-    NUMERIC_PLACE_ROW_PITCH_MM,
     ORIENTATION_KEEPOUT_MM,
     PAGE_HEIGHT_MM,
     PAGE_WIDTH_MM,
@@ -84,9 +82,6 @@ def build_manifest(layout: SheetLayout) -> dict:
         "bubble_sample_radius_mm": BUBBLE_SAMPLE_RADIUS_MM,
         "mcq_option_pitch_mm": MCQ_OPTION_PITCH_MM,
         "mcq_label_offset_mm": MCQ_LABEL_OFFSET_MM,
-        "numeric_digit_pitch_mm": NUMERIC_DIGIT_PITCH_MM,
-        "numeric_place_row_pitch_mm": NUMERIC_PLACE_ROW_PITCH_MM,
-        "numeric_label_offset_mm": NUMERIC_LABEL_OFFSET_MM,
         "fiducial_size_mm": layout.fiducials[0].size_mm if layout.fiducials else None,
         "fiducial_keepouts_mm": [
             {"x0_mm": x0, "y0_mm": y0, "x1_mm": x1, "y1_mm": y1}
@@ -145,6 +140,7 @@ def build_manifest(layout: SheetLayout) -> dict:
                 "page": w.page,
                 "name": w.name,
                 "program": w.program,
+                "programs": list(w.programs or ((w.program,) if w.program else ())),
                 "x_mm": w.x_mm,
                 "y_mm": w.y_mm,
                 "width_mm": w.width_mm,
@@ -160,14 +156,12 @@ def build_manifest(layout: SheetLayout) -> dict:
             "program_selector": {
                 label: {"x_mm": x, "y_mm": y} for label, (x, y) in rb.program_selector.items()
             },
-            "btech_digits": {
-                "columns": rb.btech_digits.columns,
-                "x_mm": rb.btech_digits.x_mm,
-                "y_mm": rb.btech_digits.y_mm,
-                "col_pitch_mm": rb.btech_digits.col_pitch_mm,
-                "row_pitch_mm": rb.btech_digits.row_pitch_mm,
+            "program_grid_keys": {
+                "BTECH": "btech_digits",
+                "MTECH": "mtech_digits",
+                "PHD": "mtech_digits",
             },
-            "digits": {
+            "btech_digits": {
                 "columns": rb.btech_digits.columns,
                 "x_mm": rb.btech_digits.x_mm,
                 "y_mm": rb.btech_digits.y_mm,
@@ -181,31 +175,10 @@ def build_manifest(layout: SheetLayout) -> dict:
                 "col_pitch_mm": rb.mtech_digits.col_pitch_mm,
                 "row_pitch_mm": rb.mtech_digits.row_pitch_mm,
             },
-            "program_digit_counts": {
-                "BTECH": 7,
-                "MTECH": 5,
-                "PHD": 5,
-            },
-            "program_prefixes": {
-                "BTECH": "",
-                "MTECH": "MT",
-                "PHD": "PHD",
-            },
         },
         "mcq_block": [
             {"page": e.page, "q_no": e.q_no, "x_mm": e.x_mm, "y_mm": e.y_mm, "options": e.options}
             for e in layout.mcq_entries
-        ],
-        "numeric_block": [
-            {
-                "page": e.page,
-                "q_no": e.q_no,
-                "x_mm": e.x_mm,
-                "y_mm": e.y_mm,
-                "digits": e.digits,
-                "max_marks": e.max_marks,
-            }
-            for e in layout.numeric_entries
         ],
         "written_block": [
             {
@@ -219,6 +192,11 @@ def build_manifest(layout: SheetLayout) -> dict:
                 "lines": e.lines,
             }
             for e in layout.written_entries
+        ],
+        "numerical_block": [
+            {**asdict(e), "orientation": "horizontal", "answer_type": "unsigned_integer",
+             "leading_zeros": "required"}
+            for e in layout.numerical_entries
         ],
     }
     # Fail here, at generation time, rather than months later at grading

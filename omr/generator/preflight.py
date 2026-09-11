@@ -100,12 +100,11 @@ def _all_bubbles(manifest: dict):
             x = entry["x_mm"] + manifest["mcq_label_offset_mm"] + i * manifest["mcq_option_pitch_mm"]
             yield entry.get("page", 1), f"Q{entry['q_no']}-{opt}", x, entry["y_mm"]
 
-    for entry in manifest.get("numeric_block", []):
-        for place in range(int(entry["digits"])):
-            for digit in range(10):
-                x = entry["x_mm"] + manifest["numeric_label_offset_mm"] + digit * manifest["numeric_digit_pitch_mm"]
-                y = entry["y_mm"] + place * manifest["numeric_place_row_pitch_mm"]
-                yield entry.get("page", 1), f"Q{entry['q_no']}-D{place + 1}-{digit}", x, y
+    from ..contracts.geometry import digit_grid_centers_mm
+
+    for entry in manifest.get("numerical_block", []):
+        for (column, digit), (x, y) in digit_grid_centers_mm(entry).items():
+            yield entry["page"], f"Q{entry['q_no']}-col{column + 1}-{digit}", x, y
 
     rb = manifest["roll_number_block"]
     page = rb.get("page", 1)
@@ -113,17 +112,6 @@ def _all_bubbles(manifest: dict):
         yield page, f"program-{label}", pos["x_mm"], pos["y_mm"]
     for choice in manifest.get("continuation_program_choices", []):
         yield choice.get("page", 1), f"continuation-program-{choice['program']}", choice["x_mm"], choice["y_mm"]
-    if "digits" in rb:
-        grid = rb["digits"]
-        for col in range(grid["columns"]):
-            for digit in range(10):
-                yield (
-                    page,
-                    f"roll-col{col + 1}-{digit}",
-                    grid["x_mm"] + col * grid["col_pitch_mm"],
-                    grid["y_mm"] + digit * grid["row_pitch_mm"],
-                )
-        return
     for key, short in (("btech_digits", "BT"), ("mtech_digits", "MT")):
         grid = rb[key]
         for col in range(grid["columns"]):

@@ -51,6 +51,20 @@ def _fill_btech_roll(draw: ImageDraw.ImageDraw, manifest: dict, roll_no: str) ->
         _fill_bubble(draw, manifest, x_mm, y_mm)
 
 
+def _fill_postgraduate_roll(draw: ImageDraw.ImageDraw, manifest: dict, program: str, digits: str) -> None:
+    block = manifest["roll_number_block"]
+    selector = block["program_selector"][program]
+    _fill_bubble(draw, manifest, selector["x_mm"], selector["y_mm"])
+    grid = block[block["program_grid_keys"][program]]
+    for col, digit_char in enumerate(digits):
+        _fill_bubble(
+            draw,
+            manifest,
+            grid["x_mm"] + col * grid["col_pitch_mm"],
+            grid["y_mm"] + int(digit_char) * grid["row_pitch_mm"],
+        )
+
+
 def _add_tiny_roll_noise(draw: ImageDraw.ImageDraw, manifest: dict, col: int, digit: int) -> None:
     grid = manifest["roll_number_block"]["btech_digits"]
     cx, cy = mm_to_px(
@@ -89,3 +103,35 @@ def test_double_filled_roll_column_still_needs_review(tmp_path: Path):
 
     assert roll.confidence == "low"
     assert any("multiple filled digits" in flag for flag in roll.review_flags)
+
+
+def test_phd_selector_reads_shared_five_digit_grid(tmp_path: Path):
+    manifest, page = _page(tmp_path)
+    _fill_postgraduate_roll(ImageDraw.Draw(page), manifest, "PHD", "20301")
+
+    roll = read_roll_number(np.asarray(page), manifest, DPI)
+
+    assert roll.program == "PHD"
+    assert roll.roll_no == "PHD20301"
+    assert roll.confidence == "high"
+
+
+def test_shared_grid_without_program_selector_is_not_guessed(tmp_path: Path):
+    manifest, page = _page(tmp_path)
+    block = manifest["roll_number_block"]
+    grid = block[block["program_grid_keys"]["PHD"]]
+    draw = ImageDraw.Draw(page)
+    for col, digit_char in enumerate("20301"):
+        _fill_bubble(
+            draw,
+            manifest,
+            grid["x_mm"] + col * grid["col_pitch_mm"],
+            grid["y_mm"] + int(digit_char) * grid["row_pitch_mm"],
+        )
+
+    roll = read_roll_number(np.asarray(page), manifest, DPI)
+
+    assert roll.program is None
+    assert roll.roll_no is None
+    assert roll.confidence == "low"
+    assert any("shared by MTECH and PHD" in flag for flag in roll.review_flags)

@@ -41,6 +41,7 @@ import numpy as np
 from .contracts import load_manifest
 from .contracts.geometry import mm_to_px, px_per_mm
 from .grading.mcq import MCQOutcome, grade_mcq_responses, read_mcq_responses
+from .reader.numerical import read_numerical_responses
 
 VERIFY_DPI = 200
 
@@ -79,7 +80,7 @@ class VerifyResult:
     def format(self) -> str:
         lines = [f"Round-trip verification of {self.exam_id} ({self.num_pages} page(s)):"]
         if self.total_questions == 0:
-            lines.append("  no MCQs on this sheet - nothing to round-trip")
+            lines.append("  no MCQs or numerical questions on this sheet - nothing to round-trip")
             return "\n".join(lines)
 
         lines.append(f"  answers recovered:  {self.recovered}/{self.total_questions}")
@@ -155,9 +156,9 @@ def verify_sheet(
     result = VerifyResult(
         exam_id=manifest["exam_id"],
         num_pages=manifest["num_pages"],
-        total_questions=len(manifest["mcq_block"]),
+        total_questions=len(manifest["mcq_block"]) + len(manifest.get("numerical_block", [])),
     )
-    if not manifest["mcq_block"]:
+    if not result.total_questions:
         return result
 
     rng = random.Random(seed)
@@ -173,6 +174,15 @@ def verify_sheet(
         i = entry["options"].index(option)
         x_mm = entry["x_mm"] + manifest["mcq_label_offset_mm"] + i * manifest["mcq_option_pitch_mm"]
         _fill(draws[page], manifest, x_mm, entry["y_mm"], dpi, coverage, darkness)
+
+    intended_numbers = {}
+    for entry in manifest.get("numerical_block", []):
+        text = str(rng.randrange(10 ** entry["positions"])).zfill(entry["positions"])
+        intended_numbers[entry["q_no"]] = text
+        for column, digit in enumerate(text):
+            _fill(draws[entry["page"]], manifest,
+                  entry["x_mm"] + int(digit) * entry["digit_pitch_mm"],
+                  entry["y_mm"] + column * entry["position_pitch_mm"], dpi, coverage, darkness)
 
     if save_filled_to:
         save_filled_to = Path(save_filled_to)
@@ -206,6 +216,23 @@ def verify_sheet(
 
     result.marks_awarded = sum(g.marks_awarded for g in grades)
     result.marks_possible = marks_per_mcq * len(grades)
+    numerical_entries = {entry["q_no"]: entry for entry in manifest.get("numerical_block", [])}
+    for reading in read_numerical_responses(arrays, manifest, dpi):
+        want = intended_numbers[reading.q_no]
+        marks = numerical_entries[reading.q_no]["max_marks"]
+        result.marks_possible += marks
+        if reading.digits_text == want:
+            result.recovered += 1
+            result.marks_awarded += marks
+        else:
+            result.mismatches.append(f"Q{reading.q_no}: filled '{want}' but read {reading.outcome} as {reading.digits_text}")
+        result.flagged.extend(f"Q{reading.q_no}: {flag}" for flag in reading.review_flags)
+        for column, expected_digit in zip(reading.columns, want):
+            for digit, ratio in column["fill_ratios"].items():
+                if digit == expected_digit:
+                    result.min_filled_ratio = min(result.min_filled_ratio, ratio)
+                else:
+                    result.max_empty_ratio = max(result.max_empty_ratio, ratio)
     return result
 
 

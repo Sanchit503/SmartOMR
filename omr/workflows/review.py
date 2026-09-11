@@ -206,6 +206,8 @@ def _student_from_parse_index(
         "student_email": detail_student.get("email") or student.get("student_email"),
         "mcq_score": student.get("mcq_score"),
         "mcq_total": student.get("mcq_total"),
+        "numerical_score": student.get("numerical_score", 0.0),
+        "numerical_total": student.get("numerical_total", 0.0),
         "pages": pages,
         "manual_pages": [],
         "pages_found": pages_found,

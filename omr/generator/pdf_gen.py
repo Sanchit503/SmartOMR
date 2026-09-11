@@ -33,17 +33,14 @@ from .metrics import (
     MCQ_LABEL_OFFSET_MM,
     MCQ_OPTION_HEADER_MM,
     MCQ_OPTION_PITCH_MM,
-    NUMERIC_DIGIT_PITCH_MM,
-    NUMERIC_LABEL_OFFSET_MM,
-    NUMERIC_PLACE_LABEL_DX_MM,
-    NUMERIC_PLACE_ROW_PITCH_MM,
+    NUMERICAL_GRID_OFFSET_X_MM,
+    NUMERICAL_GRID_OFFSET_Y_MM,
     PAGE_HEIGHT_MM,
     PAGE_WIDTH_MM,
-    PROGRAM_SELECTOR_Y_MM,
-    ROLL_WRITE_IN_TOP_MM,
     WRITTEN_HEADER_MM,
     WRITTEN_LINE_MM,
     identity_box,
+    numerical_slot_width_mm,
 )
 
 # ReportLab measures from the bottom-left; the manifest measures from the
@@ -53,12 +50,23 @@ BOX_RULE_PT = 0.9
 
 MIN_FONT_PT = 5.5  # floor for the auto-shrink below
 
+NUMERICAL_PLACE_VALUE_LABELS = (
+    "Ones",
+    "Tens",
+    "Hundreds",
+    "Thousands",
+    "Ten thousands",
+    "Hundred thousands",
+    "Millions",
+    "Ten millions",
+)
+
 INSTRUCTION_LINE_1 = (
     "Fill each bubble completely with a dark pen or pencil. Do not fold or tear the sheet, "
     "and keep all marks away from the black corner squares."
 )
 INSTRUCTION_LINE_2 = (
-    "Bubble your program, then write and bubble your roll number. "
+    "Bubble your program, then write and bubble your roll number in THAT program's grid only. "
     "Write your roll number on every page of this sheet."
 )
 
@@ -111,8 +119,8 @@ def render_pdf(layout: SheetLayout, output_path: str | Path) -> Path:
     c.setTitle(f"{layout.exam_id} - OMR answer sheet")
 
     mcq_pages = sorted({e.page for e in layout.mcq_entries})
-    numeric_pages = sorted({e.page for e in layout.numeric_entries})
     written_pages = sorted({e.page for e in layout.written_entries})
+    numerical_pages = sorted({e.page for e in layout.numerical_entries})
 
     for page_no in range(1, layout.num_pages + 1):
         _draw_registration_marks(c, layout, page_no)
@@ -122,7 +130,7 @@ def render_pdf(layout: SheetLayout, output_path: str | Path) -> Path:
         else:
             _draw_continuation_identity(c, layout, page_no)
         _draw_mcq_block(c, layout, page_no, is_first=bool(mcq_pages) and page_no == mcq_pages[0])
-        _draw_numeric_block(c, layout, page_no, is_first=bool(numeric_pages) and page_no == numeric_pages[0])
+        _draw_numerical_block(c, layout, page_no, is_first=bool(numerical_pages) and page_no == numerical_pages[0])
         _draw_written_block(c, layout, page_no, is_first=bool(written_pages) and page_no == written_pages[0])
         c.showPage()
 
@@ -231,23 +239,20 @@ def _draw_identity_block(c: canvas.Canvas, layout: SheetLayout) -> None:
     c.setFillColorRGB(0, 0, 0)
     _draw_identity_border(c, 1)
 
-    c.setFont("Helvetica-Bold", 8.5)
-    c.drawString(MARGIN_MM * mm, _y(PROGRAM_SELECTOR_Y_MM) - 3, "Program:")
-    c.drawString(MARGIN_MM * mm, _y(ROLL_WRITE_IN_TOP_MM - 2.0) - 3, "Roll No.")
-    for program, title in (
-        ("BTECH", "BTECH"),
-        ("MTECH", "MTECH"),
-        ("PHD", "PHD"),
-    ):
+    # BTech has seven numeric digits. MTech and PhD each have a textual
+    # prefix plus five numeric digits, so their selectors share one grid.
+    for program in ("BTECH", "MTECH", "PHD"):
         sx, sy = rb.program_selector[program]
         c.setLineWidth(1)
         c.circle(sx * mm, _y(sy), BUBBLE_RADIUS_MM * mm, stroke=1, fill=0)
         c.setFont("Helvetica-Bold", 8.5)
-        c.drawString((sx + BUBBLE_RADIUS_MM + 2.5) * mm, _y(sy) - 3, title)
-        grid = rb.btech_digits
-        if program != "BTECH":
-            continue
+        c.drawString((sx + BUBBLE_RADIUS_MM + 2.5) * mm, _y(sy) - 3, program)
 
+    c.setFont("Helvetica-Bold", 8.0)
+    c.drawString(49.0 * mm, _y(rb.program_selector["BTECH"][1]) - 3, "BTech Roll No. (7 digits)")
+    c.drawString(169.0 * mm, _y(rb.program_selector["MTECH"][1]) - 3, "5 digits")
+
+    for grid in (rb.btech_digits, rb.mtech_digits):
         # Digit labels go in a column to the LEFT of the grid, never inside a
         # bubble — one label serves the whole row, since every column of a
         # roll grid shares the same digit ordering.
@@ -264,7 +269,7 @@ def _draw_identity_block(c: canvas.Canvas, layout: SheetLayout) -> None:
                 c.circle(cx * mm, _y(cy), BUBBLE_RADIUS_MM * mm, stroke=1, fill=0)
 
     for fld in layout.write_in_fields:
-        if fld.page == 1 and fld.name == "roll_number" and fld.program == "BTECH":
+        if fld.page == 1 and fld.name == "roll_number":
             _draw_write_in(c, fld)
 
 
@@ -280,21 +285,22 @@ def _draw_continuation_identity(c: canvas.Canvas, layout: SheetLayout, page_no: 
 
     if choices:
         c.setLineWidth(1)
-        titles = {
-            "BTECH": "BTech Roll No.  (7 digits)",
-            "MTECH": "MTech Roll No.  (MT + 5 digits)",
-            "PHD": "PhD Roll No.  (PhD + 5 digits)",
-        }
         for choice in sorted(choices, key=lambda c: c.x_mm):
             c.circle(choice.x_mm * mm, _y(choice.y_mm), choice.radius_mm * mm, stroke=1, fill=0)
             text_x = choice.x_mm + choice.radius_mm + 2.0
             text_y = _y(choice.y_mm) - 3
             c.setFont("Helvetica-Bold", 7.8)
             c.drawString(text_x * mm, text_y, choice.program)
-            title_x = text_x + c.stringWidth(choice.program, "Helvetica-Bold", 7.8) / mm + 3.0
-            c.drawString(title_x * mm, text_y, titles[choice.program])
+        c.setFont("Helvetica-Bold", 7.5)
+        c.drawString(47.0 * mm, _y(choices[0].y_mm) - 3, "BTech Roll No. (7 digits)")
+        c.drawString(174.0 * mm, _y(choices[0].y_mm) - 3, "5 digits")
 
+    seen_fields = set()
     for fld in fields:
+        geometry = (fld.x_mm, fld.y_mm, fld.width_mm, fld.height_mm, fld.cells, fld.cell_pitch_mm)
+        if geometry in seen_fields:
+            continue
+        seen_fields.add(geometry)
         _draw_write_in(c, fld)
 
 
@@ -335,44 +341,45 @@ def _draw_mcq_block(c: canvas.Canvas, layout: SheetLayout, page_no: int, is_firs
             c.circle(ox * mm, _y(entry.y_mm), BUBBLE_RADIUS_MM * mm, stroke=1, fill=0)
 
 
-def _draw_numeric_block(c: canvas.Canvas, layout: SheetLayout, page_no: int, is_first: bool) -> None:
-    entries = [e for e in layout.numeric_entries if e.page == page_no]
+def _draw_numerical_block(c: canvas.Canvas, layout: SheetLayout, page_no: int, is_first: bool) -> None:
+    entries = [e for e in layout.numerical_entries if e.page == page_no]
     if not entries:
         return
-    c.setFillColorRGB(0, 0, 0)
-
-    top_y = min(e.y_mm for e in entries)
-    c.setFont("Helvetica-Bold", 10)
+    top = entries[0].y_mm - NUMERICAL_GRID_OFFSET_Y_MM
+    section = "B" if layout.mcq_entries else "A"
     suffix = "" if is_first else "  (continued)"
-    marks = _marks(entries[0].max_marks)
-    c.drawString(
-        MARGIN_MM * mm,
-        _y(top_y - MCQ_OPTION_HEADER_MM - 4),
-        f"Section N - Numeric Answers  [{marks} mark each]{suffix}",
-    )
-
-    c.setFont("Helvetica-Bold", 6.3)
-    for col_x in sorted({e.x_mm for e in entries}):
-        for digit in range(10):
-            x = col_x + NUMERIC_LABEL_OFFSET_MM + digit * NUMERIC_DIGIT_PITCH_MM
-            c.drawCentredString(x * mm, _y(top_y - MCQ_OPTION_HEADER_MM) - 2, str(digit))
-
+    c.setFillColorRGB(0, 0, 0)
+    c.setFont("Helvetica-Bold", 10)
+    c.drawString(MARGIN_MM * mm, _y(top - 8), f"Section {section} - Numerical Answers{suffix}")
+    c.setFont("Helvetica", 7.5)
+    c.drawString(MARGIN_MM * mm, _y(top - 3),
+                 "Whole numbers only. Fill one bubble in every place-value row; use leading zeros "
+                 "(e.g. 7 as 007 in a 3-digit grid).")
     for entry in entries:
-        c.setFont("Helvetica", 8)
-        c.drawString(
-            entry.x_mm * mm,
-            _y(entry.y_mm + NUMERIC_PLACE_ROW_PITCH_MM / 2) - 2.5,
-            f"Q{entry.q_no}",
-        )
-        for place in range(entry.digits):
-            y = entry.y_mm + place * NUMERIC_PLACE_ROW_PITCH_MM
+        left = entry.x_mm - NUMERICAL_GRID_OFFSET_X_MM
+        slot_top = entry.y_mm - NUMERICAL_GRID_OFFSET_Y_MM
+        digit_label = "digit" if entry.positions == 1 else "digits"
+        _draw_fitted(c, left, slot_top + 2,
+                     f"Q{entry.q_no}  [{_marks(entry.max_marks)} marks]  {entry.positions} {digit_label}",
+                     "Helvetica-Bold", 8, numerical_slot_width_mm(entry.positions))
+        c.setLineWidth(HAIRLINE_PT)
+        c.setFont("Helvetica", 6.5)
+        for digit in range(10):
+            x = entry.x_mm + digit * entry.digit_pitch_mm
+            c.drawCentredString(x * mm, _y(entry.y_mm - 5.0) - 2.2, str(digit))
+        for position in range(entry.positions):
+            y = entry.y_mm + position * entry.position_pitch_mm
             c.setFont("Helvetica", 6.5)
-            label = "Tens" if entry.digits == 2 and place == 0 else "Ones" if entry.digits == 2 and place == 1 else f"D{place + 1}"
-            c.drawRightString((entry.x_mm + NUMERIC_PLACE_LABEL_DX_MM) * mm, _y(y) - 2.2, label)
+            place_power = entry.positions - position - 1
+            c.drawRightString(
+                (entry.x_mm - BUBBLE_RADIUS_MM - 2.5) * mm,
+                _y(y) - 2.2,
+                NUMERICAL_PLACE_VALUE_LABELS[place_power],
+            )
             c.setLineWidth(1)
             for digit in range(10):
-                x = entry.x_mm + NUMERIC_LABEL_OFFSET_MM + digit * NUMERIC_DIGIT_PITCH_MM
-                c.circle(x * mm, _y(y), BUBBLE_RADIUS_MM * mm, stroke=1, fill=0)
+                c.circle((entry.x_mm + digit * entry.digit_pitch_mm) * mm, _y(y),
+                         BUBBLE_RADIUS_MM * mm, stroke=1, fill=0)
 
 
 def _draw_written_block(c: canvas.Canvas, layout: SheetLayout, page_no: int, is_first: bool) -> None:
@@ -382,8 +389,9 @@ def _draw_written_block(c: canvas.Canvas, layout: SheetLayout, page_no: int, is_
     c.setFillColorRGB(0, 0, 0)
     c.setFont("Helvetica-Bold", 10)
     suffix = "" if is_first else "  (continued)"
+    section = "C" if layout.numerical_entries and layout.mcq_entries else "B"
     c.drawString(
-        MARGIN_MM * mm, _y(entries[0].y_mm - WRITTEN_HEADER_MM - 4), f"Section B - Written Answers{suffix}"
+        MARGIN_MM * mm, _y(entries[0].y_mm - WRITTEN_HEADER_MM - 4), f"Section {section} - Written Answers{suffix}"
     )
 
     for entry in entries:

@@ -1,0 +1,17 @@
+{
+  "exam_id": "NUMERICAL_PILOT",
+  "course_code": "DEMO101",
+  "exam_name": "Mixed Answer Pilot",
+  "exam_type": "quiz",
+  "num_mcq": 5,
+  "marks_per_mcq": 1,
+  "numerical_questions": [
+    {"q_no": 6, "max_marks": 2, "digits": 2},
+    {"q_no": 7, "max_marks": 2, "digits": 3},
+    {"q_no": 8, "max_marks": 3, "digits": 4}
+  ],
+  "written_questions": [
+    {"q_no": 9, "max_marks": 3, "lines": 2},
+    {"q_no": 10, "max_marks": 3, "lines": 2}
+  ]
+}

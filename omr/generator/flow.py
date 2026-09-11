@@ -9,17 +9,17 @@ as three pages with a third of page 1 left blank, purely because the layout
 engine took a different branch once the exam stopped fitting on one sheet.
 
 So: one cursor walks down page 1, then page 2, and so on. Section A (MCQs)
-is placed first, Section B (written answers) continues from wherever
-Section A ended — on the same page if there is room, on the next page if
-there isn't. A page break happens only when the next thing genuinely does
+is placed first, numerical answers second, and written answers continue
+from wherever the preceding section ended — on the same page if there is
+room, on the next page if there isn't. A page break happens only when the next thing genuinely does
 not fit, which makes an empty or half-empty page structurally impossible
 rather than something to remember not to produce.
 
 Two things this deliberately does NOT do:
 
-*Interleave sections.* All MCQs precede all written answers, and a page
-break never splits a single answer box. That mirrors how a real exam paper
-reads (Section A complete, then Section B) and keeps the parser's job to
+*Interleave sections.* All MCQs precede all numerical grids, which precede
+all written answers. A page break never splits one grid or answer box. That
+mirrors how a real exam paper reads and keeps the parser's job to
 "read the coordinates the manifest gives you".
 
 *Vary the MCQ column count per page.* The count is chosen once for the whole
@@ -40,12 +40,13 @@ from .metrics import (
     MARGIN_MM,
     MCQ_COLUMN_CANDIDATES,
     MCQ_ROW_PITCH_MM,
-    NUMERIC_DIGIT_PITCH_MM,
-    NUMERIC_LABEL_OFFSET_MM,
-    NUMERIC_PLACE_ROW_PITCH_MM,
-    NUMERIC_QUESTION_GAP_MM,
-    NUMERIC_QUESTION_ROW_PITCH_MM,
-    NUMERIC_SECTION_GAP_MM,
+    NUMERICAL_COLUMN_GAP_MM,
+    NUMERICAL_GRID_OFFSET_X_MM,
+    NUMERICAL_GRID_OFFSET_Y_MM,
+    NUMERICAL_DIGIT_PITCH_MM,
+    NUMERICAL_POSITION_PITCH_MM,
+    NUMERICAL_QUESTION_GAP_MM,
+    NUMERICAL_SECTION_HEADER_MM,
     PAGE_BOTTOM_MM,
     SECTION_GAP_MM,
     SECTION_HEADER_MM,
@@ -57,11 +58,8 @@ from .metrics import (
     mcq_first_row_y_mm,
     mcq_rows_that_fit,
     min_mcq_column_width_mm,
-    min_numeric_column_width_mm,
-    numeric_block_bottom_mm,
-    numeric_first_row_y_mm,
-    numeric_question_height_mm,
-    numeric_rows_that_fit,
+    numerical_slot_width_mm,
+    numerical_slot_height_mm,
     usable_width_mm,
     written_box_height_mm,
     written_slot_height_mm,
@@ -97,14 +95,13 @@ class WrittenEntry:
 
 
 @dataclass(frozen=True)
-class NumericEntry:
-    """One numeric-answer item. `x_mm` is the question label edge; each digit
-    place is drawn as one 0-9 bubble row, starting at `y_mm`."""
-
+class NumericalEntry:
     q_no: int
     x_mm: float
     y_mm: float
-    digits: int
+    positions: int
+    digit_pitch_mm: float
+    position_pitch_mm: float
     max_marks: float
     page: int = 1
 
@@ -112,17 +109,13 @@ class NumericEntry:
 @dataclass
 class FlowResult:
     mcq_entries: list[MCQEntry] = field(default_factory=list)
-    numeric_entries: list[NumericEntry] = field(default_factory=list)
     written_entries: list[WrittenEntry] = field(default_factory=list)
     num_pages: int = 1
     mcq_columns: int = 0
+    numerical_entries: list[NumericalEntry] = field(default_factory=list)
 
     def pages_with_content(self) -> set[int]:
-        return (
-            {e.page for e in self.mcq_entries}
-            | {e.page for e in self.numeric_entries}
-            | {e.page for e in self.written_entries}
-        )
+        return {e.page for e in self.mcq_entries + self.numerical_entries + self.written_entries}
 
 
 class LayoutTooTight(ValueError):
@@ -184,15 +177,16 @@ def _place_mcqs(cur: _Cursor, num_mcq: int, option_letters: list[str], columns: 
     return entries
 
 
-def _place_written(cur: _Cursor, written_questions, after_mcqs: bool) -> list[WrittenEntry]:
-    """Continue from wherever the MCQs ended. This is the behaviour the whole
-    module exists for: a written box goes on the current page if it fits
+def _place_written(cur: _Cursor, written_questions, after_content: bool) -> list[WrittenEntry]:
+    """Continue from wherever the preceding objective section ended.
+
+    A written box goes on the current page if it fits
     there, and only then on the next one."""
     entries: list[WrittenEntry] = []
     if not written_questions:
         return entries
 
-    if after_mcqs:
+    if after_content:
         cur.y += SECTION_GAP_MM
 
     width = usable_width_mm()
@@ -237,44 +231,40 @@ def _place_written(cur: _Cursor, written_questions, after_mcqs: bool) -> list[Wr
     return entries
 
 
-def _place_numeric(cur: _Cursor, config, after_mcqs: bool) -> list[NumericEntry]:
-    entries: list[NumericEntry] = []
-    if config.num_numeric == 0:
+def _place_numerical(cur: _Cursor, questions, after_mcqs: bool) -> list[NumericalEntry]:
+    entries: list[NumericalEntry] = []
+    if not questions:
         return entries
-
     if after_mcqs:
-        cur.y += NUMERIC_SECTION_GAP_MM
-
-    columns = 2 if usable_width_mm() / 2 >= min_numeric_column_width_mm(config.numeric_digits) else 1
-    col_width = usable_width_mm() / columns
-    remaining = list(range(config.num_mcq + 1, config.num_mcq + config.num_numeric + 1))
-
+        cur.y += SECTION_GAP_MM
+    remaining = list(questions)
+    needs_header = True
+    slots_per_row = 2
     while remaining:
-        rows_available = numeric_rows_that_fit(cur.y, config.numeric_digits)
-        if rows_available < 1:
+        header = NUMERICAL_SECTION_HEADER_MM if needs_header else 0.0
+        row = remaining[:slots_per_row]
+        row_height = max(numerical_slot_height_mm(question.digits) for question in row)
+        if cur.y + header + row_height > PAGE_BOTTOM_MM + EPS:
             cur.next_page()
+            needs_header = True
             continue
-
-        take = min(len(remaining), rows_available * columns)
-        rows_used = math.ceil(take / columns)
-        y0 = numeric_first_row_y_mm(cur.y)
-        for i, q_no in enumerate(remaining[:take]):
-            col, row = divmod(i, rows_used)
-            entries.append(
-                NumericEntry(
-                    q_no=q_no,
-                    x_mm=MARGIN_MM + col * col_width,
-                    y_mm=y0 + row * numeric_question_height_mm(config.numeric_digits),
-                    digits=config.numeric_digits,
-                    max_marks=config.marks_per_numeric,
-                    page=cur.page,
-                )
-            )
-        cur.y = numeric_block_bottom_mm(cur.y, rows_used, config.numeric_digits) + NUMERIC_QUESTION_GAP_MM
-        remaining = remaining[take:]
-        if remaining:
-            cur.next_page()
-
+        cur.y += header
+        needs_header = False
+        for column, question in enumerate(row):
+            width = numerical_slot_width_mm(question.digits)
+            x = MARGIN_MM + column * (width + NUMERICAL_COLUMN_GAP_MM)
+            entries.append(NumericalEntry(
+                q_no=question.q_no,
+                x_mm=x + NUMERICAL_GRID_OFFSET_X_MM,
+                y_mm=cur.y + NUMERICAL_GRID_OFFSET_Y_MM,
+                positions=question.digits,
+                digit_pitch_mm=NUMERICAL_DIGIT_PITCH_MM,
+                position_pitch_mm=NUMERICAL_POSITION_PITCH_MM,
+                max_marks=question.max_marks,
+                page=cur.page,
+            ))
+        remaining = remaining[len(row):]
+        cur.y += row_height + NUMERICAL_QUESTION_GAP_MM
     return entries
 
 
@@ -286,18 +276,14 @@ def _flow_with(config, option_letters: list[str], columns: int) -> FlowResult | 
 
     cur = _Cursor(page=1, y=content_top_mm(1))
     mcq_entries = _place_mcqs(cur, config.num_mcq, option_letters, columns)
-    numeric_entries = _place_numeric(cur, config, after_mcqs=bool(mcq_entries))
-    written_entries = _place_written(
-        cur,
-        config.written_questions,
-        after_mcqs=bool(mcq_entries or numeric_entries),
-    )
+    numerical_entries = _place_numerical(cur, config.numerical_questions, after_mcqs=bool(mcq_entries))
+    written_entries = _place_written(cur, config.written_questions, after_content=bool(mcq_entries or numerical_entries))
     return FlowResult(
         mcq_entries=mcq_entries,
-        numeric_entries=numeric_entries,
         written_entries=written_entries,
         num_pages=cur.page,
         mcq_columns=columns if config.num_mcq else 0,
+        numerical_entries=numerical_entries,
     )
 
 

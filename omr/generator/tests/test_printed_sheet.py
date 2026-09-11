@@ -16,7 +16,7 @@ import pymupdf
 import pytest
 
 from omr.contracts.geometry import mm_to_px, px_per_mm
-from omr.generator.config import ExamConfig, WrittenQuestionConfig
+from omr.generator.config import ExamConfig, NumericalQuestionConfig, WrittenQuestionConfig
 from omr.generator.generate import generate_exam
 from omr.generator.metrics import (
     BUBBLE_RADIUS_MM,
@@ -25,6 +25,7 @@ from omr.generator.metrics import (
     CONT_MTECH_SELECTOR_X_MM,
     CONT_PROGRAM_SELECTOR_Y_MM,
     MARGIN_MM,
+    NUMERICAL_GRID_OFFSET_X_MM,
     PAGE_HEIGHT_MM,
     PAGE_WIDTH_MM,
     corner_keepouts,
@@ -150,6 +151,41 @@ def test_student_fill_signal_resists_shifted_empty_bubble_outline(tmp_path):
 
     assert full_ratio > 0.02, "test setup should include leaked outline ink"
     assert student_ratio < 0.02
+
+
+def test_numerical_rows_use_place_values_without_redundant_write_in_boxes(tmp_path):
+    result = generate_exam(
+        a_config(
+            num_mcq=0,
+            numerical_questions=[NumericalQuestionConfig(q_no=1, max_marks=1, digits=3)],
+            written_questions=[],
+        ),
+        tmp_path,
+    )
+    entry = result["manifest"]["numerical_block"][0]
+    points_per_mm = 72 / 25.4
+
+    with pymupdf.open(result["pdf_path"]) as document:
+        page = document[0]
+        text = page.get_text()
+        assert all(label in text for label in ("Hundreds", "Tens", "Ones"))
+        assert text.index("Hundreds") < text.index("Tens") < text.index("Ones")
+        assert "Digit 1" not in text
+
+        # No small vector rectangle should remain in the lane between the
+        # place-value label and its first 0-9 bubble.
+        for drawing in page.get_drawings():
+            if not any(item[0] == "re" for item in drawing["items"]):
+                continue
+            rect = drawing["rect"]
+            center_x_mm = (rect.x0 + rect.x1) / 2 / points_per_mm
+            center_y_mm = (rect.y0 + rect.y1) / 2 / points_per_mm
+            for position in range(entry["positions"]):
+                row_y_mm = entry["y_mm"] + position * entry["position_pitch_mm"]
+                assert not (
+                    entry["x_mm"] - NUMERICAL_GRID_OFFSET_X_MM / 2 < center_x_mm < entry["x_mm"] - 3
+                    and abs(center_y_mm - row_y_mm) < 4
+                ), "a redundant numerical write-in box was printed"
 
 
 # ---------------------------------------------------------------------------

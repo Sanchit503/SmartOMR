@@ -84,6 +84,30 @@ def test_manifest_from_a_future_schema_version_is_refused_not_guessed():
         validate_manifest(a_manifest(schema_version=MANIFEST_SCHEMA_VERSION + 1))
 
 
+def test_v4_manifest_without_numerical_or_phd_fields_remains_readable():
+    manifest = a_manifest()
+    manifest["schema_version"] = 4
+    manifest.pop("numerical_block")
+    manifest["roll_number_block"]["program_selector"].pop("PHD")
+    manifest["roll_number_block"].pop("program_grid_keys")
+    manifest["continuation_program_choices"] = [
+        choice for choice in manifest["continuation_program_choices"] if choice["program"] != "PHD"
+    ]
+    for field in manifest["write_in_fields"]:
+        if "MTECH" in field.get("programs", []):
+            field["program"] = "MTECH"
+        field.pop("programs", None)
+
+    assert validate_manifest(manifest) is manifest
+
+
+def test_v5_manifest_missing_phd_selector_is_rejected():
+    manifest = a_manifest()
+    manifest["roll_number_block"]["program_selector"].pop("PHD")
+    with pytest.raises(ManifestError, match="program selectors"):
+        validate_manifest(manifest)
+
+
 def test_entry_pointing_past_the_last_page_is_rejected():
     manifest = a_manifest()
     manifest["mcq_block"][0]["page"] = manifest["num_pages"] + 1

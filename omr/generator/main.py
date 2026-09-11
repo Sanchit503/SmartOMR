@@ -20,7 +20,7 @@ from pathlib import Path
 
 from pydantic import ValidationError
 
-from .config import DEFAULT_UNIVERSITY_NAME, ExamConfig, WrittenQuestionConfig
+from .config import DEFAULT_UNIVERSITY_NAME, ExamConfig, NumericalQuestionConfig, WrittenQuestionConfig
 from .generate import generate_exam
 
 DEFAULT_OUTPUT_DIR = Path(__file__).resolve().parents[2] / "data" / "exams"
@@ -82,10 +82,9 @@ def ask_yes_no(prompt: str, default: bool = True) -> bool:
 def prompt_for_config() -> ExamConfig:
     """Ask for an exam's requirements one at a time.
 
-    Written questions are asked for in bulk first — most exams use the same
-    marks and line count for every short answer, so asking 10 times for the
-    same two numbers is just friction. Only if the questions actually differ
-    does it fall through to per-question prompts.
+    Numerical and written questions are asked for in bulk first because most
+    exams reuse one grid/box shape. Only differing questions fall through to
+    per-question prompts.
     """
     # Plain ASCII on purpose: the default Windows console codepage mangles
     # non-ASCII punctuation into replacement characters.
@@ -107,15 +106,28 @@ def prompt_for_config() -> ExamConfig:
         mcq_options = ask_int_range("How many options per MCQ (A-B up to A-F)?", 2, 6, default="4")
         marks_per_mcq = ask("Marks per correct MCQ", default="1", cast=float)
 
-    print("\n-- Section N: Numeric answers --")
-    num_numeric = ask("How many numeric questions?", default="0", cast=int)
-    numeric_digits = 2
-    marks_per_numeric = 1.0
-    if num_numeric > 0:
-        marks_per_numeric = ask("Marks per numeric question", default="1", cast=float)
-        numeric_digits = ask_int_range("Maximum digits per numeric answer", 1, 4, default="2")
+    print("\n-- Numerical answers (non-negative whole numbers) --")
+    num_numerical = ask_int_range("How many numerical questions?", 0, 1000, default="0")
+    numerical_questions: list[NumericalQuestionConfig] = []
+    if num_numerical:
+        uniform = num_numerical == 1 or ask_yes_no(
+            f"Do all {num_numerical} numerical questions have the same marks and maximum digits?"
+        )
+        if uniform:
+            max_marks = ask("  Max marks for each numerical question", default="1", cast=float)
+            digits = ask_int_range("  Maximum digits per answer", 1, 8, default="3")
+            numerical_questions = [
+                NumericalQuestionConfig(q_no=num_mcq + i + 1, max_marks=max_marks, digits=digits)
+                for i in range(num_numerical)
+            ]
+        else:
+            for i in range(num_numerical):
+                q_no = num_mcq + i + 1
+                max_marks = ask(f"  Max marks for Q{q_no}", default="1", cast=float)
+                digits = ask_int_range(f"  Maximum digits for Q{q_no}", 1, 8, default="3")
+                numerical_questions.append(NumericalQuestionConfig(q_no=q_no, max_marks=max_marks, digits=digits))
 
-    print("\n-- Section B: Written answers --")
+    print("\n-- Written answers --")
     num_written = ask("How many written questions?", default="0", cast=int)
     written_questions: list[WrittenQuestionConfig] = []
 
@@ -127,12 +139,12 @@ def prompt_for_config() -> ExamConfig:
             max_marks = ask("  Max marks for each", default="5", cast=float)
             lines = ask("  Answer lines for each (2 = a two-line short answer)", default="2", cast=int)
             written_questions = [
-                WrittenQuestionConfig(q_no=num_mcq + num_numeric + i + 1, max_marks=max_marks, lines=lines)
+                WrittenQuestionConfig(q_no=num_mcq + num_numerical + i + 1, max_marks=max_marks, lines=lines)
                 for i in range(num_written)
             ]
         else:
             for i in range(num_written):
-                q_no = num_mcq + num_numeric + i + 1
+                q_no = num_mcq + num_numerical + i + 1
                 print(f"  -- Q{q_no} --")
                 max_marks = ask(f"    Max marks for Q{q_no}", default="5", cast=float)
                 lines = ask(f"    Answer lines for Q{q_no}", default="2", cast=int)
@@ -149,10 +161,8 @@ def prompt_for_config() -> ExamConfig:
         num_mcq=num_mcq,
         mcq_options=mcq_options,
         marks_per_mcq=marks_per_mcq,
-        num_numeric=num_numeric,
-        numeric_digits=numeric_digits,
-        marks_per_numeric=marks_per_numeric,
         written_questions=written_questions,
+        numerical_questions=numerical_questions,
     )
 
 

@@ -28,6 +28,8 @@ def _write_student(
     verified: bool,
     mcq_score: float | None = 8,
     mcq_total: float | None = 10,
+    numerical_score: float | None = 0,
+    numerical_total: float | None = 0,
 ) -> dict:
     student_dir = parsed_dir / "students" / roll_no
     written = []
@@ -73,6 +75,8 @@ def _write_student(
         "student_email": f"{roll_no}@example.edu",
         "mcq_score": mcq_score,
         "mcq_total": mcq_total,
+        "numerical_score": numerical_score,
+        "numerical_total": numerical_total,
         "pages_found": [1, 2],
         "missing_pages": [],
         "source_indices": [1, 2],
@@ -85,10 +89,22 @@ def _write_student(
     }
 
 
-def _write_verified_index(tmp_path: Path) -> Path:
+def _write_verified_index(
+    tmp_path: Path,
+    *,
+    numerical_score: float | None = 0,
+    numerical_total: float | None = 0,
+) -> Path:
     parsed_dir = tmp_path / "parsed" / "WRITTEN_EXAM"
     parsed_dir.mkdir(parents=True)
-    verified_student = _write_student(parsed_dir, "2024001", status="verified", verified=True)
+    verified_student = _write_student(
+        parsed_dir,
+        "2024001",
+        status="verified",
+        verified=True,
+        numerical_score=numerical_score,
+        numerical_total=numerical_total,
+    )
     review_student = _write_student(parsed_dir, "2024002", status="needs_review", verified=False)
     payload = {
         "schema_version": 1,
@@ -182,7 +198,7 @@ def test_export_written_packet_includes_rubric_metadata(tmp_path: Path):
 
 
 def test_import_written_marks_writes_grades_and_final_scores(tmp_path: Path):
-    parsed_dir = _write_verified_index(tmp_path)
+    parsed_dir = _write_verified_index(tmp_path, numerical_score=3, numerical_total=4)
     rubric_path = parsed_dir / "rubric.csv"
     rubric_path.write_text(
         "q_no,question_text,rubric,model_answer,max_marks\n"
@@ -209,10 +225,13 @@ def test_import_written_marks_writes_grades_and_final_scores(tmp_path: Path):
     assert student["written_status"] == "complete"
     assert student["written_score"] == 3.5
     assert student["written_total"] == 4.0
-    assert student["total_score"] == 11.5
-    assert student["total_marks"] == 14.0
+    assert student["numerical_score"] == 3
+    assert student["numerical_total"] == 4
+    assert student["total_score"] == 14.5
+    assert student["total_marks"] == 18.0
     final_rows = _csv_rows(parsed_dir / "written_grading" / "final_scores.csv")
-    assert final_rows[0]["total_score"] == "11.5"
+    assert final_rows[0]["total_score"] == "14.5"
+    assert final_rows[0]["numerical_score"] == "3"
     grade_rows = _csv_rows(parsed_dir / "written_grading" / "written_grades_report.csv")
     assert grade_rows[1]["marks_awarded"] == "1.5"
     assert "answers_graded=2" in load_written_summary(parsed_dir)

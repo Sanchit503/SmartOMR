@@ -16,7 +16,7 @@ sheet lives in this folder:
 
 Run it with:  python -m omr.generator.main
 """
-from .config import ExamConfig, WrittenQuestionConfig
+from .config import ExamConfig, NumericalQuestionConfig, WrittenQuestionConfig
 from .generate import generate_exam
 from .layout import SheetLayout, build_layout
 from .manifest import build_manifest, save_manifest
@@ -25,6 +25,7 @@ from .preflight import check_sheet
 
 __all__ = [
     "ExamConfig",
+    "NumericalQuestionConfig",
     "SheetLayout",
     "WrittenQuestionConfig",
     "build_layout",

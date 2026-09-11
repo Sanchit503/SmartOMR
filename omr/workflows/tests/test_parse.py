@@ -8,10 +8,11 @@ import numpy as np
 import pymupdf
 from PIL import Image, ImageDraw
 
-from omr.contracts.geometry import MM_PER_INCH, mm_to_px, px_per_mm
-from omr.generator.config import ExamConfig, WrittenQuestionConfig
+from omr.contracts.geometry import MM_PER_INCH, digit_grid_centers_mm, mm_to_px, px_per_mm
+from omr.generator.config import ExamConfig, NumericalQuestionConfig, WrittenQuestionConfig
 from omr.generator.generate import generate_exam
-from omr.workflows.parse import parse_scan, parse_scans
+from omr.models import AnswerKeyEntry
+from omr.workflows.parse import _numerical_payload, parse_scan, parse_scans
 
 DPI = 200
 
@@ -262,3 +263,39 @@ def test_parse_scan_can_still_fail_on_missing_pages_in_strict_mode(tmp_path: Pat
         assert False, "strict mode should reject a missing page"
     except Exception as exc:
         assert "missing page(s): 2" in str(exc)
+
+
+def test_numerical_payload_scores_value_and_preserves_written_digits(tmp_path: Path):
+    result = generate_exam(
+        ExamConfig(
+            exam_id="NUMERICAL_SCORE_TEST",
+            course_code="CSE202",
+            exam_name="Numerical Quiz",
+            exam_type="quiz",
+            num_mcq=0,
+            numerical_questions=[NumericalQuestionConfig(q_no=1, max_marks=2, digits=3)],
+        ),
+        tmp_path / "numerical_exam",
+    )
+    page = _render_pages(result["pdf_path"])[1]
+    entry = result["manifest"]["numerical_block"][0]
+    draw = ImageDraw.Draw(page)
+    for position, digit in enumerate("007"):
+        _fill_bubble(draw, result["manifest"], *digit_grid_centers_mm(entry)[(position, int(digit))])
+
+    flags: list[str] = []
+    responses, score, total = _numerical_payload(
+        {1: np.asarray(page)},
+        result["manifest"],
+        DPI,
+        {1: AnswerKeyEntry(q_no=1, answer="7", marks=2)},
+        flags,
+    )
+
+    assert score == 2
+    assert total == 2
+    assert not flags
+    assert responses[0]["digits_text"] == "007"
+    assert responses[0]["value"] == 7
+    assert responses[0]["correct_value"] == 7
+    assert responses[0]["marks_awarded"] == 2

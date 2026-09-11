@@ -143,25 +143,20 @@ IDENTITY_BOX_PAD_MM = 1.5  # blank paper between the last bubble row and the bor
 # left of it — both so a student can't mistake which grid a selector belongs
 # to, and because a separate selector row cost ~6mm of a page that has to
 # fit an entire midsem.
-PROGRAM_SELECTOR_Y_MM = 48.0
+PROGRAM_SELECTOR_Y_MM = 47.5
 ROLL_GRID_TITLE_Y_MM = PROGRAM_SELECTOR_Y_MM
-ROLL_WRITE_IN_TOP_MM = 54.0
+ROLL_WRITE_IN_TOP_MM = 51.0
 
 DIGIT_COL_PITCH_MM = 10.0
 DIGIT_ROW_PITCH_MM = 6.0  # 4mm bubble + 2mm clear between rows
-ROLL_BLOCK_TOP_MM = 67.5  # center of the digit-0 row
+ROLL_BLOCK_TOP_MM = 62.0  # center of the digit-0 row
 DIGIT_ROW_LABEL_DX_MM = 7.5  # row label sits this far LEFT of column 0
 
-ROLL_GRID_X_MM = 52.0
-ROLL_GRID_COLUMNS = 7
-PROGRAM_SELECTOR_X_MM = 42.0
-PROGRAM_SELECTOR_PITCH_MM = 49.0
-PROGRAMS = ("BTECH", "MTECH", "PHD")
-BTECH_GRID_X_MM = ROLL_GRID_X_MM
-BTECH_GRID_COLUMNS = ROLL_GRID_COLUMNS
-MTECH_GRID_X_MM = ROLL_GRID_X_MM
+BTECH_GRID_X_MM = 28.0
+BTECH_GRID_COLUMNS = 7
+MTECH_GRID_X_MM = 128.0
 MTECH_GRID_COLUMNS = 5
-PHD_GRID_COLUMNS = 5
+PHD_SELECTOR_X_MM = 153.0
 
 # ---------------------------------------------------------------------------
 # Identity block — pages 2+ (the human-read one)
@@ -178,13 +173,12 @@ CONT_IDENTITY_TOP_MM = 31.0
 CONT_IDENTITY_HEIGHT_MM = 19.0
 CONT_PROGRAM_SELECTOR_Y_MM = 35.0
 CONT_WRITE_IN_TOP_MM = 39.5
-CONT_ROLL_CELL_PITCH_MM = 9.0
-CONT_BTECH_ROLL_X_MM = MARGIN_MM + 9.0
-CONT_MTECH_ROLL_X_MM = MARGIN_MM + 78.0
-CONT_PHD_ROLL_X_MM = MARGIN_MM + 132.0
+CONT_ROLL_CELL_PITCH_MM = 12.0
+CONT_BTECH_ROLL_X_MM = MARGIN_MM + 6.0
+CONT_MTECH_ROLL_X_MM = MARGIN_MM + 120.0
 CONT_BTECH_SELECTOR_X_MM = CONT_BTECH_ROLL_X_MM + BUBBLE_RADIUS_MM
 CONT_MTECH_SELECTOR_X_MM = CONT_MTECH_ROLL_X_MM + BUBBLE_RADIUS_MM
-CONT_PHD_SELECTOR_X_MM = CONT_PHD_ROLL_X_MM + BUBBLE_RADIUS_MM
+CONT_PHD_SELECTOR_X_MM = CONT_MTECH_SELECTOR_X_MM + 25.0
 
 # ---------------------------------------------------------------------------
 # Question blocks
@@ -200,14 +194,14 @@ MCQ_OPTION_PITCH_MM = 8.0
 MCQ_LABEL_OFFSET_MM = 12.0  # "Q123" at 8pt is 8.4mm wide, so this clears it
 MCQ_COLUMN_CANDIDATES = (2, 3, 4)
 
-# Numeric answer blocks
-NUMERIC_LABEL_OFFSET_MM = 19.0
-NUMERIC_PLACE_LABEL_DX_MM = 13.0
-NUMERIC_DIGIT_PITCH_MM = 6.3
-NUMERIC_PLACE_ROW_PITCH_MM = 6.6
-NUMERIC_QUESTION_GAP_MM = 5.2
-NUMERIC_QUESTION_ROW_PITCH_MM = 0.0  # derived by numeric_question_height_mm()
-NUMERIC_SECTION_GAP_MM = 7.0
+NUMERICAL_DIGIT_PITCH_MM = 6.0
+NUMERICAL_POSITION_PITCH_MM = 7.0
+NUMERICAL_GRID_OFFSET_X_MM = 29.0
+NUMERICAL_GRID_OFFSET_Y_MM = 14.0
+NUMERICAL_COLUMN_GAP_MM = 6.0
+NUMERICAL_QUESTION_GAP_MM = 10.0
+NUMERICAL_SECTION_HEADER_MM = 12.0
+NUMERICAL_SLOT_WIDTH_MM = (PAGE_WIDTH_MM - 2 * MARGIN_MM) / 2 - NUMERICAL_COLUMN_GAP_MM / 2
 
 WRITTEN_HEADER_MM = 6.0  # "Q21 [5 marks]" label above the box
 WRITTEN_LINE_MM = 7.0  # height of one ruled writing line, same for every box
@@ -307,11 +301,6 @@ def min_mcq_column_width_mm(num_options: int) -> float:
     return MCQ_LABEL_OFFSET_MM + (num_options - 1) * MCQ_OPTION_PITCH_MM + 10.0
 
 
-def min_numeric_column_width_mm(digits: int) -> float:
-    """Question label + place label + a 0-9 row, with right-side breathing room."""
-    return NUMERIC_LABEL_OFFSET_MM + 9 * NUMERIC_DIGIT_PITCH_MM + 12.0
-
-
 def mcq_first_row_y_mm(band_top: float) -> float:
     """Center of the first MCQ row in a block whose band starts at `band_top`
     (section label, then the option-letter header, then the rows)."""
@@ -331,35 +320,20 @@ def mcq_block_bottom_mm(band_top: float, rows: int) -> float:
     return mcq_first_row_y_mm(band_top) + (rows - 1) * MCQ_ROW_PITCH_MM + BUBBLE_RADIUS_MM
 
 
-def numeric_question_height_mm(digits: int) -> float:
-    return (digits - 1) * NUMERIC_PLACE_ROW_PITCH_MM + BUBBLE_RADIUS_MM * 2 + NUMERIC_QUESTION_GAP_MM
-
-
-def numeric_first_row_y_mm(band_top: float) -> float:
-    return band_top + SECTION_HEADER_MM + MCQ_OPTION_HEADER_MM
-
-
-def numeric_rows_that_fit(band_top: float, digits: int) -> int:
-    room = PAGE_BOTTOM_MM - numeric_first_row_y_mm(band_top) - BUBBLE_RADIUS_MM
-    if room < -EPS:
-        return 0
-    return int(room // numeric_question_height_mm(digits)) + 1
-
-
-def numeric_block_bottom_mm(band_top: float, rows: int, digits: int) -> float:
-    return (
-        numeric_first_row_y_mm(band_top)
-        + (rows - 1) * numeric_question_height_mm(digits)
-        + (digits - 1) * NUMERIC_PLACE_ROW_PITCH_MM
-        + BUBBLE_RADIUS_MM
-    )
-
-
 def written_box_height_mm(lines: int) -> float:
     """Every writing line is exactly WRITTEN_LINE_MM tall regardless of how
     many there are, so a 2-line box and a 6-line box give a student the same
     room per line."""
     return lines * WRITTEN_LINE_MM
+
+
+def numerical_slot_width_mm(digits: int) -> float:
+    del digits
+    return NUMERICAL_SLOT_WIDTH_MM
+
+
+def numerical_slot_height_mm(digits: int) -> float:
+    return NUMERICAL_GRID_OFFSET_Y_MM + (digits - 1) * NUMERICAL_POSITION_PITCH_MM + BUBBLE_RADIUS_MM + 2.0
 
 
 def written_slot_height_mm(lines: int) -> float:

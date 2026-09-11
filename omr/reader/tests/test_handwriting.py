@@ -70,6 +70,8 @@ def test_handwritten_roll_normalization_is_format_aware():
     assert normalize_handwritten_roll_text(" 2024 587 ", "BTECH") == "2024587"
     assert normalize_handwritten_roll_text("MT 12345", "MTECH") == "MT12345"
     assert normalize_handwritten_roll_text("12345", "MTECH") == "MT12345"
+    assert normalize_handwritten_roll_text("PhD 20301", "PHD") == "PHD20301"
+    assert normalize_handwritten_roll_text("20301", "PHD") == "PHD20301"
     assert normalize_handwritten_roll_text("20O45B7", "BTECH") == "2004587"
     assert normalize_handwritten_roll_text("12345", "BTECH") is None
 
@@ -120,6 +122,26 @@ def test_continuation_roll_read_saves_crop_and_validates_ocr(tmp_path: Path):
     assert Path(result.crop_paths["BTECH"]).exists()
     assert len(result.cell_crop_paths["BTECH"]) == 7
     assert all(Path(path).exists() for path in result.cell_crop_paths["BTECH"])
+
+
+def test_phd_continuation_roll_uses_shared_five_cell_crop(tmp_path: Path):
+    manifest, page = _sheet(tmp_path)
+    _fill_continuation_program(ImageDraw.Draw(page), manifest, "PHD")
+
+    result = read_continuation_roll_number(
+        np.asarray(page),
+        manifest,
+        DPI,
+        2,
+        tmp_path / "identity",
+        ocr_backend=FakeOcr("PHD20301", digits="20301"),
+    )
+
+    assert result.roll_no == "PHD20301"
+    assert result.program == "PHD"
+    assert result.confidence == "high"
+    assert result.crop_paths["PHD"] == result.crop_paths["MTECH"]
+    assert len(result.cell_crop_paths["PHD"]) == 5
 
 
 def test_conflicting_handwriting_ocr_strategies_are_rejected(tmp_path: Path):

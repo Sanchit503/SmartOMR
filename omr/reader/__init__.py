@@ -27,6 +27,7 @@ from .scan import (
     load_scan_pages,
 )
 from .quality import assess_alignment_quality, save_alignment_overlay, save_alignment_report, save_sampling_overlay
+from .numerical import NumericalReading, read_numerical_responses
 from .written import crop_written_responses
 from .written_ocr import build_written_ocr_backend, read_written_answer_texts, save_written_line_crops
 
@@ -35,6 +36,7 @@ __all__ = [
     "LocalDigitModelRollOcr",
     "LocalEnsembleRollOcr",
     "LocalTesseractRollOcr",
+    "NumericalReading",
     "RollOcrResult",
     "ScanError",
     "assess_alignment_quality",
@@ -45,6 +47,7 @@ __all__ = [
     "detect_page_index",
     "load_scan_pages",
     "normalize_handwritten_roll_text",
+    "read_numerical_responses",
     "read_continuation_roll_number",
     "read_write_in_roll_number",
     "save_alignment_overlay",

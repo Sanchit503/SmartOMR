@@ -63,6 +63,7 @@ def test_wizard_asks_once_when_written_questions_are_uniform(monkeypatch):
             "20",                         # how many MCQs
             "4",                          # options per MCQ
             "1",                          # marks per MCQ
+            "0",                          # no numerical questions
             "3",                          # how many written questions
             "y",                          # all the same?
             "5",                          # marks for each
@@ -85,6 +86,7 @@ def test_wizard_asks_per_question_when_they_differ(monkeypatch):
         [
             "", "CS301", "Mid-Semester Examination", "midsem", "CS301_MIDSEM_2026A",
             "20", "4", "1",
+            "0",                          # no numerical questions
             "3",                          # how many written questions
             "n",                          # they differ
             "5", "2",                     # Q21
@@ -100,6 +102,24 @@ def test_wizard_asks_per_question_when_they_differ(monkeypatch):
     ]
 
 
+def test_wizard_collects_uniform_numerical_questions(monkeypatch):
+    feed(
+        monkeypatch,
+        [
+            "", "CS301", "Numerical Quiz", "quiz", "CS301_NUMERICAL",
+            "2", "4", "1",
+            "3", "y", "2", "3",
+            "0",
+        ],
+    )
+    config = prompt_for_config()
+    assert [(q.q_no, q.max_marks, q.digits) for q in config.numerical_questions] == [
+        (3, 2, 3),
+        (4, 2, 3),
+        (5, 2, 3),
+    ]
+
+
 def test_wizard_and_config_file_produce_identical_sheets(monkeypatch, tmp_path):
     from_config = tmp_path / "from_config"
     from_wizard = tmp_path / "from_wizard"
@@ -111,6 +131,7 @@ def test_wizard_and_config_file_produce_identical_sheets(monkeypatch, tmp_path):
         [
             "", "CS301", "Mid-Semester Examination", "midsem", "CS301_MIDSEM_2026A",
             "20", "4", "1",
+            "0",
             "3", "n", "5", "2", "5", "2", "10", "4",
         ],
     )
@@ -128,6 +149,7 @@ def test_defaults_keep_a_bare_mcq_only_quiz_to_one_page(monkeypatch, tmp_path):
             "CS201", "Quiz 3", "",   # exam type defaults to quiz
             "",                       # exam id defaults to CS201_QUIZ
             "10", "", "2",            # 10 MCQs, default 4 options, 2 marks each
+            "0",                      # no numerical questions
             "0",                      # no written questions
         ],
     )

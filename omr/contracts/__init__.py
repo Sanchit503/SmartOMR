@@ -16,6 +16,7 @@ from .geometry import (
     A4_WIDTH_MM,
     MM_PER_INCH,
     canonical_size_px,
+    digit_grid_centers_mm,
     mm_to_px,
     px_per_mm,
 )
@@ -27,6 +28,7 @@ __all__ = [
     "MM_PER_INCH",
     "MANIFEST_SCHEMA_VERSION",
     "canonical_size_px",
+    "digit_grid_centers_mm",
     "load_manifest",
     "mm_to_px",
     "px_per_mm",

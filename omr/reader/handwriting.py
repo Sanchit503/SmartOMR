@@ -62,8 +62,7 @@ class LocalDigitModelRollOcr:
             confidences.append(float(read.confidence or 0.0))
             payloads.append(_ocr_result_payload(read))
 
-        prefix = _program_prefix(program)
-        text = f"{prefix}{digits}"
+        text = _format_roll_digits(program, digits)
         confidence = min(confidences) if "?" not in digits and confidences else 0.0
         return RollOcrResult(
             text=text,
@@ -305,12 +304,12 @@ def normalize_handwritten_roll_text(text: str, program: str | None = None) -> st
         match = re.search(r"(?<!\d)(\d{5})(?!\d)", cleaned)
         return f"PHD{match.group(1)}" if match else None
 
-    match = re.search(r"MT(\d{5})(?!\d)", cleaned)
-    if match:
-        return f"MT{match.group(1)}"
     match = re.search(r"PHD(\d{5})(?!\d)", cleaned)
     if match:
         return f"PHD{match.group(1)}"
+    match = re.search(r"MT(\d{5})(?!\d)", cleaned)
+    if match:
+        return f"MT{match.group(1)}"
     match = re.search(r"(?<!\d)(\d{7})(?!\d)", cleaned)
     if match:
         return match.group(1)
@@ -353,20 +352,22 @@ def save_roll_number_crop_sets(
     crop_paths: dict[str, str] = {}
     cell_crop_paths: dict[str, list[str]] = {}
     for field in _roll_write_in_fields(manifest, page_index):
-        program = str(field.get("program", "")).upper() or "UNKNOWN"
+        programs = _field_programs(field) or ("UNKNOWN",)
+        stem = "_".join(program.lower() for program in programs)
         x0, y0, x1, y1 = _crop_box_px(field, gray.shape, dpi, padding_mm=padding_mm)
         crop = gray[y0:y1, x0:x1]
-        path = output_dir / f"page_{page_index}_{program.lower()}_roll_crop.png"
+        path = output_dir / f"page_{page_index}_{stem}_roll_crop.png"
         Image.fromarray(crop, mode="L").save(path)
-        crop_paths[program] = str(path)
 
         cells: list[str] = []
         for index, (cx0, cy0, cx1, cy1) in enumerate(_cell_crop_boxes_px(field, gray.shape, dpi, cell_padding_mm)):
             cell = gray[cy0:cy1, cx0:cx1]
-            cell_path = output_dir / f"page_{page_index}_{program.lower()}_roll_cell_{index + 1}.png"
+            cell_path = output_dir / f"page_{page_index}_{stem}_roll_cell_{index + 1}.png"
             Image.fromarray(cell, mode="L").save(cell_path)
             cells.append(str(cell_path))
-        cell_crop_paths[program] = cells
+        for program in programs:
+            crop_paths[program] = str(path)
+            cell_crop_paths[program] = cells
     return crop_paths, cell_crop_paths
 
 
@@ -599,7 +600,7 @@ def _read_roll_from_cells(
 
     if "?" in digits:
         return RollOcrResult(digits, confidence=0.0, raw={"cells": cell_payloads})
-    text = f"{_program_prefix(program)}{digits}"
+    text = _format_roll_digits(program, digits)
     confidence = min(confidences) if confidences else 0.62
     return RollOcrResult(text, confidence=confidence, raw={"cells": cell_payloads})
 
@@ -775,13 +776,13 @@ def _expected_digit_count(program: str | None) -> int | None:
     return None
 
 
-def _program_prefix(program: str | None) -> str:
+def _format_roll_digits(program: str | None, digits: str) -> str:
     expected = (program or "").upper()
     if expected == "MTECH":
-        return "MT"
+        return f"MT{digits}"
     if expected == "PHD":
-        return "PHD"
-    return ""
+        return f"PHD{digits}"
+    return digits
 
 
 def _segment_digit_cells(image: Image.Image, count: int) -> list[Image.Image]:
@@ -846,6 +847,14 @@ def _roll_write_in_fields(manifest: dict, page_index: int) -> list[dict]:
         for field in manifest.get("write_in_fields", [])
         if field.get("page", 1) == page_index and field.get("name") == "roll_number"
     ]
+
+
+def _field_programs(field: dict) -> tuple[str, ...]:
+    programs = field.get("programs")
+    if isinstance(programs, list) and programs:
+        return tuple(str(program).upper() for program in programs)
+    program = str(field.get("program") or "").upper()
+    return (program,) if program else ()
 
 
 def _crop_box_px(

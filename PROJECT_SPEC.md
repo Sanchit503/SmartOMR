@@ -1,20 +1,20 @@
 # SmartOMR — OMR-Based Assessment System — Project Specification
 
-**Context:** BTP project, IIIT Delhi. Covers BTech and MTech students only (no PhD).
+**Context:** BTP project, IIIT Delhi. Covers BTech, MTech, and current five-digit PhD enrollment IDs.
 **Purpose of this document:** hand this to a coding assistant as persistent project context. Read the whole thing before writing any code — the module boundaries and shared schemas in Sections 3–4 are what make the rest of the pipeline work.
 
 ---
 
 ## 1. What we're building
 
-An end-to-end pipeline for exams that mix MCQs and short (2-line) written answers, on the same OMR sheet:
+An end-to-end pipeline for exams that mix MCQs, non-negative whole-number answers, and short written answers on the same OMR sheet:
 
-1. Professor configures an exam (course, exam type, number of MCQs, number/marks of written questions, roster, answer key, marking rubric).
+1. Professor configures an exam (course, exam type, MCQs, numerical grids, written questions, roster, answer key, marking rubric).
 2. System **generates** a printable OMR sheet for that exam.
 3. Sheet gets printed, students fill it by hand, professor collects them.
 4. Sheets are **scanned** (flatbed/sheet-fed scanner) or **photographed** (phone camera) — the system must handle both.
 5. System **identifies** which student each sheet belongs to (bubbled roll number) and **emails them the scanned copy** so they can flag if it's not theirs or something looks wrong — this happens *before* grading.
-6. System **grades MCQs** automatically against the answer key, and **grades written answers** using a vision-capable LLM against a professor-supplied rubric.
+6. System **grades MCQs and numerical answers** automatically against the answer key, and **grades written answers** using a vision-capable LLM against a professor-supplied rubric.
 7. System **auto-emails tentative marks** to each student. No professor-approval gate before sending — that's a deliberate design choice (see Section 9). Students who disagree file a **physical re-evaluation request**; the system just needs to log that a request came in.
 
 ---
@@ -37,7 +37,7 @@ These five decisions shape every module below. Don't deviate from them without a
 Student
   roll_number      (PK, string — see Section 4.2 for format)
   name
-  program           BTECH | MTECH
+  program           BTECH | MTECH | PHD
   email
 
 Exam
@@ -52,9 +52,10 @@ Question
   id                (PK)
   exam_id           (FK)
   q_no
-  type              mcq | written
+  type              mcq | numerical | written
   max_marks
   mcq_correct_option   (nullable, only for type=mcq)
+  numerical_correct_value (nullable, only for type=numerical)
   model_answer_rubric  (nullable, only for type=written — free text from professor)
   question_text        (from the ingested question paper, used for written LLM grading context)
 
@@ -73,6 +74,7 @@ Response
   sheet_id          (FK)
   question_id       (FK)
   mcq_selected_option   (nullable)
+  numerical_value       (nullable)
   written_crop_path     (nullable, only for written questions)
 
 Grade
@@ -110,10 +112,13 @@ ReEvalRequest
   "num_mcq": 20,
   "mcq_options": 4,
   "marks_per_mcq": 1,
+  "numerical_questions": [
+    { "q_no": 21, "max_marks": 2, "digits": 3 }
+  ],
   "written_questions": [
-    { "q_no": 21, "max_marks": 5, "lines": 2 },
     { "q_no": 22, "max_marks": 5, "lines": 2 },
-    { "q_no": 23, "max_marks": 10, "lines": 4 }
+    { "q_no": 23, "max_marks": 5, "lines": 2 },
+    { "q_no": 24, "max_marks": 10, "lines": 4 }
   ],
   "roster_csv": "roster_cs301_2026.csv"
 }
@@ -121,17 +126,17 @@ ReEvalRequest
 
 **Output:** a printable PDF, **plus** a template manifest JSON (see 4.4) — always generate both together, never just the PDF.
 
-### 4.2 The roll-number block — handling BTech vs MTech
+### 4.2 The roll-number block — handling BTech, MTech, and PhD
 
-BTech roll numbers are 7 numeric digits (e.g., `2024503`). MTech roll numbers are a fixed 2-letter prefix + 5 digits (e.g., `MT25001`). Don't try to build one alphanumeric bubble grid that handles both — that's unnecessarily hard to print and read. Instead:
+BTech roll numbers are 7 numeric digits (e.g., `2024503`). MTech and current PhD enrollment IDs use a program prefix plus 5 digits (e.g., `MT25001`, `PHD20301`). Do not build an alphanumeric bubble grid. Instead:
 
-- One **program-selector bubble pair**: `BTECH` / `MTECH`.
+- Three **program-selector bubbles**: `BTECH` / `MTECH` / `PHD`.
 - A **7-column all-numeric digit grid** (0–9 per column) for BTech.
-- A **5-column all-numeric digit grid** (0–9 per column) for MTech (the `MT` prefix is implied by the program bubble, not bubbled).
+- One shared **5-column all-numeric digit grid** (0–9 per column) for MTech and PhD; the selected program supplies `MT` or `PHD`.
 
-Print both grids on every sheet; the parser only reads the grid matching whichever program bubble is filled. This keeps every bubble a simple 0–9 digit bubble — no letter-bubbling anywhere, which keeps both generation and OMR reading standard and reliable.
+Print both numeric grids on page 1; the parser reads the grid mapped to the selected program. The program selector is mandatory for the shared MTech/PhD grid because five digits alone cannot distinguish the programs. This keeps every bubble numeric and avoids duplicate space.
 
-Parsing reconstructs the full roll number (`2024503` or `MT25001`) and looks it up in the roster — it does **not** attempt to derive an email from it directly (Section 2, principle 2).
+Parsing reconstructs the full roll number (`2024503`, `MT25001`, or `PHD20301`) and looks it up in the roster — it does **not** scrape the public PhD directory or derive an email directly. Older four-digit PhD IDs remain an explicit format-confirmation item before printing for those students.
 
 ### 4.3 Fiducial markers
 
@@ -150,15 +155,19 @@ Print four solid black square markers, one in each corner, on every sheet, regar
     { "corner": "BR", "x_mm": 200, "y_mm": 287 }
   ],
   "roll_number_block": {
-    "program_selector": { "BTECH": { "x_mm": 20, "y_mm": 25 }, "MTECH": { "x_mm": 35, "y_mm": 25 } },
+    "program_selector": { "BTECH": { "x_mm": 20, "y_mm": 25 }, "MTECH": { "x_mm": 35, "y_mm": 25 }, "PHD": { "x_mm": 45, "y_mm": 25 } },
+    "program_grid_keys": { "BTECH": "btech_digits", "MTECH": "mtech_digits", "PHD": "mtech_digits" },
     "btech_digits":  { "columns": 7, "x_mm": 20, "y_mm": 32, "col_pitch_mm": 8, "row_pitch_mm": 6 },
     "mtech_digits":  { "columns": 5, "x_mm": 20, "y_mm": 70, "col_pitch_mm": 8, "row_pitch_mm": 6 }
   },
   "mcq_block": [
     { "q_no": 1, "x_mm": 20, "y_mm": 110, "options": ["A", "B", "C", "D"] }
   ],
+  "numerical_block": [
+    { "q_no": 21, "page": 1, "positions": 3, "orientation": "horizontal", "answer_type": "unsigned_integer", "leading_zeros": "required" }
+  ],
   "written_block": [
-    { "q_no": 21, "x_mm": 20, "y_mm": 220, "width_mm": 170, "height_mm": 18, "max_marks": 5 }
+    { "q_no": 22, "x_mm": 20, "y_mm": 220, "width_mm": 170, "height_mm": 18, "max_marks": 5 }
   ]
 }
 ```
@@ -221,13 +230,19 @@ with a generated verified sheet become eligible for later email/grading automati
 
 ---
 
-## 7. Module 4 — MCQ auto-grading
+## 7. Module 4 — Objective-answer auto-grading
 
 Straightforward once Module 5/6 give you canonical images and manifest coordinates:
 
 1. For each MCQ, read fill ratio at each option's bubble coordinates.
 2. Exactly one bubble above threshold → that's the answer, compare to `mcq_correct_option`.
 3. Zero bubbles or multiple bubbles above threshold → treat as invalid/blank (0 marks), but log it distinctly from "answered wrong" so the professor can spot scanning issues vs. genuine blanks.
+
+For each numerical answer, read one selected `0–9` bubble per place-value row from the horizontal
+manifest grid. Rows are printed from the most significant place down to ones (for example,
+`Hundreds`, `Tens`, `Ones`). Every row must be filled, including leading zeros (`7` is `007` in a
+3-position grid). Compare the reconstructed integer to the numerical answer key. A completely blank grid is an
+unanswered response worth zero; incomplete, faint, or multiply marked grids require human review.
 
 ---
 
@@ -239,7 +254,7 @@ Straightforward once Module 5/6 give you canonical images and manifest coordinat
    and a browser review page. Import professor/TA marks only after validating
    `0 <= marks_awarded <= max_marks`.
 3. Store written grades separately from raw parser output in structured JSON/CSV, then produce a
-   combined `final_scores.csv` with MCQ + written totals.
+   combined `final_scores.csv` with MCQ + numerical + written totals.
 4. Written grading now goes through `omr.grading.written.WrittenGrader`. The as-built provider is
    a deterministic `mock` provider for workflow testing; it defaults to `needs_human_review` and
    must not be used as real marks.
@@ -286,7 +301,7 @@ Marking guideline: {rubric_text}
 
 ## 9. Module 6 — Tentative marks email & re-evaluation logging
 
-- Once both MCQ and written grades exist for a sheet (and nothing on it is `needs_human_review`), auto-send an email: per-question breakdown, MCQ score, written scores with brief justification text, and total — clearly labeled **"Tentative marks — AI-assisted grading for written answers."**
+- Once MCQ, numerical, and written grades exist for a sheet (and nothing on it is `needs_human_review`), auto-send an email: per-question breakdown, objective scores, written scores with brief justification text, and total — clearly labeled **"Tentative marks — AI-assisted grading for written answers."**
 - Include re-evaluation instructions (the physical process itself is outside the system, per your professor's design). What the system *should* do: include a link/button in the email that logs a `ReEvalRequest` row (roll number, exam, timestamp) so the professor has a queue of who to expect, rather than relying on memory or word-of-mouth. This is a small addition but it's the one piece of digital record-keeping for what's otherwise a manual process — worth building even though it's minor, since it was called out as the main point of the auto-send design.
 - Sheets with any `needs_human_review` grade should **not** auto-send — they wait in the review queue until a human resolves the flagged item, then send.
 
@@ -340,7 +355,7 @@ omr/
                  preflight.py  rasterizes the result and proves it is readable
                  main.py       entry point (terminal wizard / --config)
                Run it with `python -m omr.generator.main`.
-  grading/     Modules 4/5 (Sections 7-8). Bubble reading + MCQ grading; written-answer
+  grading/     Modules 4/5 (Sections 7-8). Bubble reading + MCQ/numerical grading; written-answer
                grading contracts and safe mock provider.
   reader/      Modules 2/3 prototype (Sections 5-6): scan/PDF loading,
                fiducial alignment to canonical A4, alignment quality reports,
@@ -361,13 +376,13 @@ Bubble radius, option pitch, and block positions are **layout decisions the gene
 and publishes through the manifest — they are deliberately NOT in `contracts/`, so the reader
 learns them at parse time rather than sharing a constant that could drift.
 
-**Sheet flow (settled, don't undo):** questions flow continuously — Section A (MCQs) first,
-then Section B (written) starting in whatever space is left on the same page, breaking to a
-new page only when the next question does not fit. There is exactly one placement algorithm
+**Sheet flow (settled, don't undo):** questions flow continuously — MCQs first, compact horizontal
+numerical grids second, then written answers starting in whatever space remains, breaking to a
+new page only when the next row or answer box does not fit. There is exactly one placement algorithm
 (`flow.py`) for every exam, because two of them disagreed and produced half-empty pages.
 
-**Identity per page (settled):** every page carries compact BTECH and MTECH identity blocks:
-BTECH has 7 write-in boxes; MTECH has 5 because the `MT` prefix is implied by the selector. It also
+**Identity per page (settled):** every page carries compact BTECH, MTECH, and PHD identity choices:
+BTECH has 7 write-in boxes; MTECH and PHD share 5 because their prefixes are implied by the selector. It also
 has a row of page-index bars with its own index printed solid. The *bubbled* roll-number
 grid is on page 1 only — repeating it costs ~85mm a page and invites a continuation page that
 contradicts page 1. The manifest schema enforces both (every page must have a roll-number
@@ -379,8 +394,8 @@ field, exactly one filled page bar at its own index, and at least one question).
 
 Sized so each phase is independently testable before moving on.
 
-**Phase 1 — Generator + pure MCQ pipeline (no real scanning yet)**
-Build the generator (4.1–4.4) and MCQ grading (Module 7). Test by programmatically drawing "filled" bubbles onto a generated sheet in code — you don't need real students or a scanner to validate this phase. Get the manifest-driven approach solid here; everything else depends on it.
+**Phase 1 — Generator + objective-answer pipeline (no real scanning yet)**
+Build the generator (4.1–4.4) and MCQ/numerical grading (Module 7). Test by programmatically drawing "filled" bubbles onto a generated sheet in code — you don't need real students or a scanner to validate this phase. Get the manifest-driven approach solid here; everything else depends on it.
 
 **Phase 2 — Real scan ingestion**
 Module 2 (canonicalization) and Module 3 (identity resolution + verification email). Test with a handful of real printed-and-filled sheets, both scanned and phone-photographed, to validate the fiducial/perspective-correction path handles both.
@@ -395,7 +410,8 @@ Module 6 + Module 10 + hardening the edge cases in Section 13.
 
 ## 13. Edge cases to explicitly handle (don't discover these in production)
 
-- Multiple bubbles filled in one roll-number column, or one MCQ.
+- Multiple bubbles filled in one roll-number column, MCQ, or numerical digit position.
+- Partially filled numerical answer (leading positions left blank instead of explicitly bubbling zero).
 - No bubbles filled (blank vs. scanning miss — log distinctly).
 - Fiducial marker obscured (torn/folded corner, thumb over it in a phone photo).
 - Roll number bubbled but doesn't exist in the roster (typo by student, or roster out of date).

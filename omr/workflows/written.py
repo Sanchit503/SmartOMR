@@ -104,6 +104,8 @@ FINAL_SCORES_COLUMNS = [
     "written_total",
     "mcq_score",
     "mcq_total",
+    "numerical_score",
+    "numerical_total",
     "total_score",
     "total_marks",
     "grading_complete",
@@ -315,6 +317,8 @@ def _answer_rows_from_student(
                 "verified_sheet_pdf_path": student.get("verified_sheet_pdf_path") or "",
                 "mcq_score": student.get("mcq_score"),
                 "mcq_total": student.get("mcq_total"),
+                "numerical_score": student.get("numerical_score", 0.0),
+                "numerical_total": student.get("numerical_total", 0.0),
             }
         )
     return answers
@@ -336,6 +340,8 @@ def _student_summaries(index: dict[str, Any], included_rolls: set[str]) -> list[
                 "verified_sheet_pdf_path": student.get("verified_sheet_pdf_path") or "",
                 "mcq_score": student.get("mcq_score"),
                 "mcq_total": student.get("mcq_total"),
+                "numerical_score": student.get("numerical_score", 0.0),
+                "numerical_total": student.get("numerical_total", 0.0),
             }
         )
     return summaries
@@ -740,9 +746,13 @@ def _student_aggregates(packet: dict[str, Any], grades: list[dict[str, Any]]) ->
 
         mcq_score = student.get("mcq_score")
         mcq_total = student.get("mcq_total")
-        grading_complete = written_status == "complete" and mcq_score is not None and mcq_total is not None
-        total_score = float(mcq_score) + written_score if grading_complete else None
-        total_marks = float(mcq_total) + written_total if mcq_total is not None else None
+        numerical_score = student.get("numerical_score", 0.0)
+        numerical_total = student.get("numerical_total", 0.0)
+        grading_complete = (written_status == "complete" and mcq_score is not None and mcq_total is not None
+                            and numerical_score is not None and numerical_total is not None)
+        total_score = float(mcq_score) + float(numerical_score) + written_score if grading_complete else None
+        total_marks = (float(mcq_total) + float(numerical_total) + written_total
+                       if mcq_total is not None and numerical_total is not None else None)
         rows.append(
             {
                 "roll_no": roll_no,
@@ -754,6 +764,8 @@ def _student_aggregates(packet: dict[str, Any], grades: list[dict[str, Any]]) ->
                 "written_total": written_total,
                 "mcq_score": mcq_score,
                 "mcq_total": mcq_total,
+                "numerical_score": numerical_score,
+                "numerical_total": numerical_total,
                 "total_score": total_score,
                 "total_marks": total_marks,
                 "grading_complete": grading_complete,
@@ -785,7 +797,7 @@ def _write_final_scores_csv(path: Path, rows: list[dict[str, Any]]) -> None:
         writer.writeheader()
         for row in rows:
             formatted = dict(row)
-            for key in ("written_score", "written_total", "mcq_score", "mcq_total", "total_score", "total_marks"):
+            for key in ("written_score", "written_total", "mcq_score", "mcq_total", "numerical_score", "numerical_total", "total_score", "total_marks"):
                 formatted[key] = _format_number(row.get(key))
             formatted["grading_complete"] = str(bool(row.get("grading_complete"))).lower()
             formatted["eligible_for_email"] = str(bool(row.get("eligible_for_email"))).lower()

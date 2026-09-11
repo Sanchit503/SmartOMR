@@ -17,11 +17,11 @@ from typing import Any
 import numpy as np
 from PIL import Image, ImageDraw
 
-from omr.contracts.geometry import canonical_size_px, mm_to_px, px_per_mm
+from omr.contracts.geometry import canonical_size_px, digit_grid_centers_mm, mm_to_px, px_per_mm
 from omr.grading.bubbles import STUDENT_MARK_CORE_RATIO
 from omr.grading.mcq import mcq_sample_centers
-from omr.grading.numeric import numeric_sample_centers
 from omr.reader.identity import roll_sample_centers
+from omr.reader.numerical import numerical_sample_centers
 
 
 @dataclass(frozen=True)
@@ -237,6 +237,10 @@ def _page_written_entries(manifest: dict, page_index: int) -> list[dict]:
 
 def _expected_bubble_anchors(manifest: dict, page_index: int) -> list[tuple[str, float, float]]:
     anchors: list[tuple[str, float, float]] = []
+    for entry in manifest.get("numerical_block", []):
+        if entry["page"] == page_index:
+            anchors.extend((f"Q{entry['q_no']}.col{col + 1}.{digit}", x, y)
+                           for (col, digit), (x, y) in digit_grid_centers_mm(entry).items())
     label_offset = manifest["mcq_label_offset_mm"]
     option_pitch = manifest["mcq_option_pitch_mm"]
 
@@ -251,19 +255,6 @@ def _expected_bubble_anchors(manifest: dict, page_index: int) -> list[tuple[str,
                     entry["y_mm"],
                 )
             )
-
-    for entry in manifest.get("numeric_block", []):
-        if entry.get("page", 1) != page_index:
-            continue
-        for place_index in range(int(entry["digits"])):
-            for digit in range(10):
-                anchors.append(
-                    (
-                        f"Q{entry['q_no']}.D{place_index + 1}.{digit}",
-                        entry["x_mm"] + manifest["numeric_label_offset_mm"] + digit * manifest["numeric_digit_pitch_mm"],
-                        entry["y_mm"] + place_index * manifest["numeric_place_row_pitch_mm"],
-                    )
-                )
 
     if manifest["roll_number_block"].get("page", 1) == page_index:
         block = manifest["roll_number_block"]
@@ -291,6 +282,11 @@ def _expected_bubble_anchors(manifest: dict, page_index: int) -> list[tuple[str,
 def _expected_bubble_anchor_blocks(manifest: dict, page_index: int) -> list[tuple[str, list[tuple[str, float, float]]]]:
     """Return nearby anchor groups so local stretch can be measured by region."""
     blocks: list[tuple[str, list[tuple[str, float, float]]]] = []
+    for entry in manifest.get("numerical_block", []):
+        if entry["page"] == page_index:
+            anchors = [(f"Q{entry['q_no']}.col{col + 1}.{digit}", x, y)
+                       for (col, digit), (x, y) in digit_grid_centers_mm(entry).items()]
+            blocks.append((f"numerical_Q{entry['q_no']}", anchors))
     label_offset = manifest["mcq_label_offset_mm"]
     option_pitch = manifest["mcq_option_pitch_mm"]
 
@@ -313,33 +309,16 @@ def _expected_bubble_anchor_blocks(manifest: dict, page_index: int) -> list[tupl
         if anchors:
             blocks.append((f"mcq_block_{index}", anchors))
 
-    numeric_groups: dict[float, list[dict]] = {}
-    for entry in manifest.get("numeric_block", []):
-        if entry.get("page", 1) != page_index:
-            continue
-        numeric_groups.setdefault(float(entry["x_mm"]), []).append(entry)
-    for index, (_x_mm, entries) in enumerate(sorted(numeric_groups.items()), start=1):
-        anchors = []
-        for entry in sorted(entries, key=lambda item: (item["y_mm"], item["q_no"])):
-            for place_index in range(int(entry["digits"])):
-                for digit in range(10):
-                    anchors.append(
-                        (
-                            f"Q{entry['q_no']}.D{place_index + 1}.{digit}",
-                            entry["x_mm"] + manifest["numeric_label_offset_mm"] + digit * manifest["numeric_digit_pitch_mm"],
-                            entry["y_mm"] + place_index * manifest["numeric_place_row_pitch_mm"],
-                        )
-                    )
-        if anchors:
-            blocks.append((f"numeric_block_{index}", anchors))
-
     if manifest["roll_number_block"].get("page", 1) == page_index:
         block = manifest["roll_number_block"]
-        for grid_name, program in (("btech_digits", "BTECH"), ("mtech_digits", "MTECH")):
+        mapping = block.get("program_grid_keys", {"BTECH": "btech_digits", "MTECH": "mtech_digits"})
+        for grid_name in dict.fromkeys(mapping.values()):
+            programs = [program for program, mapped_grid in mapping.items() if mapped_grid == grid_name]
             anchors = []
-            selector = block["program_selector"].get(program)
-            if selector is not None:
-                anchors.append((f"program.{program}", selector["x_mm"], selector["y_mm"]))
+            for program in programs:
+                selector = block["program_selector"].get(program)
+                if selector is not None:
+                    anchors.append((f"program.{program}", selector["x_mm"], selector["y_mm"]))
             grid = block[grid_name]
             for col in range(grid["columns"]):
                 for digit in range(10):
@@ -350,7 +329,7 @@ def _expected_bubble_anchor_blocks(manifest: dict, page_index: int) -> list[tupl
                             grid["y_mm"] + digit * grid["row_pitch_mm"],
                         )
                     )
-            blocks.append((f"roll_{program.lower()}", anchors))
+            blocks.append((f"roll_{'_'.join(program.lower() for program in programs)}", anchors))
 
     continuation = [
         (f"continuation_program.{choice['program']}", choice["x_mm"], choice["y_mm"])
@@ -852,15 +831,13 @@ def _local_overlay_points(
         (float(cx), float(cy))
         for cx, cy in mcq_sample_centers(gray, entries, manifest, dpi).values()
     ]
-    numeric_entries = [entry for entry in manifest.get("numeric_block", []) if entry.get("page", 1) == page_index]
-    centers.extend(
-        (float(cx), float(cy))
-        for cx, cy in numeric_sample_centers(gray, numeric_entries, manifest, dpi).values()
-    )
     centers.extend(
         (float(cx), float(cy))
         for cx, cy in roll_sample_centers(gray, manifest, dpi, page_index).values()
     )
+    for entry in manifest.get("numerical_block", []):
+        if entry["page"] == page_index:
+            centers.extend(numerical_sample_centers(gray, manifest, entry, dpi).values())
     return centers
 
 

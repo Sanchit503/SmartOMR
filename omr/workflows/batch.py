@@ -22,10 +22,9 @@ from PIL import Image
 from omr.contracts import load_manifest
 from omr.contracts.geometry import MM_PER_INCH, mm_to_px, px_per_mm
 from omr.grading.mcq import read_mcq_responses
-from omr.grading.numeric import read_numeric_responses
 from omr.io.csv import load_answer_key, load_students, normalize_roll
-from omr.models import AlignedPage, HandwrittenRollRead, Student
-from omr.reader.digit_model import DigitFeature, extract_digit_feature
+from omr.models import AlignedPage, Student
+from omr.reader.digit_model import extract_digit_feature
 from omr.reader.handwriting import (
     RollOcrBackend,
     build_roll_ocr_backend,
@@ -43,24 +42,18 @@ from omr.workflows.parse import (
     _match_student,
     _mcq_answer_summary,
     _mcq_payload,
+    _numerical_payload,
     _missing_pages,
-    _numeric_answer_summary,
-    _numeric_payload,
     _page_artifacts,
     _safe_id,
     _scan_files,
     _student_payload,
-    _template_images_from_manifest_path,
     _written_payload,
 )
 from omr.reader.written_ocr import WrittenOcrBackend, build_written_ocr_backend, read_written_answer_texts
 
 
 CONFIDENCE_RANK = {"low": 0, "medium": 1, "high": 2}
-ADAPTIVE_DIGIT_READY_DISTANCE = 0.058
-ADAPTIVE_DIGIT_REVIEW_DISTANCE = 0.080
-ADAPTIVE_DIGIT_READY_MARGIN = 0.004
-ADAPTIVE_DIGIT_REVIEW_MARGIN = 0.002
 GROUPING_MODES = {"auto", "identity", "page-major", "sheet-major", "write-in-similarity"}
 HANDWRITTEN_OCR_NOT_CONFIGURED_FLAG = "handwritten roll OCR is not configured; saved roll crop(s) for manual review"
 PAGE_MAJOR_IDENTITY_KIND = "page_major_order"
@@ -88,6 +81,8 @@ REVIEW_REPORT_COLUMNS = [
     "identity_kinds",
     "mcq_score",
     "mcq_total",
+    "numerical_score",
+    "numerical_total",
     "review_flag_count",
     "review_flags",
     "sheet_pdf_path",
@@ -108,18 +103,6 @@ class _PageRecord:
     confidence: str
     identity_payload: dict[str, Any] | None
     review_flags: list[str]
-
-
-@dataclass(frozen=True)
-class _DigitExample:
-    roll_no: str
-    program: str
-    digit_index: int
-    digit: str
-    feature: np.ndarray
-    foreground_fraction: float
-    crop_path: str
-    source_index: int
 
 
 @dataclass(frozen=True)
@@ -234,268 +217,6 @@ def _best_page(existing: _PageRecord, challenger: _PageRecord) -> _PageRecord:
         challenger.aligned_page.page_mark_confidence,
     )
     return challenger if challenger_score > existing_score else existing
-
-
-def _program_for_roll(roll_no: str, fallback: str | None = None) -> str | None:
-    if roll_no.upper().startswith("MT"):
-        return "MTECH"
-    if roll_no.upper().startswith("PHD"):
-        return "PHD"
-    if fallback:
-        return fallback.upper()
-    return "BTECH" if roll_no.isdigit() else None
-
-
-def _roll_digits_for_program(roll_no: str, program: str | None) -> str | None:
-    normalized_program = (program or _program_for_roll(roll_no) or "").upper()
-    if normalized_program == "MTECH":
-        digits = roll_no[2:] if roll_no.upper().startswith("MT") else roll_no
-        return digits if len(digits) == 5 and digits.isdigit() else None
-    if normalized_program == "PHD":
-        digits = roll_no[3:] if roll_no.upper().startswith("PHD") else roll_no
-        return digits if len(digits) == 5 and digits.isdigit() else None
-    if normalized_program == "BTECH":
-        return roll_no if len(roll_no) == 7 and roll_no.isdigit() else None
-    return None
-
-
-def _load_digit_feature(path: str | Path) -> DigitFeature:
-    return extract_digit_feature(Image.open(path).convert("L"))
-
-
-def _collect_adaptive_digit_examples(
-    records: list[_PageRecord],
-    manifest: dict,
-    root: Path,
-    dpi: float,
-) -> list[_DigitExample]:
-    roll_page = int(manifest["roll_number_block"].get("page", 1))
-    examples: list[_DigitExample] = []
-    for record in records:
-        if record.aligned_page.page_index != roll_page:
-            continue
-        if not record.roll_no or not _strong_enough(record.confidence, "high"):
-            continue
-        program = _program_for_roll(record.roll_no, record.program)
-        digits = _roll_digits_for_program(record.roll_no, program)
-        if program is None or digits is None:
-            continue
-
-        label_dir = root / "_adaptive_roll_digits" / "labels" / f"source_{record.source_index:04d}"
-        _crops, cell_crops = save_roll_number_crop_sets(
-            record.aligned_page.image,
-            manifest,
-            roll_page,
-            label_dir,
-            dpi,
-            padding_mm=0.8,
-            cell_padding_mm=0.35,
-        )
-        paths = cell_crops.get(program, [])
-        if len(paths) != len(digits):
-            continue
-        for index, (path, digit) in enumerate(zip(paths, digits, strict=False), start=1):
-            feature = _load_digit_feature(path)
-            if feature.is_blank:
-                continue
-            examples.append(
-                _DigitExample(
-                    roll_no=record.roll_no,
-                    program=program,
-                    digit_index=index,
-                    digit=digit,
-                    feature=feature.feature,
-                    foreground_fraction=feature.foreground_fraction,
-                    crop_path=str(path),
-                    source_index=record.source_index,
-                )
-            )
-    return examples
-
-
-def _candidate_rolls_for_adaptive_match(
-    grouped: dict[str, list[_PageRecord]],
-    program: str | None,
-) -> list[str]:
-    candidates = []
-    for roll_no, records in grouped.items():
-        candidate_program = _program_for_roll(roll_no, next((record.program for record in records if record.program), None))
-        if program is None or candidate_program == program:
-            candidates.append(roll_no)
-    return sorted(candidates)
-
-
-def _distance_to_digit_examples(feature: np.ndarray, examples: list[_DigitExample], digit: str, program: str) -> float:
-    matching = [example for example in examples if example.program == program and example.digit == digit]
-    if not matching:
-        return 1.0
-    return min(float(np.mean((feature - example.feature) ** 2)) for example in matching)
-
-
-def _score_adaptive_candidate(
-    candidate_roll: str,
-    program: str,
-    cell_features: list[DigitFeature],
-    examples: list[_DigitExample],
-) -> dict[str, Any] | None:
-    digits = _roll_digits_for_program(candidate_roll, program)
-    if digits is None or len(digits) != len(cell_features):
-        return None
-
-    distances = []
-    blank_count = 0
-    missing_examples = 0
-    for digit, feature in zip(digits, cell_features, strict=False):
-        if feature.is_blank:
-            blank_count += 1
-        if not any(example.program == program and example.digit == digit for example in examples):
-            missing_examples += 1
-        distances.append(_distance_to_digit_examples(feature.feature, examples, digit, program))
-
-    average_distance = float(np.mean(distances)) if distances else 1.0
-    return {
-        "roll_no": candidate_roll,
-        "program": program,
-        "average_distance": round(average_distance, 5),
-        "max_distance": round(max(distances, default=1.0), 5),
-        "distances": [round(value, 5) for value in distances],
-        "blank_cells": blank_count,
-        "missing_digit_examples": missing_examples,
-    }
-
-
-def _adaptive_digit_confidence(best: dict[str, Any], runner_up: dict[str, Any] | None) -> str:
-    average = float(best["average_distance"])
-    margin = (
-        float(runner_up["average_distance"]) - average
-        if runner_up is not None
-        else ADAPTIVE_DIGIT_READY_MARGIN * 2
-    )
-    if int(best["blank_cells"]) or int(best["missing_digit_examples"]):
-        return "low"
-    if average <= ADAPTIVE_DIGIT_READY_DISTANCE and margin >= ADAPTIVE_DIGIT_READY_MARGIN:
-        return "high"
-    if average <= ADAPTIVE_DIGIT_REVIEW_DISTANCE and margin >= ADAPTIVE_DIGIT_REVIEW_MARGIN:
-        return "medium"
-    return "low"
-
-
-def _adaptive_match_unmatched_page(
-    record: _PageRecord,
-    manifest: dict,
-    root: Path,
-    dpi: float,
-    grouped: dict[str, list[_PageRecord]],
-    examples: list[_DigitExample],
-) -> _PageRecord | None:
-    if record.identity_kind != "handwritten" or record.roll_no:
-        return None
-    program = (record.program or "").upper()
-    if program not in {"BTECH", "MTECH", "PHD"}:
-        return None
-
-    candidate_rolls = _candidate_rolls_for_adaptive_match(grouped, program)
-    if not candidate_rolls:
-        return None
-
-    identity_dir = root / "_adaptive_roll_digits" / "matches" / f"source_{record.source_index:04d}"
-    crop_paths, cell_crop_paths = save_roll_number_crop_sets(
-        record.aligned_page.image,
-        manifest,
-        record.aligned_page.page_index,
-        identity_dir,
-        dpi,
-        padding_mm=0.8,
-        cell_padding_mm=0.35,
-    )
-    cell_paths = cell_crop_paths.get(program, [])
-    if not cell_paths:
-        return None
-    cell_features = [_load_digit_feature(path) for path in cell_paths]
-
-    scores = [
-        score
-        for candidate in candidate_rolls
-        if (score := _score_adaptive_candidate(candidate, program, cell_features, examples)) is not None
-    ]
-    if not scores:
-        return None
-    ranked = sorted(scores, key=lambda item: float(item["average_distance"]))
-    best = ranked[0]
-    runner_up = ranked[1] if len(ranked) > 1 else None
-    confidence = _adaptive_digit_confidence(best, runner_up)
-    if confidence == "low":
-        return None
-
-    payload = HandwrittenRollRead(
-        page_index=record.aligned_page.page_index,
-        program=program,
-        roll_no=str(best["roll_no"]),
-        confidence=confidence,
-        provider="adaptive_digit_similarity",
-        raw_text=str(best["roll_no"]),
-        crop_paths=crop_paths,
-        cell_crop_paths=cell_crop_paths,
-        ocr_results={
-            "_adaptive_digit_similarity": {
-                "candidate_scores": ranked,
-                "examples": [
-                    {
-                        "roll_no": example.roll_no,
-                        "source_index": example.source_index,
-                        "digit_index": example.digit_index,
-                        "digit": example.digit,
-                        "foreground_fraction": round(example.foreground_fraction, 5),
-                        "crop_path": example.crop_path,
-                    }
-                    for example in examples
-                ],
-                "thresholds": {
-                    "ready_distance": ADAPTIVE_DIGIT_READY_DISTANCE,
-                    "ready_margin": ADAPTIVE_DIGIT_READY_MARGIN,
-                    "review_distance": ADAPTIVE_DIGIT_REVIEW_DISTANCE,
-                    "review_margin": ADAPTIVE_DIGIT_REVIEW_MARGIN,
-                },
-                "previous_provider": (record.identity_payload or {}).get("provider"),
-                "previous_raw_text": (record.identity_payload or {}).get("raw_text"),
-            }
-        },
-        review_flags=[],
-    )
-    return _PageRecord(
-        source_path=record.source_path,
-        source_index=record.source_index,
-        aligned_page=record.aligned_page,
-        identity_kind="handwritten",
-        roll_no=str(best["roll_no"]),
-        program=program,
-        confidence=confidence,
-        identity_payload=asdict(payload),
-        review_flags=[],
-    )
-
-
-def _attach_unmatched_pages_by_adaptive_digits(
-    grouped: dict[str, list[_PageRecord]],
-    unmatched: list[_PageRecord],
-    manifest: dict,
-    root: Path,
-    dpi: float,
-    min_group_confidence: str,
-) -> list[_PageRecord]:
-    grouped_records = [record for records in grouped.values() for record in records]
-    examples = _collect_adaptive_digit_examples(grouped_records, manifest, root, dpi)
-    if not examples:
-        return unmatched
-
-    remaining: list[_PageRecord] = []
-    for record in unmatched:
-        matched = _adaptive_match_unmatched_page(record, manifest, root, dpi, grouped, examples)
-        if matched is not None and matched.roll_no and _strong_enough(matched.confidence, min_group_confidence):
-            grouped.setdefault(matched.roll_no, []).append(matched)
-        else:
-            remaining.append(record)
-    return remaining
 
 
 def _group_records_by_identity(
@@ -998,19 +719,10 @@ def _write_unmatched_page(
     manifest: dict,
     root: Path,
     dpi: float,
-    written_padding_mm: float = 0.0,
-    written_ocr_backend: WrittenOcrBackend | None = None,
-    template_images_by_page: dict[int, np.ndarray] | None = None,
 ) -> dict[str, Any]:
     output_dir = root / "unmatched_pages" / f"source_{record.source_index:04d}"
     aligned = {record.aligned_page.page_index: record.aligned_page}
-    images_by_page, page_records, quality_reports = _page_artifacts(
-        aligned,
-        manifest,
-        output_dir,
-        dpi,
-        written_padding_mm=written_padding_mm,
-    )
+    _images_by_page, page_records, quality_reports = _page_artifacts(aligned, manifest, output_dir, dpi)
     identity_payload = record.identity_payload
     if record.identity_kind == "handwritten":
         crops, cell_crops = save_roll_number_crop_sets(
@@ -1025,21 +737,6 @@ def _write_unmatched_page(
     review_flags = list(record.review_flags)
     for report in quality_reports:
         review_flags.extend(f"page {report.page_index}: {flag}" for flag in report.review_flags)
-    parse_manifest = _manifest_for_pages(manifest, set(images_by_page))
-    written_crops = crop_written_responses(
-        images_by_page,
-        parse_manifest,
-        output_dir / "written",
-        dpi,
-        padding_mm=written_padding_mm,
-        template_images_by_page=template_images_by_page,
-    )
-    written_ocr_reads = read_written_answer_texts(
-        written_crops,
-        output_dir / "written_ocr",
-        written_ocr_backend,
-    )
-    written_payload = _written_payload(written_crops, output_dir, written_ocr_reads)
     payload = {
         "source_path": str(record.source_path),
         "source_index": record.source_index,
@@ -1048,7 +745,6 @@ def _write_unmatched_page(
         "identity_kind": record.identity_kind,
         "identity": _relative_identity_payload(identity_payload, output_dir),
         "pages": [asdict(page) for page in page_records],
-        "written_responses": written_payload,
         "review_flags": review_flags,
     }
     details_path = output_dir / "page.json"
@@ -1099,7 +795,6 @@ def _write_student_group(
     allow_partial: bool,
     roll_ocr_backend: RollOcrBackend | None,
     written_ocr_backend: WrittenOcrBackend | None,
-    template_images_by_page: dict[int, np.ndarray] | None = None,
 ) -> dict[str, Any]:
     output_dir = root / "students" / _safe_id(roll_no)
     selected_by_page: dict[int, _PageRecord] = {}
@@ -1119,13 +814,7 @@ def _write_student_group(
         review_flags.append(f"duplicate page {page_no} found in source pages {source_indices}; best page was used")
 
     aligned_pages = {page_no: record.aligned_page for page_no, record in selected_by_page.items()}
-    images_by_page, page_records, quality_reports = _page_artifacts(
-        aligned_pages,
-        manifest,
-        output_dir,
-        dpi,
-        written_padding_mm=written_padding_mm,
-    )
+    images_by_page, page_records, quality_reports = _page_artifacts(aligned_pages, manifest, output_dir, dpi)
     sheet_pdf_path = _save_student_pdf(images_by_page, manifest, output_dir)
     for report in quality_reports:
         review_flags.extend(f"page {report.page_index}: {flag}" for flag in report.review_flags)
@@ -1167,18 +856,9 @@ def _write_student_group(
 
     readings = read_mcq_responses(images_by_page, parse_manifest, dpi)
     mcq_responses, mcq_score, mcq_total = _mcq_payload(readings, parse_manifest, answer_key, review_flags)
-    numeric_readings = read_numeric_responses(images_by_page, parse_manifest, dpi)
-    numeric_responses, numeric_score, numeric_total = _numeric_payload(
-        numeric_readings,
-        parse_manifest,
-        answer_key,
-        review_flags,
+    numerical_responses, numerical_score, numerical_total = _numerical_payload(
+        images_by_page, manifest, dpi, answer_key, review_flags,
     )
-    objective_score = None
-    objective_total = None
-    if mcq_score is not None or numeric_score is not None:
-        objective_score = (mcq_score or 0.0) + (numeric_score or 0.0)
-        objective_total = (mcq_total or 0.0) + (numeric_total or 0.0)
 
     written_crops = crop_written_responses(
         images_by_page,
@@ -1186,7 +866,6 @@ def _write_student_group(
         output_dir / "written",
         dpi,
         padding_mm=written_padding_mm,
-        template_images_by_page=template_images_by_page,
     )
     written_ocr_reads = read_written_answer_texts(
         written_crops,
@@ -1254,12 +933,10 @@ def _write_student_group(
         "pages": [asdict(page) for page in page_records],
         "mcq_score": mcq_score,
         "mcq_total": mcq_total,
+        "numerical_responses": numerical_responses,
+        "numerical_score": numerical_score,
+        "numerical_total": numerical_total,
         "mcq_responses": mcq_responses,
-        "numeric_score": numeric_score,
-        "numeric_total": numeric_total,
-        "numeric_responses": numeric_responses,
-        "objective_score": objective_score,
-        "objective_total": objective_total,
         "written_responses": written_payload,
         "review_flags": review_flags,
         "details_path": str(details_path),
@@ -1355,6 +1032,8 @@ def _student_report_row(
         "identity_kinds": "; ".join(identity_kinds),
         "mcq_score": _score_value(result.get("mcq_score")),
         "mcq_total": _score_value(result.get("mcq_total")),
+        "numerical_score": _score_value(result.get("numerical_score")),
+        "numerical_total": _score_value(result.get("numerical_total")),
         "review_flag_count": len(flags),
         "review_flags": _join_flags(flags),
         "sheet_pdf_path": _report_path(_student_artifact_path(result, "sheet_pdf_path"), root),
@@ -1534,6 +1213,8 @@ def _write_review_html(
         "source_indices",
         "mcq_score",
         "mcq_total",
+        "numerical_score",
+        "numerical_total",
         "review_flag_count",
         "review_flags",
         "sheet_pdf_path",
@@ -1723,7 +1404,6 @@ def parse_exam_bundle(
     min_group_confidence: str = "high",
     grouping_mode: str = "auto",
     written_ocr_backend: WrittenOcrBackend | None = None,
-    adaptive_roll_matching: bool = True,
 ) -> tuple[list[dict[str, Any]], Path]:
     if min_group_confidence not in CONFIDENCE_RANK:
         raise ValueError(f"unknown minimum group confidence: {min_group_confidence}")
@@ -1734,7 +1414,6 @@ def parse_exam_bundle(
     course_id = _safe_id(course_id) if course_id else _safe_id(manifest["exam_id"])
     root = Path(output_root) / course_id
     root.mkdir(parents=True, exist_ok=True)
-    template_images_by_page = _template_images_from_manifest_path(manifest_path, manifest, dpi)
 
     students = load_students(students_path) if students_path else None
     valid_rolls = set(students) if students else None
@@ -1812,16 +1491,6 @@ def parse_exam_bundle(
     else:
         grouped, unmatched = identity_grouped, identity_unmatched
 
-    if adaptive_roll_matching and unmatched:
-        unmatched = _attach_unmatched_pages_by_adaptive_digits(
-            grouped,
-            unmatched,
-            manifest,
-            root,
-            dpi,
-            min_group_confidence,
-        )
-
     student_results: list[dict[str, Any]] = []
     for roll_no, student_page_records in sorted(grouped.items()):
         student_results.append(
@@ -1837,22 +1506,10 @@ def parse_exam_bundle(
                 allow_partial,
                 ocr_backend,
                 written_ocr_backend,
-                template_images_by_page=template_images_by_page,
             )
         )
 
-    unmatched_results = [
-        _write_unmatched_page(
-            record,
-            manifest,
-            root,
-            dpi,
-            written_padding_mm=written_padding_mm,
-            written_ocr_backend=written_ocr_backend,
-            template_images_by_page=template_images_by_page,
-        )
-        for record in unmatched
-    ]
+    unmatched_results = [_write_unmatched_page(record, manifest, root, dpi) for record in unmatched]
     index_path = root / "parse_index.json"
     index = {
         "exam_id": manifest["exam_id"],
@@ -1879,12 +1536,10 @@ def parse_exam_bundle(
                 ),
                 "mcq_score": result["mcq_score"],
                 "mcq_total": result["mcq_total"],
+                "numerical_responses": result["numerical_responses"],
+                "numerical_score": result["numerical_score"],
+                "numerical_total": result["numerical_total"],
                 "mcq_answers": _mcq_answer_summary(result),
-                "numeric_score": result.get("numeric_score"),
-                "numeric_total": result.get("numeric_total"),
-                "numeric_answers": _numeric_answer_summary(result),
-                "objective_score": result.get("objective_score"),
-                "objective_total": result.get("objective_total"),
                 "pages": [
                     {
                         "page": page["page_index"],
@@ -1950,11 +1605,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--written-answer-ocr",
         default="none",
-        choices=["none", "tesseract", "trocr", "ensemble", "best", "auto"],
-        help=(
-            "Optional written-answer transcription. best/auto/ensemble use transformer HTR on preserved "
-            "raw crops; tesseract is an explicit legacy option for experiments."
-        ),
+        choices=["none", "tesseract", "trocr"],
+        help="Optional offline OCR provider for written-answer crops",
     )
     parser.add_argument(
         "--written-ocr-model",
@@ -1984,15 +1636,6 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "auto detects scanner order from page-index bars; identity groups pages by read roll number; "
             "page-major expects A1 B1 ... A2 B2 ...; sheet-major expects A1 A2 ... B1 B2 ..."
-        ),
-    )
-    parser.add_argument(
-        "--no-adaptive-roll-matching",
-        action="store_true",
-        help=(
-            "Disable page-1-to-continuation handwritten digit shape matching. "
-            "By default, batch mode uses confident page-1 rolls to label write-in digit cells "
-            "and recover weak continuation-page roll OCR."
         ),
     )
     return parser
@@ -2029,7 +1672,6 @@ def main(argv: list[str] | None = None) -> int:
             min_group_confidence=args.min_group_confidence,
             grouping_mode=args.grouping_mode,
             written_ocr_backend=written_ocr_backend,
-            adaptive_roll_matching=not args.no_adaptive_roll_matching,
         )
     except (OSError, ScanError, ValueError, RuntimeError) as exc:
         print(str(exc), file=sys.stderr)

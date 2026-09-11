@@ -41,3 +41,22 @@ def canonical_size_px(manifest: dict, dpi: float) -> tuple[int, int]:
         round(manifest["page"]["width_mm"] * scale),
         round(manifest["page"]["height_mm"] * scale),
     )
+
+
+def digit_grid_centers_mm(grid: dict) -> dict[tuple[int, int], tuple[float, float]]:
+    """Return (position, digit) centers using only manifest grid geometry."""
+    if grid.get("orientation") == "horizontal":
+        return {
+            (position, digit): (
+                grid["x_mm"] + digit * grid["digit_pitch_mm"],
+                grid["y_mm"] + position * grid["position_pitch_mm"],
+            )
+            for position in range(grid["positions"])
+            for digit in range(10)
+        }
+    return {
+        (column, digit): (grid["x_mm"] + column * grid["col_pitch_mm"],
+                          grid["y_mm"] + digit * grid["row_pitch_mm"])
+        for column in range(grid["columns"])
+        for digit in range(10)
+    }

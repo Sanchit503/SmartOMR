@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import re
 import sys
 from dataclasses import asdict
@@ -20,7 +21,6 @@ from PIL import Image
 
 from omr.contracts import load_manifest
 from omr.grading.mcq import MCQOutcome, read_mcq_responses
-from omr.grading.numeric import NumericOutcome, normalize_numeric_answer, read_numeric_responses
 from omr.io.csv import load_answer_key, load_students, normalize_roll
 from omr.models import AnswerKeyEntry, ParsedPage, RollRead, Student
 from omr.reader.quality import (
@@ -30,6 +30,7 @@ from omr.reader.quality import (
     save_sampling_overlay,
 )
 from omr.reader.identity import read_roll_number
+from omr.reader.numerical import read_numerical_responses
 from omr.reader.scan import IMAGE_EXTENSIONS, ScanError, align_scan_pages, load_scan_pages
 from omr.reader.written import crop_written_responses
 from omr.reader.written_ocr import (
@@ -94,40 +95,11 @@ def _save_debug_image(image: object, path: Path) -> None:
     Image.fromarray(gray.astype(np.uint8, copy=False), mode="L").convert("RGB").save(path)
 
 
-def _template_images_from_manifest_path(
-    manifest_path: str | Path,
-    manifest: dict,
-    dpi: float,
-) -> dict[int, np.ndarray] | None:
-    manifest_path = Path(manifest_path)
-    if manifest_path.name.endswith(".manifest.json"):
-        template_path = manifest_path.with_name(manifest_path.name.removesuffix(".manifest.json") + ".pdf")
-    else:
-        template_path = manifest_path.with_suffix(".pdf")
-    if not template_path.exists():
-        return None
-
-    try:
-        import pymupdf
-    except ImportError:
-        return None
-
-    images: dict[int, np.ndarray] = {}
-    render_dpi = int(round(dpi))
-    with pymupdf.open(template_path) as doc:
-        for page_no in range(1, min(int(manifest["num_pages"]), len(doc)) + 1):
-            pix = doc[page_no - 1].get_pixmap(dpi=render_dpi, colorspace=pymupdf.csGRAY)
-            image = Image.frombytes("L", (pix.width, pix.height), pix.samples)
-            images[page_no] = np.asarray(image).astype(np.uint8, copy=False)
-    return images or None
-
-
 def _page_artifacts(
     aligned_pages: dict[int, Any],
     manifest: dict,
     output_dir: Path,
     dpi: float,
-    written_padding_mm: float = 0.0,
 ) -> tuple[dict[int, np.ndarray], list[ParsedPage], list[Any]]:
     pages_dir = output_dir / "pages"
     debug_dir = output_dir / "debug"
@@ -151,14 +123,7 @@ def _page_artifacts(
         sampling_overlay_path = debug_dir / f"page_{page_no}_sampling_overlay.png"
         report_path = debug_dir / f"page_{page_no}_alignment.json"
         save_alignment_overlay(debug_image if debug_image is not None else image, manifest, page_no, dpi, overlay_path)
-        save_sampling_overlay(
-            debug_image if debug_image is not None else image,
-            manifest,
-            page_no,
-            dpi,
-            sampling_overlay_path,
-            written_padding_mm=written_padding_mm,
-        )
+        save_sampling_overlay(debug_image if debug_image is not None else image, manifest, page_no, dpi, sampling_overlay_path)
         report = report.with_paths(
             report_path=_json_path(report_path, output_dir),
             overlay_path=_json_path(overlay_path, output_dir),
@@ -193,8 +158,8 @@ def _missing_pages(manifest: dict, images_by_page: dict[int, np.ndarray]) -> lis
 def _manifest_for_pages(manifest: dict, pages: set[int]) -> dict:
     partial = dict(manifest)
     partial["mcq_block"] = [entry for entry in manifest["mcq_block"] if entry.get("page", 1) in pages]
-    partial["numeric_block"] = [entry for entry in manifest.get("numeric_block", []) if entry.get("page", 1) in pages]
     partial["written_block"] = [entry for entry in manifest["written_block"] if entry.get("page", 1) in pages]
+    partial["numerical_block"] = [entry for entry in manifest.get("numerical_block", []) if entry["page"] in pages]
     return partial
 
 
@@ -285,71 +250,45 @@ def _mcq_payload(
     return responses, score, total
 
 
-def _numeric_payload(
-    readings,
-    manifest: dict,
-    answer_key: dict[int, AnswerKeyEntry] | None,
-    review_flags: list[str],
-) -> tuple[list[dict], float | None, float | None]:
-    page_by_q = {entry["q_no"]: entry.get("page", 1) for entry in manifest.get("numeric_block", [])}
-    digits_by_q = {entry["q_no"]: int(entry["digits"]) for entry in manifest.get("numeric_block", [])}
-    marks_by_q = {entry["q_no"]: float(entry["max_marks"]) for entry in manifest.get("numeric_block", [])}
-    responses: list[dict] = []
+def _numerical_payload(images_by_page, manifest, dpi, answer_key, review_flags):
+    entries = {entry["q_no"]: entry for entry in manifest.get("numerical_block", [])}
+    total = sum(entry["max_marks"] for entry in entries.values())
     score = 0.0
-    total = 0.0
-
-    for reading in readings:
-        q_no = reading.q_no
-        if reading.needs_human_review:
-            review_flags.append(f"Q{q_no}: {reading.review_reason}")
-
-        correct_answer = None
-        marks = None
-        marks_awarded = None
-        if answer_key is not None:
-            key_entry = answer_key.get(q_no)
-            marks = key_entry.marks if key_entry is not None else marks_by_q.get(q_no, 0.0)
-            total += marks
-            if key_entry is None:
-                review_flags.append(f"answer key is missing Q{q_no}")
-                marks_awarded = 0.0
-            else:
-                correct_answer = normalize_numeric_answer(key_entry.answer, digits_by_q[q_no])
-                selected_answer = normalize_numeric_answer(reading.answer or "", digits_by_q[q_no])
-                is_correct = reading.outcome == NumericOutcome.ANSWERED and selected_answer == correct_answer
-                marks_awarded = marks if is_correct else 0.0
-                score += marks_awarded
-
-        responses.append(
-            {
-                "q_no": q_no,
-                "page": page_by_q.get(q_no, 1),
-                "outcome": reading.outcome.value,
-                "answer": reading.answer,
-                "confidence": reading.confidence.value,
-                "needs_human_review": reading.needs_human_review,
-                "review_reason": reading.review_reason,
-                "correct_answer": correct_answer,
-                "marks": marks,
-                "marks_awarded": marks_awarded,
-                "places": [
-                    {
-                        "place_index": place.place_index,
-                        "selected_digit": place.selected_digit,
-                        "outcome": place.outcome.value,
-                        "confidence": place.confidence.value,
-                        "review_reason": place.review_reason,
-                        "fill_ratios": place.fill_ratios,
-                        "ink_densities": place.ink_densities,
-                    }
-                    for place in reading.places
-                ],
-            }
-        )
-
+    complete = True
+    responses = []
+    readable_manifest = dict(manifest)
+    readable_manifest["numerical_block"] = [entry for entry in entries.values() if entry["page"] in images_by_page]
+    missing = [entry for entry in entries.values() if entry["page"] not in images_by_page]
+    if missing:
+        complete = False
+        review_flags.extend(f"numerical Q{entry['q_no']} is on missing page {entry['page']}" for entry in missing)
+    for reading in read_numerical_responses(images_by_page, readable_manifest, dpi):
+        entry = entries[reading.q_no]
+        payload = asdict(reading)
+        payload.update(max_marks=entry["max_marks"], correct_value=None, marks_awarded=None)
+        review_flags.extend(f"Q{reading.q_no}: {flag}" for flag in reading.review_flags)
+        key = answer_key.get(reading.q_no) if answer_key is not None else None
+        if key is not None:
+            if not re.fullmatch(r"[0-9]+", key.answer) or len(key.answer) > 100:
+                raise ValueError(f"numerical answer key Q{reading.q_no} must be a non-negative whole number")
+            expected = int(key.answer)
+            if expected >= 10 ** entry["positions"]:
+                raise ValueError(f"numerical answer key Q{reading.q_no} exceeds its digit capacity")
+            if not math.isfinite(key.marks) or key.marks != entry["max_marks"]:
+                raise ValueError(f"numerical answer key Q{reading.q_no} marks must match manifest max_marks")
+            payload["correct_value"] = expected
+            if not reading.needs_human_review:
+                awarded = entry["max_marks"] if reading.outcome == "answered" and reading.value == expected else 0.0
+                payload["marks_awarded"] = awarded
+                score += awarded
+        elif answer_key is not None:
+            review_flags.append(f"answer key is missing numerical Q{reading.q_no}")
+        if payload["marks_awarded"] is None:
+            complete = False
+        responses.append(payload)
     if answer_key is None:
         return responses, None, None
-    return responses, score, total
+    return responses, score if complete else None, total
 
 
 def _mcq_answer_summary(result: dict) -> list[dict]:
@@ -367,48 +306,16 @@ def _mcq_answer_summary(result: dict) -> list[dict]:
     ]
 
 
-def _numeric_answer_summary(result: dict) -> list[dict]:
-    return [
-        {
-            "q_no": response["q_no"],
-            "answer": response["answer"],
-            "outcome": response["outcome"],
-            "confidence": response["confidence"],
-            "needs_review": response["needs_human_review"],
-            "correct_answer": response["correct_answer"],
-            "marks_awarded": response["marks_awarded"],
-        }
-        for response in result.get("numeric_responses", [])
-    ]
-
-
 def _relative_written_ocr_payload(read: WrittenAnswerOcr, output_dir: Path) -> dict:
     payload = read.to_json()
     payload["crop_path"] = _json_path(Path(str(payload["crop_path"])), output_dir)
-    if payload.get("analysis_crop_path"):
-        payload["analysis_crop_path"] = _json_path(Path(str(payload["analysis_crop_path"])), output_dir)
     line_results = []
     for line in payload.get("line_results", []):
         line_payload = dict(line)
         line_payload["crop_path"] = _json_path(Path(str(line_payload["crop_path"])), output_dir)
-        line_payload["raw"] = _relative_written_ocr_nested_paths(line_payload.get("raw"), output_dir)
         line_results.append(line_payload)
     payload["line_results"] = line_results
     return payload
-
-
-def _relative_written_ocr_nested_paths(value: object, output_dir: Path) -> object:
-    if isinstance(value, dict):
-        result = {}
-        for key, nested in value.items():
-            if key == "crop_path" and isinstance(nested, str) and nested:
-                result[key] = _json_path(Path(nested), output_dir)
-            else:
-                result[key] = _relative_written_ocr_nested_paths(nested, output_dir)
-        return result
-    if isinstance(value, list):
-        return [_relative_written_ocr_nested_paths(item, output_dir) for item in value]
-    return value
 
 
 def _written_payload(
@@ -420,8 +327,6 @@ def _written_payload(
     for crop in written_crops:
         item = asdict(crop)
         item["crop_path"] = _json_path(Path(crop.crop_path), output_dir)
-        if crop.ocr_crop_path is not None:
-            item["ocr_crop_path"] = _json_path(Path(crop.ocr_crop_path), output_dir)
         if written_ocr_reads and crop.q_no in written_ocr_reads:
             item["ocr"] = _relative_written_ocr_payload(written_ocr_reads[crop.q_no], output_dir)
         payload.append(item)
@@ -454,14 +359,7 @@ def parse_scan(
 
     raw_pages = load_scan_pages(scan_path, dpi)
     aligned_pages = align_scan_pages(raw_pages, manifest, dpi, allow_partial=allow_partial)
-    template_images_by_page = _template_images_from_manifest_path(manifest_path, manifest, dpi)
-    images_by_page, page_records, quality_reports = _page_artifacts(
-        aligned_pages,
-        manifest,
-        output_dir,
-        dpi,
-        written_padding_mm=written_padding_mm,
-    )
+    images_by_page, page_records, quality_reports = _page_artifacts(aligned_pages, manifest, output_dir, dpi)
     available_pages = set(images_by_page)
     parse_manifest = _manifest_for_pages(manifest, available_pages) if allow_partial else manifest
 
@@ -490,19 +388,9 @@ def parse_scan(
 
     readings = read_mcq_responses(images_by_page, parse_manifest, dpi)
     mcq_responses, mcq_score, mcq_total = _mcq_payload(readings, parse_manifest, answer_key, review_flags)
-    numeric_readings = read_numeric_responses(images_by_page, parse_manifest, dpi)
-    numeric_responses, numeric_score, numeric_total = _numeric_payload(
-        numeric_readings,
-        parse_manifest,
-        answer_key,
-        review_flags,
+    numerical_responses, numerical_score, numerical_total = _numerical_payload(
+        images_by_page, manifest, dpi, answer_key, review_flags,
     )
-
-    objective_score = None
-    objective_total = None
-    if mcq_score is not None or numeric_score is not None:
-        objective_score = (mcq_score or 0.0) + (numeric_score or 0.0)
-        objective_total = (mcq_total or 0.0) + (numeric_total or 0.0)
 
     written_dir = output_dir / "written"
     written_crops = crop_written_responses(
@@ -511,7 +399,6 @@ def parse_scan(
         written_dir,
         dpi,
         padding_mm=written_padding_mm,
-        template_images_by_page=template_images_by_page,
     )
     written_ocr_reads = read_written_answer_texts(
         written_crops,
@@ -531,12 +418,10 @@ def parse_scan(
         "pages": [asdict(page) for page in page_records],
         "mcq_score": mcq_score,
         "mcq_total": mcq_total,
+        "numerical_responses": numerical_responses,
+        "numerical_score": numerical_score,
+        "numerical_total": numerical_total,
         "mcq_responses": mcq_responses,
-        "numeric_score": numeric_score,
-        "numeric_total": numeric_total,
-        "numeric_responses": numeric_responses,
-        "objective_score": objective_score,
-        "objective_total": objective_total,
         "written_responses": written_payload,
         "review_flags": review_flags,
         "details_path": str(details_path),
@@ -556,12 +441,10 @@ def _error_payload(scan_path: Path, output_dir: Path, error: Exception) -> dict:
         "pages": [],
         "mcq_score": None,
         "mcq_total": None,
+        "numerical_responses": [],
+        "numerical_score": None,
+        "numerical_total": None,
         "mcq_responses": [],
-        "numeric_score": None,
-        "numeric_total": None,
-        "numeric_responses": [],
-        "objective_score": None,
-        "objective_total": None,
         "written_responses": [],
         "review_flags": [str(error)],
         "error_type": type(error).__name__,
@@ -629,12 +512,10 @@ def parse_scans(
                 "student_name": result["student"]["name"],
                 "mcq_score": result["mcq_score"],
                 "mcq_total": result["mcq_total"],
+                "numerical_responses": result["numerical_responses"],
+                "numerical_score": result["numerical_score"],
+                "numerical_total": result["numerical_total"],
                 "mcq_answers": _mcq_answer_summary(result),
-                "numeric_score": result.get("numeric_score"),
-                "numeric_total": result.get("numeric_total"),
-                "numeric_answers": _numeric_answer_summary(result),
-                "objective_score": result.get("objective_score"),
-                "objective_total": result.get("objective_total"),
                 "page_quality": [
                     {
                         "page": page["page_index"],
@@ -685,11 +566,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--written-answer-ocr",
         default="none",
-        choices=["none", "tesseract", "trocr", "ensemble", "best", "auto"],
-        help=(
-            "Optional written-answer transcription. best/auto/ensemble use transformer HTR on preserved "
-            "raw crops; tesseract is an explicit legacy option for experiments."
-        ),
+        choices=["none", "tesseract", "trocr"],
+        help="Optional offline OCR provider for written-answer crops",
     )
     parser.add_argument(
         "--written-ocr-model",
