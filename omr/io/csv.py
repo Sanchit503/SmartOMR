@@ -17,6 +17,7 @@ QUESTION_TEXT_HEADERS = ("question_text", "question", "prompt")
 RUBRIC_HEADERS = ("rubric", "marking_guideline", "marking_guidelines", "guideline", "guidelines")
 MODEL_ANSWER_HEADERS = ("model_answer", "expected_answer", "sample_answer")
 MAX_MARKS_HEADERS = ("max_marks", "marks", "marks_possible")
+DROPPED_ANSWERS = {"DROP", "DROPPED", "CANCELLED", "CANCELED", "BONUS", "VOID"}
 PROGRAM_ALIASES = {
     "BTECH": "BTECH",
     "BTECHNOLOGY": "BTECH",
@@ -185,9 +186,10 @@ def load_answer_key(path: str | Path, default_marks: float = 1.0) -> dict[int, A
                     marks = float(row[marks_col])
                 except ValueError as exc:
                     raise ValueError(f"{path}:{row_no} has invalid marks {row[marks_col]!r}") from exc
+            dropped = answer in DROPPED_ANSWERS or marks == 0.0
             if q_no in key:
                 raise ValueError(f"{path}:{row_no} duplicates Q{q_no}")
-            key[q_no] = AnswerKeyEntry(q_no=q_no, answer=answer, marks=marks)
+            key[q_no] = AnswerKeyEntry(q_no=q_no, answer=answer, marks=marks, dropped=dropped)
     if not key:
         raise ValueError(f"{path} contains no answer key entries")
     return key

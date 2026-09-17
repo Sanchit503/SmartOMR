@@ -24,6 +24,7 @@ class AnswerKeyEntry:
     q_no: int
     answer: str
     marks: float
+    dropped: bool = False
 
 
 @dataclass(frozen=True)
