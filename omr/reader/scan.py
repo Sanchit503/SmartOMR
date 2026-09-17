@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from itertools import combinations, permutations
 from math import hypot
 from pathlib import Path
+import re
 
 import numpy as np
 
@@ -777,8 +778,8 @@ def _page_mark_templates(manifest: dict) -> list[dict]:
     return [by_index[index] for index in sorted(by_index)]
 
 
-def detect_page_index(gray: np.ndarray, manifest: dict, dpi: float) -> tuple[int, float, dict[int, float]]:
-    scores = {
+def _page_index_bar_scores(gray: np.ndarray, manifest: dict, dpi: float) -> dict[int, float]:
+    return {
         int(mark["index"]): _rect_dark_fraction(
             gray,
             mark["x_mm"],
@@ -791,16 +792,93 @@ def detect_page_index(gray: np.ndarray, manifest: dict, dpi: float) -> tuple[int
         )
         for mark in _page_mark_templates(manifest)
     }
+
+
+def _page_index_error(scores: dict[int, float], suffix: str = "") -> ScanError:
+    detail = f"(scores: {', '.join(f'{i}={s:.2f}' for i, s in sorted(scores.items()))})"
+    return ScanError(f"page-index bars are ambiguous {detail}; {suffix or 'rescan or inspect manually'}")
+
+
+def _ocr_page_index_from_text_region(
+    gray: np.ndarray,
+    manifest: dict,
+    dpi: float,
+) -> tuple[int, float, str] | None:
+    """Read visible 'Page X of Y' text as a fallback page-index signal.
+
+    This is deliberately conservative: it only accepts OCR when the visible
+    total page count agrees with the manifest, so random header text cannot
+    silently become a page number.
+    """
+    try:
+        import pytesseract
+        from PIL import Image
+    except ImportError:
+        return None
+    configured_cmd = getattr(pytesseract.pytesseract, "tesseract_cmd", "")
+    if configured_cmd in {"", "tesseract"}:
+        for candidate in (
+            Path("C:/Program Files/Tesseract-OCR/tesseract.exe"),
+            Path("C:/Program Files (x86)/Tesseract-OCR/tesseract.exe"),
+        ):
+            if candidate.exists():
+                pytesseract.pytesseract.tesseract_cmd = str(candidate)
+                break
+
+    cv2 = _cv2()
+    gray = _as_gray_array(gray)
+    page = manifest.get("page", {})
+    width_mm = float(page.get("width_mm", 210.0))
+    # The printed page text lives in the top-right header. Keep the crop wide
+    # enough for translations like "Page 10 of 12" while avoiding roll grids.
+    x0, y0 = mm_to_px(max(0.0, width_mm - 48.0), 20.0, dpi)
+    x1, y1 = mm_to_px(width_mm - 4.0, 42.0, dpi)
+    crop = gray[max(0, y0):min(gray.shape[0], y1), max(0, x0):min(gray.shape[1], x1)]
+    if crop.size == 0:
+        return None
+
+    crop = cv2.resize(crop, None, fx=3.0, fy=3.0, interpolation=cv2.INTER_CUBIC)
+    crop = cv2.copyMakeBorder(crop, 12, 12, 12, 12, cv2.BORDER_CONSTANT, value=255)
+    _threshold, binary = cv2.threshold(crop, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
+    image = Image.fromarray(binary)
+    texts: list[str] = []
+    for config in ("--psm 7", "--psm 6"):
+        try:
+            text = pytesseract.image_to_string(image, config=config).strip()
+        except Exception:
+            return None
+        if text:
+            texts.append(text)
+
+    expected_total = int(manifest.get("num_pages", 0) or 0)
+    for text in texts:
+        normalized = re.sub(r"\s+", " ", text).strip()
+        match = re.search(r"page\D*(\d{1,3})\D+of\D+(\d{1,3})", normalized, flags=re.IGNORECASE)
+        if match is None:
+            numbers = [int(value) for value in re.findall(r"\d{1,3}", normalized)]
+            if len(numbers) >= 2:
+                page_index, total = numbers[0], numbers[1]
+            else:
+                continue
+        else:
+            page_index, total = int(match.group(1)), int(match.group(2))
+        if 1 <= page_index <= expected_total and total == expected_total:
+            return page_index, 0.35, normalized
+    return None
+
+
+def detect_page_index(gray: np.ndarray, manifest: dict, dpi: float) -> tuple[int, float, dict[int, float]]:
+    scores = _page_index_bar_scores(gray, manifest, dpi)
     ranked = sorted(scores.items(), key=lambda item: item[1], reverse=True)
     top_index, top_score = ranked[0]
     runner_up = ranked[1][1] if len(ranked) > 1 else 0.0
     filled = [index for index, score in scores.items() if score >= 0.45]
     if len(filled) != 1:
-        raise ScanError(
-            "page-index bars are ambiguous "
-            f"(scores: {', '.join(f'{i}={s:.2f}' for i, s in sorted(scores.items()))}); "
-            "rescan or inspect manually"
-        )
+        ocr = _ocr_page_index_from_text_region(gray, manifest, dpi)
+        if ocr is not None:
+            page_index, confidence, text = ocr
+            return page_index, confidence, scores
+        raise _page_index_error(scores, "OCR fallback could not read a valid 'Page X of Y'; rescan or inspect manually")
     return top_index, max(0.0, top_score - runner_up), scores
 
 

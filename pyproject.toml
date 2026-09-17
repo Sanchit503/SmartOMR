@@ -24,8 +24,12 @@ smartomr-parse = "omr.workflows.parse:main"
 smartomr-batch = "omr.workflows.batch:main"
 smartomr-review = "omr.workflows.review:main"
 smartomr-written = "omr.workflows.written:main"
+smartomr-email = "omr.workflows.email:main"
 smartomr-doctor = "omr.health:main"
 smartomr-train-digits = "omr.reader.digit_model:main"
+smartomr-extract-bubble-crops = "omr.datasets.bubble_crops:main"
+smartomr-train-cancelled-bubbles = "omr.datasets.train_cancelled_bubbles:main"
+smartomr-ui = "omr.ui.app:main"
 
 [project.optional-dependencies]
 dev = [
@@ -37,6 +41,10 @@ htr = [
     "sentencepiece>=0.2",
     "protobuf>=4.25",
     "tiktoken>=0.7",
+]
+ml = [
+    "scikit-learn>=1.4",
+    "joblib>=1.3",
 ]
 
 [tool.setuptools.packages.find]

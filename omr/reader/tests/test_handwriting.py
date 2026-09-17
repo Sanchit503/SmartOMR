@@ -72,6 +72,8 @@ def test_handwritten_roll_normalization_is_format_aware():
     assert normalize_handwritten_roll_text("12345", "MTECH") == "MT12345"
     assert normalize_handwritten_roll_text("PhD 20301", "PHD") == "PHD20301"
     assert normalize_handwritten_roll_text("20301", "PHD") == "PHD20301"
+    assert normalize_handwritten_roll_text("SP24ABC", "BTECH") == "SP24ABC"
+    assert normalize_handwritten_roll_text("sp24-001") == "SP24001"
     assert normalize_handwritten_roll_text("20O45B7", "BTECH") == "2004587"
     assert normalize_handwritten_roll_text("12345", "BTECH") is None
 
@@ -161,6 +163,26 @@ def test_conflicting_handwriting_ocr_strategies_are_rejected(tmp_path: Path):
     assert result.roll_no is None
     assert result.confidence == "low"
     assert any("conflicting candidates" in flag for flag in result.review_flags)
+
+
+def test_sp_roll_can_be_read_from_whole_strip_when_in_roster(tmp_path: Path):
+    manifest, page = _sheet(tmp_path)
+    draw = ImageDraw.Draw(page)
+    _fill_continuation_program(draw, manifest, "BTECH")
+
+    result = read_continuation_roll_number(
+        np.asarray(page),
+        manifest,
+        DPI,
+        2,
+        tmp_path / "identity",
+        ocr_backend=FakeOcr("SP24ABC", digits="???????"),
+        valid_rolls={"SP24ABC"},
+    )
+
+    assert result.roll_no == "SP24ABC"
+    assert result.confidence == "medium"
+    assert any("whole-strip OCR" in flag for flag in result.review_flags)
 
 
 def test_handwritten_roll_not_in_roster_is_rejected(tmp_path: Path):

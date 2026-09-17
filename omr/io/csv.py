@@ -2,15 +2,16 @@
 from __future__ import annotations
 
 import csv
+import re
 from pathlib import Path
 
 from omr.models import AnswerKeyEntry, EvaluationResult, Student, WrittenQuestionMeta
 
 
-ROLL_HEADERS = ("roll_no", "roll", "roll_number", "student_roll", "student_id")
-NAME_HEADERS = ("name", "student_name")
-EMAIL_HEADERS = ("email", "mail", "student_email")
-PROGRAM_HEADERS = ("program", "degree")
+ROLL_HEADERS = ("roll_no", "roll", "roll_number", "student_roll", "student_id", "rollno")
+NAME_HEADERS = ("name", "student_name", "studentname")
+EMAIL_HEADERS = ("email", "mail", "student_email", "email_id", "emailid")
+PROGRAM_HEADERS = ("program", "degree", "class_type", "classtype")
 WRITTEN_Q_HEADERS = ("q_no", "question_no", "question_number", "q")
 QUESTION_TEXT_HEADERS = ("question_text", "question", "prompt")
 RUBRIC_HEADERS = ("rubric", "marking_guideline", "marking_guidelines", "guideline", "guidelines")
@@ -18,15 +19,37 @@ MODEL_ANSWER_HEADERS = ("model_answer", "expected_answer", "sample_answer")
 MAX_MARKS_HEADERS = ("max_marks", "marks", "marks_possible")
 
 
+def _header_key(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", str(value).strip().lower())
+
+
 def normalize_roll(value: str) -> str:
     return "".join(str(value).upper().split())
 
 
+def normalize_student_roll(value: str, program: str | None = None) -> str:
+    roll = normalize_roll(value)
+    if not roll:
+        return roll
+    program_key = re.sub(r"[^A-Z0-9]+", "", str(program or "").upper())
+    if program_key in {"MTECH", "MT"} and roll.isdigit():
+        return f"MT{roll}"
+    if program_key == "PHD" and roll.isdigit():
+        return f"PHD{roll}"
+    if program_key.startswith("SP") and not roll.startswith("SP"):
+        return f"SP{roll}"
+    return roll
+
+
 def _field(row: dict[str, str], names: tuple[str, ...], required: bool = True) -> str:
     lowered = {k.strip().lower(): v for k, v in row.items()}
+    canonical = {_header_key(k): v for k, v in row.items()}
     for name in names:
         if name in lowered and str(lowered[name]).strip():
             return str(lowered[name]).strip()
+        key = _header_key(name)
+        if key in canonical and str(canonical[key]).strip():
+            return str(canonical[key]).strip()
     if required:
         raise ValueError(f"CSV row is missing one of these columns: {', '.join(names)}")
     return ""
@@ -34,9 +57,13 @@ def _field(row: dict[str, str], names: tuple[str, ...], required: bool = True) -
 
 def _column(fieldnames: list[str], names: tuple[str, ...]) -> str | None:
     lowered = {name.strip().lower(): name for name in fieldnames}
+    canonical = {_header_key(name): name for name in fieldnames}
     for name in names:
         if name in lowered:
             return lowered[name]
+        key = _header_key(name)
+        if key in canonical:
+            return canonical[key]
     return None
 
 
@@ -49,12 +76,12 @@ def load_students(path: str | Path) -> dict[str, Student]:
         students: dict[str, Student] = {}
         known = set(ROLL_HEADERS + NAME_HEADERS + EMAIL_HEADERS + PROGRAM_HEADERS)
         for row_no, row in enumerate(reader, start=2):
-            roll_no = normalize_roll(_field(row, ROLL_HEADERS))
+            program = _field(row, PROGRAM_HEADERS, required=False).upper()
+            roll_no = normalize_student_roll(_field(row, ROLL_HEADERS), program)
             if not roll_no:
                 raise ValueError(f"{path}:{row_no} has an empty roll number")
             if roll_no in students:
                 raise ValueError(f"{path}:{row_no} duplicates roll number {roll_no}")
-            program = _field(row, PROGRAM_HEADERS, required=False).upper()
             extra = {
                 k: v
                 for k, v in row.items()

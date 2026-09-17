@@ -20,11 +20,12 @@ DPI = 200
 class FakeOcr:
     provider = "fake"
 
-    def __init__(self, digits: str = "20245872024587") -> None:
+    def __init__(self, digits: str = "20245872024587", roll_text: str = "2024587") -> None:
         self.digits = list(digits)
+        self.roll_text = roll_text
 
     def read_roll(self, crop_path: Path, program: str | None = None) -> RollOcrResult:
-        return RollOcrResult("2024587", confidence=0.95)
+        return RollOcrResult(self.roll_text, confidence=0.95)
 
     def read_digit(self, crop_path: Path) -> RollOcrResult:
         digit = self.digits.pop(0) if self.digits else ""
@@ -193,6 +194,47 @@ def test_batch_pdf_groups_unordered_pages_by_page_identity(tmp_path: Path):
     html_text = html_path.read_text(encoding="utf-8")
     assert "2024587" in html_text
     assert "students/2024587/sheet.pdf" in html_text
+
+
+def test_batch_flags_first_page_write_in_roll_conflict(tmp_path: Path):
+    result = generate_exam(
+        ExamConfig(
+            exam_id="BATCH_ROLL_CONFLICT_TEST",
+            course_code="CSE202",
+            exam_name="Quiz",
+            exam_type="quiz",
+            num_mcq=5,
+            mcq_options=4,
+            marks_per_mcq=1,
+        ),
+        tmp_path / "exam",
+    )
+    manifest = result["manifest"]
+    pages = _render_pages(result["pdf_path"])
+    _fill_btech_roll(pages[1], manifest, "2024587")
+
+    bundle_path = tmp_path / "roll_conflict_bundle.pdf"
+    pages[1].save(bundle_path, resolution=DPI)
+
+    students, index_path = parse_exam_bundle(
+        bundle_path,
+        result["manifest_path"],
+        output_root=tmp_path / "parsed",
+        dpi=DPI,
+        ocr_backend=FakeOcr(digits="20249992024999", roll_text="2024999"),
+    )
+
+    assert len(students) == 1
+    student = students[0]
+    assert student["student"]["roll_no"] == "2024587"
+    assert student["status"] == "needs_review"
+    assert student["roll_read"]["write_in_roll_read"]["roll_no"] == "2024999"
+    assert any(
+        "page-1 write-in roll 2024999 conflicts with grouped roll 2024587" in flag
+        for flag in student["review_flags"]
+    )
+    payload = json.loads(index_path.read_text(encoding="utf-8"))
+    assert payload["status_counts"]["needs_review"] == 1
 
 
 def test_batch_pdf_groups_page_major_scanner_order_without_continuation_ocr(tmp_path: Path):

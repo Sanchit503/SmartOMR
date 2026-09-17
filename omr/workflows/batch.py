@@ -722,7 +722,7 @@ def _write_unmatched_page(
 ) -> dict[str, Any]:
     output_dir = root / "unmatched_pages" / f"source_{record.source_index:04d}"
     aligned = {record.aligned_page.page_index: record.aligned_page}
-    _images_by_page, page_records, quality_reports = _page_artifacts(aligned, manifest, output_dir, dpi)
+    images_by_page, page_records, quality_reports = _page_artifacts(aligned, manifest, output_dir, dpi)
     identity_payload = record.identity_payload
     if record.identity_kind == "handwritten":
         crops, cell_crops = save_roll_number_crop_sets(
@@ -737,6 +737,17 @@ def _write_unmatched_page(
     review_flags = list(record.review_flags)
     for report in quality_reports:
         review_flags.extend(f"page {report.page_index}: {flag}" for flag in report.review_flags)
+    page_manifest = _manifest_for_pages(manifest, set(images_by_page))
+    written_crops = [
+        replace(crop, ocr_crop_path=crop.ocr_crop_path or crop.crop_path)
+        for crop in crop_written_responses(
+            images_by_page,
+            page_manifest,
+            output_dir / "written",
+            dpi,
+        )
+    ]
+    written_payload = _written_payload(written_crops, output_dir)
     payload = {
         "source_path": str(record.source_path),
         "source_index": record.source_index,
@@ -745,6 +756,7 @@ def _write_unmatched_page(
         "identity_kind": record.identity_kind,
         "identity": _relative_identity_payload(identity_payload, output_dir),
         "pages": [asdict(page) for page in page_records],
+        "written_responses": written_payload,
         "review_flags": review_flags,
     }
     details_path = output_dir / "page.json"

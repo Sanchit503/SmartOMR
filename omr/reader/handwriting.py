@@ -148,6 +148,14 @@ class LocalTesseractRollOcr:
             ) from exc
         self.pytesseract = pytesseract
         command = tesseract_cmd or os.environ.get("SMARTOMR_TESSERACT_CMD")
+        if not command:
+            for candidate in (
+                Path("C:/Program Files/Tesseract-OCR/tesseract.exe"),
+                Path("C:/Program Files (x86)/Tesseract-OCR/tesseract.exe"),
+            ):
+                if candidate.exists():
+                    command = str(candidate)
+                    break
         if command:
             self.pytesseract.pytesseract.tesseract_cmd = command
 
@@ -164,7 +172,7 @@ class LocalTesseractRollOcr:
 
         for variant_name, variant in _prepare_ocr_variants(image):
             for psm in ("--psm 7", "--psm 8", "--psm 13"):
-                whole = self._read_image(variant, psm, whitelist="0123456789MT")
+                whole = self._read_image(variant, psm, whitelist="0123456789MTPHDSP")
                 candidates.append({"kind": "whole-strip", "variant": variant_name, "psm": psm, **whole})
 
         expected_digits = _expected_digit_count(program)
@@ -281,8 +289,12 @@ def build_roll_ocr_backend(
 
 def normalize_handwritten_roll_text(text: str, program: str | None = None) -> str | None:
     """Normalize OCR text into a roll number if it matches a safe format."""
-    cleaned = text.upper()
-    cleaned = cleaned.replace(" ", "").replace("-", "").replace("_", "")
+    compact = re.sub(r"[^0-9A-Z]+", "", text.upper())
+    sp_match = re.search(r"SP(\d{2}[A-Z0-9]{3,6})(?![A-Z0-9])", compact)
+    if sp_match:
+        return f"SP{sp_match.group(1)}"
+
+    cleaned = compact
     cleaned = cleaned.replace("O", "0").replace("Q", "0")
     cleaned = cleaned.replace("I", "1").replace("L", "1").replace("|", "1")
     cleaned = cleaned.replace("S", "5").replace("Z", "2").replace("G", "6").replace("B", "8")

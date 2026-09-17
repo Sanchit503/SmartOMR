@@ -327,6 +327,8 @@ def _written_payload(
     for crop in written_crops:
         item = asdict(crop)
         item["crop_path"] = _json_path(Path(crop.crop_path), output_dir)
+        if crop.ocr_crop_path:
+            item["ocr_crop_path"] = _json_path(Path(crop.ocr_crop_path), output_dir)
         if written_ocr_reads and crop.q_no in written_ocr_reads:
             item["ocr"] = _relative_written_ocr_payload(written_ocr_reads[crop.q_no], output_dir)
         payload.append(item)

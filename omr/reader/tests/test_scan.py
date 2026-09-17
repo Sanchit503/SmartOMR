@@ -9,7 +9,8 @@ from omr.generator.config import ExamConfig
 from omr.generator.generate import generate_exam
 from omr.generator.layout import build_layout
 from omr.generator.manifest import build_manifest
-from omr.reader.scan import ScanError, align_scan_page
+from omr.reader import scan as scan_module
+from omr.reader.scan import ScanError, align_scan_page, detect_page_index
 
 
 DPI = 200
@@ -117,3 +118,32 @@ def test_dark_background_photo_still_finds_inner_marker_contours(tmp_path):
     aligned = align_scan_page(photo, result["manifest"], dpi=DPI)
 
     assert aligned.page_index == 1
+
+
+def test_page_index_uses_ocr_when_bars_are_weak(monkeypatch):
+    manifest = _manifest()
+    width, height = canonical_size_px(manifest, DPI)
+    page = np.full((height, width), 255, dtype=np.uint8)
+
+    monkeypatch.setattr(
+        scan_module,
+        "_ocr_page_index_from_text_region",
+        lambda _gray, _manifest, _dpi: (1, 0.35, "Page 1 of 1"),
+    )
+
+    page_index, confidence, scores = detect_page_index(page, manifest, DPI)
+
+    assert page_index == 1
+    assert confidence == pytest.approx(0.35)
+    assert scores[1] == 0.0
+
+
+def test_page_index_rejects_when_bars_and_ocr_are_both_weak(monkeypatch):
+    manifest = _manifest()
+    width, height = canonical_size_px(manifest, DPI)
+    page = np.full((height, width), 255, dtype=np.uint8)
+
+    monkeypatch.setattr(scan_module, "_ocr_page_index_from_text_region", lambda *_args: None)
+
+    with pytest.raises(ScanError, match="OCR fallback"):
+        detect_page_index(page, manifest, DPI)

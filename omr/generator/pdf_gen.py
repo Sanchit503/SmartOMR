@@ -358,9 +358,8 @@ def _draw_numerical_block(c: canvas.Canvas, layout: SheetLayout, page_no: int, i
     for entry in entries:
         left = entry.x_mm - NUMERICAL_GRID_OFFSET_X_MM
         slot_top = entry.y_mm - NUMERICAL_GRID_OFFSET_Y_MM
-        digit_label = "digit" if entry.positions == 1 else "digits"
         _draw_fitted(c, left, slot_top + 2,
-                     f"Q{entry.q_no}  [{_marks(entry.max_marks)} marks]  {entry.positions} {digit_label}",
+                     f"Q{entry.q_no}  [{_marks(entry.max_marks)} marks]",
                      "Helvetica-Bold", 8, numerical_slot_width_mm(entry.positions))
         c.setLineWidth(HAIRLINE_PT)
         c.setFont("Helvetica", 6.5)
