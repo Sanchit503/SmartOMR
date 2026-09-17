@@ -6,6 +6,7 @@ reading happens downstream.
 """
 from __future__ import annotations
 
+from collections.abc import Iterator
 from dataclasses import dataclass
 from itertools import combinations, permutations
 from math import hypot
@@ -70,8 +71,8 @@ def _final_warp_interpolation(cv2_module: object) -> int:
     return cv2_module.INTER_CUBIC
 
 
-def load_scan_pages(path: str | Path, dpi: float) -> list[np.ndarray]:
-    """Load a scanned image or PDF page array.
+def iter_scan_pages(path: str | Path, dpi: float) -> Iterator[np.ndarray]:
+    """Yield scanned image/PDF pages without retaining a whole PDF in memory.
 
     Images are decoded in color so the final perspective warp can work from
     the original pixels. PDF pages are rendered grayscale because scanned PDFs
@@ -85,25 +86,38 @@ def load_scan_pages(path: str | Path, dpi: float) -> list[np.ndarray]:
             import pymupdf
         except ImportError as exc:
             raise RuntimeError("PyMuPDF is required to read scanned PDFs") from exc
-        doc = pymupdf.open(path)
-        pages: list[np.ndarray] = []
         zoom = dpi / 72.0
         matrix = pymupdf.Matrix(zoom, zoom)
-        for page in doc:
-            pix = page.get_pixmap(matrix=matrix, colorspace=pymupdf.csGRAY, alpha=False)
-            pages.append(np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width).copy())
-        if not pages:
+        page_count = 0
+        with pymupdf.open(path) as doc:
+            for page in doc:
+                pix = page.get_pixmap(matrix=matrix, colorspace=pymupdf.csGRAY, alpha=False)
+                page_count += 1
+                yield np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width).copy()
+        if page_count == 0:
             raise ScanError(f"{path} has no pages")
-        return pages
+        return
 
     if suffix in IMAGE_EXTENSIONS:
         data = np.fromfile(path, dtype=np.uint8)
         image = cv2.imdecode(data, cv2.IMREAD_COLOR)
         if image is None:
             raise ScanError(f"could not decode image {path}")
-        return [image]
+        yield image
+        return
 
     raise ScanError(f"unsupported scan type {suffix!r}; use an image or PDF")
+
+
+def load_scan_pages(path: str | Path, dpi: float) -> list[np.ndarray]:
+    """Load every scanned page into memory.
+
+    Single-sheet workflows retain this compatibility API. Large batch jobs use
+    :func:`iter_scan_pages` so raw PDF pages are released as processing moves
+    forward.
+    """
+
+    return list(iter_scan_pages(path, dpi))
 
 
 def _as_image_array(image: np.ndarray) -> np.ndarray:

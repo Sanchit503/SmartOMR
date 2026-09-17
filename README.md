@@ -3,19 +3,41 @@
 OMR-based assessment system. BTP project, IIIT Delhi. Full spec and module boundaries are in
 [PROJECT_SPEC.md](PROJECT_SPEC.md) — read that first, it's the persistent design contract for this codebase.
 
-## Status: local batch workflow, backend/UI still pending
+## Status: local professor workflow ready for controlled pilots
 
 Per the roadmap in PROJECT_SPEC.md Section 12:
 
 - [x] **Phase 1** — OMR sheet generator + MCQ/numerical grading pipeline
-- [x] **Phase 2 local batch parser** — scan/PDF loading, fiducial alignment, page-index reading,
+- [x] **Phase 2 local batch parser** — streamed scan/PDF loading, fiducial alignment, page-index reading,
   alignment quality reports, BTech/MTech/PhD roll-number reading, roster CSV matching,
-  MCQ and numerical result export,
-  production package entrypoints, local diagnostics, and review artifacts
-- [ ] Phase 2 service hardening — upload API, verification email, persistent review queue,
-  duplicate-sheet handling, and production scan-calibration dataset
-- [ ] Phase 3 — Written-answer grading (LLM-assisted)
-- [ ] Phase 4 — Marks email, re-eval logging, admin panel
+  roster reconciliation, MCQ/numerical result export, local diagnostics, and review artifacts
+- [x] **Local professor UI and email release** — browser upload, student inspection,
+  unmatched-page assignment, verification, preview queue, dry run, SMTP send log, and
+  duplicate-send protection
+- [x] **Written-answer workflow foundation** — crops, optional offline OCR, manual grading
+  packet/import, and provider interface
+- [ ] Production service hardening — authentication, database-backed jobs, resumable workers,
+  transactional mail provider, and duplicate-sheet adjudication
+- [ ] Real written-answer AI grading and re-evaluation request logging
+
+## Professor UI
+
+```bash
+python -m omr.ui.app
+```
+
+Open `http://127.0.0.1:8765`, then upload the scanned PDF, matching manifest,
+optional answer key, and student roster. CSV/XLSX rosters are normalized into the canonical
+`roll_no,name,email,program` shape. The IIITD portal export is supported even when it contains a
+blank row, `Roll No.`/`Student Name` headers, `Lecture` in `Class Type`, and an email column whose
+header is blank.
+
+After processing, resolve unmatched pages and verify every student from the Review page. Check
+the `Missing Sheets` count against the roster before preparing email. Prepare and inspect the
+email queue using **Sheet Verification - no marks** when returning scanned answer sheets. Use
+**Evaluated Sheet + Marks** only after grading data has been checked and finalized. Run a dry run,
+send one test email with `Limit = 1`, and only then perform the real send. Successful recipients
+are not sent again unless the CLI is explicitly invoked with `--resend`.
 
 ## Generate a sheet
 
@@ -742,5 +764,5 @@ Worth flagging to your professor:
   writes per-page alignment quality reports, color debug pages, overlays, and review flags, but
   thresholds and the optional digit model still need calibration against a larger real
   printed-sheet dataset.
-- **No verification email or hosted review UI yet** — local verification reports and
-  `verified_index.json` exist, but the professor-facing web queue is still future work.
+- **The professor UI is local and single-machine** — it has no authentication, database-backed
+  job queue, or hosted multi-user deployment yet. Keep it bound to `127.0.0.1` for controlled pilots.

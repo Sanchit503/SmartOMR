@@ -196,7 +196,9 @@ MCQ_COLUMN_CANDIDATES = (2, 3, 4)
 
 NUMERICAL_DIGIT_PITCH_MM = 5.2
 NUMERICAL_POSITION_PITCH_MM = 7.0
-NUMERICAL_GRID_OFFSET_X_MM = 8.0
+# Reserve enough room for the longest supported place-value label
+# ("Hundred thousands") without entering the 10 mm printer-safe margin.
+NUMERICAL_GRID_OFFSET_X_MM = 25.0
 NUMERICAL_GRID_OFFSET_Y_MM = 11.0
 NUMERICAL_COLUMN_GAP_MM = 6.0
 NUMERICAL_QUESTION_GAP_MM = 5.0

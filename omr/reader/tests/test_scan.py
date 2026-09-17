@@ -10,7 +10,7 @@ from omr.generator.generate import generate_exam
 from omr.generator.layout import build_layout
 from omr.generator.manifest import build_manifest
 from omr.reader import scan as scan_module
-from omr.reader.scan import ScanError, align_scan_page, detect_page_index
+from omr.reader.scan import ScanError, align_scan_page, detect_page_index, iter_scan_pages
 
 
 DPI = 200
@@ -147,3 +147,17 @@ def test_page_index_rejects_when_bars_and_ocr_are_both_weak(monkeypatch):
 
     with pytest.raises(ScanError, match="OCR fallback"):
         detect_page_index(page, manifest, DPI)
+
+
+def test_pdf_pages_can_be_rendered_incrementally(tmp_path):
+    pdf_path = tmp_path / "three-pages.pdf"
+    with pymupdf.open() as document:
+        for _ in range(3):
+            document.new_page(width=210, height=297)
+        document.save(pdf_path)
+
+    pages = iter_scan_pages(pdf_path, dpi=72)
+
+    first = next(pages)
+    assert first.shape == (297, 210)
+    assert sum(1 for _page in pages) == 2

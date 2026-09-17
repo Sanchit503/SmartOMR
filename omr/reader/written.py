@@ -105,7 +105,7 @@ def crop_written_responses(
         crop_path = output_dir / f"Q{entry['q_no']}.png"
         Image.fromarray(raw_crop, mode="L").save(crop_path)
 
-        ocr_crop_path = None
+        ocr_crop_path = output_dir / f"Q{entry['q_no']}_ink.png"
         if template_images_by_page and page in template_images_by_page:
             template = _gray_array(template_images_by_page[page])
             tx0, ty0, tx1, ty1 = _crop_box_px(entry, dpi, padding_mm=padding_mm)
@@ -116,8 +116,11 @@ def crop_written_responses(
             if tx0 < tx1 and ty0 < ty1:
                 template_crop = template[ty0:ty1, tx0:tx1]
                 ocr_crop = isolate_student_ink(raw_crop, template_crop)
-                ocr_crop_path = output_dir / f"Q{entry['q_no']}_ink.png"
-                Image.fromarray(ocr_crop, mode="L").save(ocr_crop_path)
+            else:
+                ocr_crop = isolate_student_ink(raw_crop)
+        else:
+            ocr_crop = isolate_student_ink(raw_crop)
+        Image.fromarray(ocr_crop, mode="L").save(ocr_crop_path)
 
         crops.append(
             WrittenCrop(
@@ -130,7 +133,7 @@ def crop_written_responses(
                 y_mm=entry["y_mm"],
                 width_mm=entry["width_mm"],
                 height_mm=entry["height_mm"],
-                ocr_crop_path=str(ocr_crop_path) if ocr_crop_path is not None else None,
+                ocr_crop_path=str(ocr_crop_path),
             )
         )
 

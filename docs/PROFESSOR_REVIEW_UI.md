@@ -43,6 +43,12 @@ The upload also accepts institute-style headers such as:
 Roll No., Student Name, Class Type, Email Id
 ```
 
+The IIITD portal CSV export is normalized automatically. Blank rows are skipped,
+`Lecture` in `Class Type` is replaced by a safe program inference from the roll number/current
+term, repeated spaces in names are collapsed, and an otherwise unnamed column is accepted as the
+email column only when the row contains exactly one valid email address. The normalized copy is
+stored as `inputs/students.csv`; the uploaded source remains beside it for audit.
+
 Only the first sheet of an `.xlsx` file is used.
 
 The UI automatically attempts local Tesseract roll-number OCR. On page 1 it
@@ -63,6 +69,7 @@ Important files:
 ```text
 inputs/                         uploaded files
 parsed/<exam_id>/parse_index.json
+parsed/<exam_id>/email_release/email_skipped.csv
 parsed/<exam_id>/students/<roll_no>/student.json
 parsed/<exam_id>/students/<roll_no>/pages/page_1.png
 parsed/<exam_id>/students/<roll_no>/debug/page_1_alignment_overlay.png
@@ -76,11 +83,20 @@ run_state.json
 ```text
 Exam runs
   -> open one exam run
-  -> see all detected students, marks, and review status
+  -> compare detected students with Roster and Missing Sheets counts
+  -> open Review Cases
+  -> assign unmatched pages to a roll or ignore confirmed duplicates/stray pages
   -> click roll number
   -> see full sheet images, overlays, answers, correct answers, marks, and flags
-  -> mark student manually checked or keep in review
+  -> verify, hold, or reject the grouping
+  -> prepare the email queue only after missing/unreadable pages are resolved
+  -> choose Sheet Verification - no marks when returning scans before grading is final
+  -> inspect previews, dry-run, and real-send one test message before releasing the batch
 ```
+
+A student cannot be verified while an expected page is missing. Roster students with no detected
+sheet remain visible in the review page and are written to `email_skipped.csv`; they never silently
+disappear from the release count.
 
 Statuses come from the parser:
 

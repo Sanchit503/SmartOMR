@@ -17,6 +17,16 @@ QUESTION_TEXT_HEADERS = ("question_text", "question", "prompt")
 RUBRIC_HEADERS = ("rubric", "marking_guideline", "marking_guidelines", "guideline", "guidelines")
 MODEL_ANSWER_HEADERS = ("model_answer", "expected_answer", "sample_answer")
 MAX_MARKS_HEADERS = ("max_marks", "marks", "marks_possible")
+PROGRAM_ALIASES = {
+    "BTECH": "BTECH",
+    "BTECHNOLOGY": "BTECH",
+    "MTECH": "MTECH",
+    "MT": "MTECH",
+    "MTECHNOLOGY": "MTECH",
+    "PHD": "PHD",
+    "DOCTOROFPHILOSOPHY": "PHD",
+    "SP": "SP",
+}
 
 
 def _header_key(value: str) -> str:
@@ -39,6 +49,47 @@ def normalize_student_roll(value: str, program: str | None = None) -> str:
     if program_key.startswith("SP") and not roll.startswith("SP"):
         return f"SP{roll}"
     return roll
+
+
+def _program_from_row(value: str, raw_roll: str, row: dict[str, str]) -> str:
+    program_key = re.sub(r"[^A-Z0-9]+", "", str(value or "").upper())
+    if program_key in PROGRAM_ALIASES:
+        return PROGRAM_ALIASES[program_key]
+
+    roll = normalize_roll(raw_roll)
+    if re.fullmatch(r"PHD\d+", roll):
+        return "PHD"
+    if re.fullmatch(r"MT\d+", roll):
+        return "MTECH"
+    if re.fullmatch(r"SP[A-Z0-9]+", roll):
+        return "SP"
+    if re.fullmatch(r"\d{7}", roll):
+        return "BTECH"
+
+    context = " ".join(str(item or "") for item in row.values()).upper()
+    compact_context = re.sub(r"[^A-Z0-9]+", "", context)
+    for marker, program in (("PHD", "PHD"), ("MTECH", "MTECH"), ("BTECH", "BTECH")):
+        if marker in compact_context:
+            return program
+    return ""
+
+
+def _email_from_row(row: dict[str, str]) -> str:
+    configured = _field(row, EMAIL_HEADERS, required=False)
+    if configured:
+        return configured
+
+    candidates = {
+        str(value).strip()
+        for value in row.values()
+        if value is not None
+        and re.fullmatch(r"[^\s@,]+@[^\s@,]+\.[^\s@,]+", str(value).strip())
+    }
+    if len(candidates) == 1:
+        return candidates.pop()
+    if len(candidates) > 1:
+        raise ValueError("CSV row contains multiple possible email addresses")
+    raise ValueError(f"CSV row is missing one of these columns: {', '.join(EMAIL_HEADERS)}")
 
 
 def _field(row: dict[str, str], names: tuple[str, ...], required: bool = True) -> str:
@@ -74,10 +125,13 @@ def load_students(path: str | Path) -> dict[str, Student]:
         if not reader.fieldnames:
             raise ValueError(f"{path} has no header row")
         students: dict[str, Student] = {}
-        known = set(ROLL_HEADERS + NAME_HEADERS + EMAIL_HEADERS + PROGRAM_HEADERS)
+        known = {_header_key(name) for name in ROLL_HEADERS + NAME_HEADERS + EMAIL_HEADERS + PROGRAM_HEADERS}
         for row_no, row in enumerate(reader, start=2):
-            program = _field(row, PROGRAM_HEADERS, required=False).upper()
-            roll_no = normalize_student_roll(_field(row, ROLL_HEADERS), program)
+            if not any(str(value or "").strip() for value in row.values()):
+                continue
+            raw_roll = _field(row, ROLL_HEADERS)
+            program = _program_from_row(_field(row, PROGRAM_HEADERS, required=False), raw_roll, row)
+            roll_no = normalize_student_roll(raw_roll, program)
             if not roll_no:
                 raise ValueError(f"{path}:{row_no} has an empty roll number")
             if roll_no in students:
@@ -85,12 +139,16 @@ def load_students(path: str | Path) -> dict[str, Student]:
             extra = {
                 k: v
                 for k, v in row.items()
-                if k and k.strip().lower() not in known and v is not None and str(v).strip()
+                if k and _header_key(k) not in known and v is not None and str(v).strip()
             }
+            try:
+                email = _email_from_row(row)
+            except ValueError as exc:
+                raise ValueError(f"{path}:{row_no} {exc}") from exc
             students[roll_no] = Student(
                 roll_no=roll_no,
-                name=_field(row, NAME_HEADERS),
-                email=_field(row, EMAIL_HEADERS),
+                name=" ".join(_field(row, NAME_HEADERS).split()),
+                email=email,
                 program=program,
                 extra=extra,
             )

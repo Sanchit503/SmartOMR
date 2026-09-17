@@ -10,8 +10,9 @@ from PIL import Image, ImageDraw
 from omr.contracts.geometry import mm_to_px, px_per_mm
 from omr.generator.config import ExamConfig, WrittenQuestionConfig
 from omr.generator.generate import generate_exam
+from omr.models import Student
 from omr.reader.handwriting import RollOcrResult
-from omr.workflows.batch import parse_exam_bundle
+from omr.workflows.batch import _reconcile_roster, parse_exam_bundle
 
 
 DPI = 200
@@ -30,6 +31,34 @@ class FakeOcr:
     def read_digit(self, crop_path: Path) -> RollOcrResult:
         digit = self.digits.pop(0) if self.digits else ""
         return RollOcrResult(digit, confidence=0.95)
+
+
+def test_roster_reconciliation_exposes_missing_and_unexpected_rolls():
+    roster = {
+        "2024001": Student("2024001", "One", "one@example.edu", "BTECH"),
+        "MT25007": Student("MT25007", "Two", "two@example.edu", "MTECH"),
+    }
+
+    result = _reconcile_roster(
+        roster,
+        [
+            {"student": {"roll_no": "2024001"}},
+            {"student": {"roll_no": "PHD25111"}},
+        ],
+    )
+
+    assert result is not None
+    assert result["roster_total"] == 2
+    assert result["detected_roster_students"] == 1
+    assert result["missing_students"] == [
+        {
+            "roll_no": "MT25007",
+            "student_name": "Two",
+            "student_email": "two@example.edu",
+            "program": "MTECH",
+        }
+    ]
+    assert result["unexpected_rolls"] == ["PHD25111"]
 
 
 def _render_pages(pdf_path: Path) -> dict[int, Image.Image]:

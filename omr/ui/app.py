@@ -20,18 +20,17 @@ import uuid
 import zipfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from email.message import Message
+from email.parser import BytesHeaderParser
+from email.policy import default as email_policy
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any
+from typing import Any, BinaryIO
 from xml.etree import ElementTree
 
-try:  # pragma: no cover - cgi is deprecated but still available on Python 3.11.
-    import cgi
-except DeprecationWarning:  # pragma: no cover
-    import cgi
-
 from omr.contracts import load_manifest
+from omr.io.csv import load_students
 from omr.reader.handwriting import build_roll_ocr_backend
 from omr.workflows.email import (
     EMAIL_LOG_CSV,
@@ -42,9 +41,12 @@ from omr.workflows.email import (
 )
 from omr.workflows.batch import parse_exam_bundle
 from omr.workflows.review import (
+    assign_unmatched_page,
     hold_student,
+    ignore_unmatched_page,
     initialize_verification_index,
     load_or_initialize_verified_index,
+    reject_student,
     verify_student,
 )
 
@@ -55,6 +57,16 @@ DEFAULT_PORT = 8765
 DEFAULT_DATA_DIR = Path("data")
 RUNS_DIR_NAME = "ui_runs"
 RUN_STATE_NAME = "run_state.json"
+MAX_UPLOAD_BYTES = 2 * 1024 * 1024 * 1024
+UPLOAD_READ_SIZE = 1024 * 1024
+MAX_MULTIPART_HEADER_BYTES = 64 * 1024
+MAX_FORM_FIELD_BYTES = 1024 * 1024
+
+
+@dataclass(frozen=True)
+class UploadedFile:
+    filename: str
+    path: Path
 
 
 def _now() -> str:
@@ -80,6 +92,142 @@ def _rel(path: Path, base: Path) -> str:
         return path.relative_to(base).as_posix()
     except ValueError:
         return path.as_posix()
+
+
+def _header_parameter(value: str, header: str, name: str) -> str | None:
+    message = Message()
+    message[header] = value
+    parameter = message.get_param(name, header=header)
+    return str(parameter) if parameter is not None else None
+
+
+def parse_multipart_upload(
+    stream: BinaryIO,
+    *,
+    content_type: str,
+    content_length: int,
+    staging_dir: Path,
+) -> tuple[dict[str, str], dict[str, UploadedFile]]:
+    """Parse a browser multipart upload while streaming file bodies to disk."""
+
+    if content_length <= 0:
+        raise ValueError("empty upload request")
+    if content_length > MAX_UPLOAD_BYTES:
+        raise ValueError(f"upload exceeds the {MAX_UPLOAD_BYTES // (1024 ** 3)} GB limit")
+    boundary_text = _header_parameter(content_type, "content-type", "boundary")
+    if not boundary_text:
+        raise ValueError("expected multipart/form-data with a boundary")
+    media_type = content_type.split(";", 1)[0].strip().lower()
+    if media_type != "multipart/form-data":
+        raise ValueError("expected multipart/form-data")
+
+    delimiter = b"--" + boundary_text.encode("utf-8")
+    closing_delimiter = delimiter + b"--"
+    remaining = content_length
+    fields: dict[str, str] = {}
+    files: dict[str, UploadedFile] = {}
+    staging_dir.mkdir(parents=True, exist_ok=True)
+
+    def read_line(limit: int = UPLOAD_READ_SIZE) -> bytes:
+        nonlocal remaining
+        if remaining <= 0:
+            return b""
+        data = stream.readline(min(limit, remaining))
+        remaining -= len(data)
+        return data
+
+    first = read_line(MAX_MULTIPART_HEADER_BYTES)
+    if first.rstrip(b"\r\n") != delimiter:
+        raise ValueError("malformed multipart upload: opening boundary is missing")
+
+    finished = False
+    while not finished and remaining > 0:
+        header_lines: list[bytes] = []
+        header_size = 0
+        while True:
+            line = read_line(MAX_MULTIPART_HEADER_BYTES)
+            if not line:
+                raise ValueError("malformed multipart upload: truncated part headers")
+            header_size += len(line)
+            if header_size > MAX_MULTIPART_HEADER_BYTES:
+                raise ValueError("multipart part headers are too large")
+            if line in {b"\r\n", b"\n"}:
+                break
+            header_lines.append(line)
+
+        headers = BytesHeaderParser(policy=email_policy).parsebytes(b"".join(header_lines))
+        disposition = headers.get("Content-Disposition", "")
+        field_name = _header_parameter(disposition, "content-disposition", "name")
+        filename = _header_parameter(disposition, "content-disposition", "filename")
+        if not field_name:
+            raise ValueError("multipart part is missing its field name")
+
+        file_handle = None
+        field_buffer = bytearray()
+        if filename:
+            upload_path = staging_dir / f"{uuid.uuid4().hex}_{_safe_id(Path(filename).name)}"
+            file_handle = upload_path.open("wb")
+        previous = b""
+        try:
+            while True:
+                line = read_line()
+                marker = line.rstrip(b"\r\n")
+                if marker in {delimiter, closing_delimiter}:
+                    payload_tail = previous
+                    if payload_tail.endswith(b"\r\n"):
+                        payload_tail = payload_tail[:-2]
+                    elif payload_tail.endswith(b"\n"):
+                        payload_tail = payload_tail[:-1]
+                    if file_handle is not None:
+                        file_handle.write(payload_tail)
+                    else:
+                        field_buffer.extend(payload_tail)
+                    finished = marker == closing_delimiter
+                    break
+                if not line:
+                    raise ValueError("malformed multipart upload: closing boundary is missing")
+                if previous:
+                    if file_handle is not None:
+                        file_handle.write(previous)
+                    else:
+                        field_buffer.extend(previous)
+                        if len(field_buffer) > MAX_FORM_FIELD_BYTES:
+                            raise ValueError(f"form field {field_name!r} is too large")
+                previous = line
+        finally:
+            if file_handle is not None:
+                file_handle.close()
+
+        if filename:
+            previous_file = files.get(field_name)
+            if previous_file is not None:
+                previous_file.path.unlink(missing_ok=True)
+            files[field_name] = UploadedFile(filename=Path(filename).name, path=upload_path)
+        else:
+            fields[field_name] = bytes(field_buffer).decode("utf-8", errors="replace")
+
+    return fields, files
+
+
+def _canonicalize_roster(path: Path) -> dict[str, int]:
+    students = load_students(path)
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=["roll_no", "name", "email", "program"])
+        writer.writeheader()
+        for student in students.values():
+            writer.writerow(
+                {
+                    "roll_no": student.roll_no,
+                    "name": student.name,
+                    "email": student.email,
+                    "program": student.program,
+                }
+            )
+    counts: dict[str, int] = {"total": len(students)}
+    for student in students.values():
+        key = student.program or "UNKNOWN"
+        counts[key] = counts.get(key, 0) + 1
+    return counts
 
 
 def _asset_url(path: str | Path | None, base: Path | None = None) -> str:
@@ -433,7 +581,7 @@ class RunStore:
                     continue
         return runs
 
-    def create_run(self, exam_id: str, files: dict[str, tuple[str, bytes]]) -> dict[str, Any]:
+    def create_run(self, exam_id: str, files: dict[str, UploadedFile]) -> dict[str, Any]:
         run_stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         run_id = _safe_id(f"{exam_id}_{run_stamp}_{uuid.uuid4().hex[:6]}")
         run_dir = self.run_dir(run_id)
@@ -441,12 +589,12 @@ class RunStore:
         inputs.mkdir(parents=True, exist_ok=True)
 
         saved: dict[str, str | None] = {}
-        for field, (filename, content) in files.items():
-            if not filename or not content:
+        for field, upload in files.items():
+            if not upload.filename or not upload.path.exists() or upload.path.stat().st_size == 0:
                 saved[field] = None
                 continue
-            target = inputs / _safe_id(Path(filename).name)
-            target.write_bytes(content)
+            target = inputs / _safe_id(Path(upload.filename).name)
+            shutil.copy2(upload.path, target)
             saved[field] = str(target)
 
         manifest_path = Path(str(saved.get("manifest") or ""))
@@ -467,9 +615,11 @@ class RunStore:
             _normalize_tabular_upload(Path(str(saved["answer_key"])), answer_key_csv)
 
         students_csv = None
+        roster_summary = None
         if saved.get("master_list"):
             students_csv = inputs / "students.csv"
             _normalize_tabular_upload(Path(str(saved["master_list"])), students_csv)
+            roster_summary = _canonicalize_roster(students_csv)
 
         state = {
             "run_id": run_id,
@@ -487,6 +637,7 @@ class RunStore:
                 "original_answer_key_upload": saved.get("answer_key"),
                 "original_master_list_upload": saved.get("master_list"),
             },
+            "roster_summary": roster_summary,
             "parse_dir": None,
             "parse_index_path": None,
             "marks_csv_path": None,
@@ -515,7 +666,7 @@ class RunStore:
                 students_path=inputs.get("students_path"),
                 answer_key_path=inputs.get("answer_key_path"),
                 output_root=parsed_root,
-                dpi=300.0,
+                dpi=200.0,
                 course_id=state["exam_id"],
                 min_group_confidence="high",
                 grouping_mode="auto",
@@ -540,6 +691,7 @@ class RunStore:
                     "needs_review": counts.get("needs_review", 0),
                     "unmatched_pages": counts.get("unmatched_pages", 0),
                     "page_errors": counts.get("page_errors", 0),
+                    "roster_missing": counts.get("roster_missing", 0),
                     "roll_ocr_provider": roll_ocr_state.get("provider"),
                 },
             )
@@ -615,8 +767,10 @@ class SmartOmrUiHandler(BaseHTTPRequestHandler):
                 self._create_run()
             elif path.startswith("/runs/"):
                 parts = [part for part in path.split("/") if part]
-                if len(parts) == 5 and parts[2] == "students" and parts[4] in {"verify", "hold"}:
+                if len(parts) == 5 and parts[2] == "students" and parts[4] in {"verify", "hold", "reject"}:
                     self._student_decision(parts[1], urllib.parse.unquote(parts[3]), parts[4])
+                elif len(parts) == 5 and parts[2] == "unmatched" and parts[4] in {"assign", "ignore"}:
+                    self._unmatched_decision(parts[1], int(parts[3]), parts[4])
                 elif len(parts) == 4 and parts[2] == "email" and parts[3] == "prepare":
                     self._prepare_email(parts[1])
                 elif len(parts) == 4 and parts[2] == "email" and parts[3] == "send":
@@ -628,36 +782,76 @@ class SmartOmrUiHandler(BaseHTTPRequestHandler):
         except Exception as exc:
             self._bad_request(str(exc))
 
-    def _multipart(self) -> cgi.FieldStorage:
-        ctype, pdict = cgi.parse_header(self.headers.get("content-type", ""))
-        if ctype != "multipart/form-data":
-            raise ValueError("expected multipart/form-data")
-        pdict["boundary"] = bytes(pdict["boundary"], "utf-8")
-        pdict["CONTENT-LENGTH"] = int(self.headers.get("content-length", 0))
-        return cgi.FieldStorage(fp=self.rfile, headers=self.headers, environ={"REQUEST_METHOD": "POST"}, keep_blank_values=True)
-
     def _create_run(self) -> None:
-        form = self._multipart()
-        exam_id = str(form.getfirst("exam_id") or "").strip()
-        files: dict[str, tuple[str, bytes]] = {}
-        for field in ("scan_pdf", "manifest", "answer_key", "master_list"):
-            item = form[field] if field in form else None
-            if item is None or not getattr(item, "filename", ""):
-                files[field] = ("", b"")
-                continue
-            files[field] = (Path(item.filename).name, item.file.read())
-        state = self.store.create_run(exam_id, files)
+        staging_dir = self.store.config.runs_dir / "_upload_staging" / uuid.uuid4().hex
+        try:
+            fields, files = parse_multipart_upload(
+                self.rfile,
+                content_type=self.headers.get("content-type", ""),
+                content_length=int(self.headers.get("content-length", 0)),
+                staging_dir=staging_dir,
+            )
+            exam_id = str(fields.get("exam_id") or "").strip()
+            state = self.store.create_run(exam_id, files)
+        finally:
+            shutil.rmtree(staging_dir, ignore_errors=True)
         self.store.start_run(state["run_id"])
         self._redirect(f"/runs/{state['run_id']}")
 
     def _student_decision(self, run_id: str, roll_no: str, action: str) -> None:
         state = self.store.read_state(run_id)
         parse_dir = Path(str(state.get("parse_dir") or ""))
+        form = self._urlencoded_form()
+        note = (form.get("note") or "").strip()
         if action == "verify":
-            verify_student(parse_dir, roll_no, reviewer="professor-ui", note="Marked manually checked from UI.", allow_missing=True)
+            verify_student(
+                parse_dir,
+                roll_no,
+                reviewer="professor-ui",
+                note=note or "Marked manually checked from UI.",
+            )
+        elif action == "hold":
+            hold_student(
+                parse_dir,
+                roll_no,
+                reviewer="professor-ui",
+                reason=note or "Kept in review from UI.",
+            )
         else:
-            hold_student(parse_dir, roll_no, reviewer="professor-ui", reason="Kept in review from UI.")
+            reject_student(
+                parse_dir,
+                roll_no,
+                reviewer="professor-ui",
+                reason=note or "Rejected from professor UI.",
+            )
         self._redirect(f"/runs/{run_id}/students/{urllib.parse.quote(roll_no)}")
+
+    def _unmatched_decision(self, run_id: str, source_index: int, action: str) -> None:
+        state = self.store.read_state(run_id)
+        parse_dir = Path(str(state.get("parse_dir") or ""))
+        form = self._urlencoded_form()
+        note = (form.get("note") or "").strip()
+        if action == "assign":
+            roll_no = (form.get("roll_no") or "").strip().upper()
+            if not roll_no:
+                raise ValueError("roll number is required to assign an unmatched page")
+            page_value = (form.get("page_index") or "").strip()
+            assign_unmatched_page(
+                parse_dir,
+                source_index,
+                roll_no,
+                page_index=int(page_value) if page_value else None,
+                reviewer="professor-ui",
+                note=note or "Assigned from professor UI.",
+            )
+        else:
+            ignore_unmatched_page(
+                parse_dir,
+                source_index,
+                reviewer="professor-ui",
+                reason=note or "Ignored as a stray/duplicate page from professor UI.",
+            )
+        self._redirect(f"/runs/{run_id}/review")
 
     def _urlencoded_form(self) -> dict[str, str]:
         length = int(self.headers.get("content-length", 0))
@@ -671,7 +865,12 @@ class SmartOmrUiHandler(BaseHTTPRequestHandler):
         form = self._urlencoded_form()
         sender = form.get("sender") or "professor@example.edu"
         sender_name = form.get("sender_name") or None
-        subject = form.get("subject") or "{exam_id}: evaluated OMR response sheet"
+        sheet_only = (form.get("release_mode") or "sheet_verification") == "sheet_verification"
+        subject = form.get("subject") or (
+            "{exam_id}: response sheet verification"
+            if sheet_only
+            else "{exam_id}: evaluated OMR response sheet"
+        )
         body_template = form.get("body_template") or None
         prepare_email_release(
             parse_dir,
@@ -679,6 +878,7 @@ class SmartOmrUiHandler(BaseHTTPRequestHandler):
             sender_name=sender_name,
             subject_template=subject,
             body_template=body_template,
+            sheet_only=sheet_only,
         )
         self._redirect(f"/runs/{run_id}/email")
 
@@ -708,10 +908,12 @@ class SmartOmrUiHandler(BaseHTTPRequestHandler):
             dry_run=dry_run,
             limit=limit,
             only_roll=only_roll,
+            delay_seconds=float(form.get("delay_seconds") or "0.25"),
         )
         sent = sum(1 for row in rows if row["status"] == "SENT")
         dry = sum(1 for row in rows if row["status"] == "DRY_RUN")
         failed = sum(1 for row in rows if row["status"] == "FAILED")
+        skipped = sum(1 for row in rows if row["status"] == "SKIPPED_ALREADY_SENT")
         self.store.write_state(
             run_id,
             last_email_send={
@@ -720,6 +922,7 @@ class SmartOmrUiHandler(BaseHTTPRequestHandler):
                 "sent": sent,
                 "dry_run": dry,
                 "failed": failed,
+                "already_sent": skipped,
                 "log_path": str(log_path),
             },
         )
@@ -789,6 +992,7 @@ class SmartOmrUiHandler(BaseHTTPRequestHandler):
         state = self.store.read_state(run_id)
         refresh = 3 if state.get("status") in {"queued", "running"} else None
         summary = state.get("summary") or {}
+        roster_summary = state.get("roster_summary") or {}
         roll_ocr = state.get("roll_ocr") or {}
         roll_ocr_label = (
             str(roll_ocr.get("provider") or "local")
@@ -799,9 +1003,11 @@ class SmartOmrUiHandler(BaseHTTPRequestHandler):
             ("Status", _badge(state.get("status"))),
             ("Stage", html.escape(str(state.get("stage") or ""))),
             ("Students", html.escape(str(summary.get("students", "")))),
+            ("Roster", html.escape(str(roster_summary.get("total", "not uploaded")))),
             ("Ready", html.escape(str(summary.get("ready", "")))),
             ("Needs Review", html.escape(str(summary.get("needs_review", "")))),
             ("Unmatched", html.escape(str(summary.get("unmatched_pages", "")))),
+            ("Missing Sheets", html.escape(str(summary.get("roster_missing", "")))),
             ("Roll OCR", html.escape(roll_ocr_label)),
         ]
         metric_html = "".join(f'<div class="metric"><span>{label}</span><strong>{value}</strong></div>' for label, value in metrics)
@@ -938,9 +1144,17 @@ class SmartOmrUiHandler(BaseHTTPRequestHandler):
                 "</tr>"
             )
         flags = details.get("review_flags", [])
+        missing_pages = list((verified or {}).get("missing_pages", []))
+        verify_action = (
+            f'<form method="post" action="/runs/{html.escape(run_id)}/students/{urllib.parse.quote(roll_no)}/verify">'
+            '<button type="submit">Mark Manually Checked</button></form>'
+            if not missing_pages
+            else '<span class="muted">Assign every missing page before verification.</span>'
+        )
         decision_actions = f"""
-        <form method="post" action="/runs/{html.escape(run_id)}/students/{urllib.parse.quote(roll_no)}/verify"><button type="submit">Mark Manually Checked</button></form>
+        {verify_action}
         <form method="post" action="/runs/{html.escape(run_id)}/students/{urllib.parse.quote(roll_no)}/hold"><button class="secondary" type="submit">Keep Needs Review</button></form>
+        <form method="post" action="/runs/{html.escape(run_id)}/students/{urllib.parse.quote(roll_no)}/reject"><button class="secondary" type="submit">Reject Grouping</button></form>
         """
         body = f"""
         <h1>Student {html.escape(str(student.get('roll_no') or roll_no))}</h1>
@@ -980,43 +1194,105 @@ class SmartOmrUiHandler(BaseHTTPRequestHandler):
     def _page_review(self, run_id: str) -> None:
         state = self.store.read_state(run_id)
         parse_dir = Path(str(state["parse_dir"]))
-        index = _read_json(Path(str(state["parse_index_path"])))
+        index, _verified_path = load_or_initialize_verified_index(parse_dir)
         rows = []
         for student in index.get("students", []):
-            details = _read_json(parse_dir / student["details_path"])
-            flags = details.get("review_flags", [])
-            if not flags:
+            status = str(student.get("status") or "needs_review")
+            flags = list(student.get("review_flags", []))
+            if status == "verified":
                 continue
-            roll = str(details.get("student", {}).get("roll_no") or student.get("roll_no") or "")
-            score, total = _score(details)
+            roll = str(student.get("roll_no") or "")
+            score, total = _score(student)
+            missing = ", ".join(str(page) for page in student.get("missing_pages", []))
+            decisions = student.get("decision_log", [])
+            latest_note = str(decisions[-1].get("note") or "") if decisions else ""
             rows.append(
                 "<tr>"
                 f"<td><a href=\"/runs/{html.escape(run_id)}/students/{urllib.parse.quote(roll)}\">{html.escape(roll)}</a></td>"
                 f"<td>{_fmt_num(score)} / {_fmt_num(total)}</td>"
-                f"<td>{_badge(details.get('status'))}</td>"
+                f"<td>{_badge(status)}</td>"
+                f"<td>{html.escape(missing)}</td>"
                 f"<td>{len(flags)}</td>"
                 f"<td class=\"flags\">{html.escape(' | '.join(str(flag) for flag in flags))}</td>"
+                f"<td>{html.escape(latest_note)}</td>"
                 "</tr>"
             )
         unmatched_rows = []
         for page in index.get("unmatched_pages", []):
+            source_index = int(page.get("source_index") or 0)
+            page_index = page.get("page_index") or ""
+            page_status = str(page.get("status") or "needs_review")
+            actions = ""
+            if page_status == "needs_review":
+                actions = f"""
+                <form method="post" action="/runs/{html.escape(run_id)}/unmatched/{source_index}/assign">
+                  <label>Student roll</label>
+                  <input name="roll_no" list="student-rolls" required placeholder="Roll number">
+                  <label>OMR page</label>
+                  <input name="page_index" type="number" min="1" value="{html.escape(str(page_index))}" required>
+                  <label>Review note</label>
+                  <input name="note" placeholder="Why this page belongs here">
+                  <button type="submit">Assign Page</button>
+                </form>
+                <form method="post" action="/runs/{html.escape(run_id)}/unmatched/{source_index}/ignore">
+                  <input name="note" required placeholder="Reason: duplicate, separator, stray page">
+                  <button class="secondary" type="submit">Ignore Page</button>
+                </form>
+                """
+            else:
+                actions = html.escape(str(page.get("assigned_to_roll_no") or page_status))
             unmatched_rows.append(
                 "<tr>"
-                f"<td>{html.escape(str(page.get('source_index')))}</td>"
-                f"<td>{html.escape(str(page.get('page_index')))}</td>"
+                f"<td>{source_index}</td>"
+                f"<td>{html.escape(str(page_index))}</td>"
+                f"<td>{_badge(page_status)}</td>"
                 f"<td class=\"flags\">{html.escape(' | '.join(str(flag) for flag in page.get('review_flags', [])))}</td>"
                 f"<td><a href=\"{_asset_url(page.get('details_path'), parse_dir)}\">details</a></td>"
+                f"<td>{actions}</td>"
                 "</tr>"
             )
+        page_error_rows = []
+        for error in index.get("page_errors", []):
+            page_error_rows.append(
+                "<tr>"
+                f"<td>{html.escape(str(error.get('source_index') or ''))}</td>"
+                f"<td>{_badge(str(error.get('status') or 'error'))}</td>"
+                f"<td>{html.escape(str(error.get('error_type') or ''))}</td>"
+                f"<td class=\"flags\">{html.escape(' | '.join(str(flag) for flag in error.get('review_flags', [])))}</td>"
+                f"<td><a href=\"{_asset_url(error.get('details_path'), parse_dir)}\">details</a></td>"
+                "</tr>"
+            )
+        missing_roster_rows = []
+        reconciliation = index.get("roster_reconciliation") or {}
+        for student in reconciliation.get("missing_students", []):
+            missing_roster_rows.append(
+                "<tr>"
+                f"<td>{html.escape(str(student.get('roll_no') or ''))}</td>"
+                f"<td>{html.escape(str(student.get('student_name') or ''))}</td>"
+                f"<td>{html.escape(str(student.get('student_email') or ''))}</td>"
+                f"<td>{html.escape(str(student.get('program') or ''))}</td>"
+                "</tr>"
+            )
+        roll_options = "".join(
+            f'<option value="{html.escape(str(student.get("roll_no") or ""))}">'
+            for student in index.get("students", [])
+        )
         body = f"""
         <h1>Review Cases</h1>
         <div class="actions band"><a class="button secondary" href="/runs/{html.escape(run_id)}">Back to Exam</a></div>
+        <datalist id="student-rolls">{roll_options}</datalist>
         <h2>Students Needing Review</h2>
-        <table><thead><tr><th>Roll No</th><th>Marks</th><th>Status</th><th>Flags</th><th>Review Notes</th></tr></thead>
-        <tbody>{''.join(rows) or '<tr><td colspan="5" class="empty">No student review cases</td></tr>'}</tbody></table>
+        <table><thead><tr><th>Roll No</th><th>Marks</th><th>Status</th><th>Missing Pages</th><th>Flags</th><th>Parser Notes</th><th>Latest Decision</th></tr></thead>
+        <tbody>{''.join(rows) or '<tr><td colspan="7" class="empty">No student review cases</td></tr>'}</tbody></table>
         <h2>Unmatched Pages</h2>
-        <table><thead><tr><th>Source Index</th><th>Detected Page</th><th>Flags</th><th>Details</th></tr></thead>
-        <tbody>{''.join(unmatched_rows) or '<tr><td colspan="4" class="empty">No unmatched pages</td></tr>'}</tbody></table>
+        <table><thead><tr><th>Source Index</th><th>Detected Page</th><th>Status</th><th>Flags</th><th>Details</th><th>Resolution</th></tr></thead>
+        <tbody>{''.join(unmatched_rows) or '<tr><td colspan="6" class="empty">No unmatched pages</td></tr>'}</tbody></table>
+        <h2>Unreadable Pages</h2>
+        <table><thead><tr><th>Source Index</th><th>Status</th><th>Error</th><th>Notes</th><th>Details</th></tr></thead>
+        <tbody>{''.join(page_error_rows) or '<tr><td colspan="5" class="empty">No unreadable pages</td></tr>'}</tbody></table>
+        <h2>Roster Students Without A Detected Sheet</h2>
+        <table><thead><tr><th>Roll No</th><th>Name</th><th>Email</th><th>Program</th></tr></thead>
+        <tbody>{''.join(missing_roster_rows) or '<tr><td colspan="4" class="empty">Every roster student has a detected sheet</td></tr>'}</tbody></table>
         """
         self._send_html("Review Cases", body)
 
@@ -1035,6 +1311,13 @@ class SmartOmrUiHandler(BaseHTTPRequestHandler):
           <form method="post" action="/runs/{html.escape(run_id)}/email/prepare">
             <div class="grid">
               <div>
+                <label>Release Type</label>
+                <select name="release_mode">
+                  <option value="sheet_verification">Sheet Verification - no marks</option>
+                  <option value="evaluated_marks">Evaluated Sheet + Marks</option>
+                </select>
+              </div>
+              <div>
                 <label>Sender Email</label>
                 <input name="sender" placeholder="professor@iiitd.ac.in">
               </div>
@@ -1044,19 +1327,9 @@ class SmartOmrUiHandler(BaseHTTPRequestHandler):
               </div>
             </div>
             <label>Subject</label>
-            <input name="subject" value="{{exam_id}}: evaluated OMR response sheet">
+            <input name="subject" placeholder="Uses a safe default for the selected release type">
             <label>Custom Message</label>
-            <textarea name="body_template" rows="10">Dear {{display_name}},
-
-Your evaluated OMR response sheet for {{exam_id}} is attached.
-
-Roll no: {{roll_no}}
-Marks: {{marks_obtained}} / {{max_marks}}
-
-Please contact the course staff if you believe there is a review issue.
-
-Regards,
-Course Team</textarea>
+            <textarea name="body_template" rows="10" placeholder="Leave blank to use the release-type default"></textarea>
             <p class="muted">Available placeholders: {{exam_id}}, {{roll_no}}, {{name}}, {{display_name}}, {{marks_obtained}}, {{max_marks}}</p>
             <button type="submit">Prepare Email Queue</button>
           </form>
@@ -1092,7 +1365,8 @@ $env:SMARTOMR_SMTP_PASSWORD = "GMAIL_APP_PASSWORD"
                 f"<td>{html.escape(row.get('roll_no',''))}</td>"
                 f"<td>{html.escape(row.get('student_name',''))}</td>"
                 f"<td>{html.escape(row.get('student_email',''))}</td>"
-                f"<td>{html.escape(row.get('marks_obtained',''))} / {html.escape(row.get('max_marks',''))}</td>"
+                f"<td>{html.escape('Sheet verification' if row.get('release_mode') == 'sheet_verification' else 'Evaluated marks')}</td>"
+                f"<td>{html.escape('Not included' if row.get('release_mode') == 'sheet_verification' else str(row.get('marks_obtained', '')) + ' / ' + str(row.get('max_marks', '')))}</td>"
                 f"<td><a href=\"{_asset_url(row.get('preview_eml_path'), parse_dir)}\">preview</a></td>"
                 "</tr>"
                 for row in queued[:50]
@@ -1150,6 +1424,10 @@ $env:SMARTOMR_SMTP_PASSWORD = "GMAIL_APP_PASSWORD"
                     <label>Only Roll No</label>
                     <input name="only_roll" placeholder="optional">
                   </div>
+                  <div>
+                    <label>Delay Between Emails (seconds)</label>
+                    <input name="delay_seconds" type="number" min="0" step="0.05" value="0.25">
+                  </div>
                 </div>
                 <button type="submit">Run Email Send</button>
               </form>
@@ -1157,8 +1435,8 @@ $env:SMARTOMR_SMTP_PASSWORD = "GMAIL_APP_PASSWORD"
             </section>
             <h2>Queued Students</h2>
             <table>
-              <thead><tr><th>Roll No</th><th>Name</th><th>Email</th><th>Marks</th><th>Preview</th></tr></thead>
-              <tbody>{rows or '<tr><td colspan="5" class="empty">No queued emails</td></tr>'}</tbody>
+              <thead><tr><th>Roll No</th><th>Name</th><th>Email</th><th>Release Type</th><th>Marks</th><th>Preview</th></tr></thead>
+              <tbody>{rows or '<tr><td colspan="6" class="empty">No queued emails</td></tr>'}</tbody>
             </table>
             <div class="actions band">
               <a class="button secondary" href="{_asset_url(log_path)}">Download Send Log</a>

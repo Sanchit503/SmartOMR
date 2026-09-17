@@ -19,6 +19,7 @@ import os
 import smtplib
 import ssl
 import sys
+import time
 from datetime import datetime, timezone
 from email.message import EmailMessage
 from pathlib import Path
@@ -30,7 +31,9 @@ EMAIL_RELEASE_DIR = "email_release"
 EMAIL_QUEUE_CSV = "email_queue.csv"
 EMAIL_SKIPPED_CSV = "email_skipped.csv"
 EMAIL_LOG_CSV = "email_send_log.csv"
-EMAIL_SCHEMA_VERSION = 1
+EMAIL_SCHEMA_VERSION = 2
+EVALUATED_SUBJECT = "{exam_id}: evaluated OMR response sheet"
+VERIFICATION_SUBJECT = "{exam_id}: response sheet verification"
 
 QUEUE_COLUMNS = [
     "roll_no",
@@ -45,6 +48,7 @@ QUEUE_COLUMNS = [
     "body_txt_path",
     "preview_eml_path",
     "subject",
+    "release_mode",
 ]
 
 SKIPPED_COLUMNS = [
@@ -239,6 +243,7 @@ def _body_text(
     marks_obtained: str,
     max_marks: str,
     body_template: str | None = None,
+    sheet_only: bool = False,
 ) -> str:
     display_name = name or roll_no
     values = {
@@ -251,6 +256,15 @@ def _body_text(
     }
     if body_template and body_template.strip():
         return body_template.format(**values).replace("\r\n", "\n").rstrip() + "\n"
+    if sheet_only:
+        return (
+            f"Dear {display_name},\n\n"
+            f"Your scanned OMR response sheet for {exam_id} is attached for verification.\n\n"
+            f"Roll no: {roll_no}\n\n"
+            "Please contact the course staff promptly if this is not your sheet or any page is missing.\n\n"
+            "Regards,\n"
+            "Course Team\n"
+        )
     return (
         f"Dear {display_name},\n\n"
         f"Your evaluated OMR response sheet for {exam_id} is attached.\n\n"
@@ -302,16 +316,19 @@ def prepare_email_release(
     *,
     sender: str = "professor@example.edu",
     sender_name: str | None = None,
-    subject_template: str = "{exam_id}: evaluated OMR response sheet",
+    subject_template: str = EVALUATED_SUBJECT,
     body_template: str | None = None,
     include_unverified: bool = False,
     include_needs_review: bool = False,
+    sheet_only: bool = False,
 ) -> tuple[dict[str, Any], Path]:
     parsed_root = _parsed_root(parsed_dir)
     verified_path = _verified_index_path(parsed_root)
     if not verified_path.exists():
         raise FileNotFoundError(f"{VERIFIED_INDEX_NAME} not found: {verified_path}")
     verified = _load_json(verified_path)
+    if sheet_only and subject_template == EVALUATED_SUBJECT:
+        subject_template = VERIFICATION_SUBJECT
     exam_id = str(verified.get("exam_id") or parsed_root.name)
     release_dir = parsed_root / EMAIL_RELEASE_DIR
     summaries_dir = release_dir / "summaries"
@@ -355,17 +372,9 @@ def prepare_email_release(
             )
             continue
 
-        marks_obtained, max_marks = _student_score(parsed_root, student, details)
-        answers = _answer_rows(details)
+        marks_obtained, max_marks = ("", "") if sheet_only else _student_score(parsed_root, student, details)
+        answers = [] if sheet_only else _answer_rows(details)
         subject = subject_template.format(exam_id=exam_id, roll_no=roll_no, name=name)
-        summary = _summary_text(
-            exam_id=exam_id,
-            roll_no=roll_no,
-            name=name,
-            marks_obtained=marks_obtained,
-            max_marks=max_marks,
-            answers=answers,
-        )
         body = _body_text(
             exam_id=exam_id,
             roll_no=roll_no,
@@ -373,12 +382,24 @@ def prepare_email_release(
             marks_obtained=marks_obtained,
             max_marks=max_marks,
             body_template=body_template,
+            sheet_only=sheet_only,
         )
         safe_roll = "".join(char if char.isalnum() or char in "._-" else "_" for char in roll_no) or "student"
         summary_path = summaries_dir / f"{safe_roll}_marks_summary.txt"
         body_path = bodies_dir / f"{safe_roll}_email_body.txt"
         preview_path = previews_dir / f"{safe_roll}.eml"
-        summary_path.write_text(summary, encoding="utf-8")
+        attachments = [sheet_path]
+        if not sheet_only:
+            summary = _summary_text(
+                exam_id=exam_id,
+                roll_no=roll_no,
+                name=name,
+                marks_obtained=marks_obtained,
+                max_marks=max_marks,
+                answers=answers,
+            )
+            summary_path.write_text(summary, encoding="utf-8")
+            attachments.append(summary_path)
         body_path.write_text(body, encoding="utf-8")
 
         message = _build_email_message(
@@ -387,7 +408,7 @@ def prepare_email_release(
             recipient=email,
             subject=subject,
             body=body,
-            attachments=[sheet_path, summary_path],
+            attachments=attachments,
         )
         preview_path.write_bytes(bytes(message))
         queue.append(
@@ -400,10 +421,28 @@ def prepare_email_release(
                 "marks_obtained": marks_obtained,
                 "max_marks": max_marks,
                 "verified_sheet_pdf_path": _relative(sheet_path, parsed_root),
-                "summary_txt_path": _relative(summary_path, parsed_root),
+                "summary_txt_path": "" if sheet_only else _relative(summary_path, parsed_root),
                 "body_txt_path": _relative(body_path, parsed_root),
                 "preview_eml_path": _relative(preview_path, parsed_root),
                 "subject": subject,
+                "release_mode": "sheet_verification" if sheet_only else "evaluated_marks",
+            }
+        )
+
+    known_rolls = {str(student.get("roll_no") or "") for student in verified.get("students", [])}
+    reconciliation = verified.get("roster_reconciliation") or {}
+    for missing in reconciliation.get("missing_students", []):
+        roll_no = str(missing.get("roll_no") or "")
+        if roll_no in known_rolls:
+            continue
+        skipped.append(
+            {
+                "roll_no": roll_no,
+                "student_name": str(missing.get("student_name") or ""),
+                "student_email": str(missing.get("student_email") or ""),
+                "status": "missing_sheet",
+                "eligible_for_email": "false",
+                "reason": "no parsed student sheet was detected for this roster entry",
             }
         )
 
@@ -419,6 +458,7 @@ def prepare_email_release(
         "body_template": body_template,
         "include_unverified": include_unverified,
         "include_needs_review": include_needs_review,
+        "sheet_only": sheet_only,
         "queued": len(queue),
         "skipped": len(skipped),
         "queue_csv": f"{EMAIL_RELEASE_DIR}/{EMAIL_QUEUE_CSV}",
@@ -442,6 +482,17 @@ def _append_log(path: Path, rows: list[dict[str, str]]) -> None:
         writer.writerows(rows)
 
 
+def _sent_recipients(path: Path) -> set[tuple[str, str]]:
+    if not path.exists():
+        return set()
+    with path.open(newline="", encoding="utf-8-sig") as handle:
+        return {
+            (str(row.get("roll_no") or ""), str(row.get("student_email") or "").lower())
+            for row in csv.DictReader(handle)
+            if row.get("status") == "SENT"
+        }
+
+
 def send_email_release(
     queue_csv: str | Path,
     *,
@@ -454,19 +505,47 @@ def send_email_release(
     dry_run: bool = True,
     limit: int | None = None,
     only_roll: str | None = None,
+    resend: bool = False,
+    delay_seconds: float = 0.0,
 ) -> tuple[list[dict[str, str]], Path]:
+    if delay_seconds < 0:
+        raise ValueError("delay_seconds must be non-negative")
     queue_path = Path(queue_csv).resolve()
     release_dir = queue_path.parent
     parsed_root = release_dir.parent
     rows = _read_queue(queue_path)
     if only_roll:
         rows = [row for row in rows if str(row.get("roll_no")) == str(only_roll)]
+    log_path = release_dir / EMAIL_LOG_CSV
+    already_sent = _sent_recipients(log_path) if not dry_run and not resend else set()
+    skipped_rows = [
+        row
+        for row in rows
+        if (str(row.get("roll_no") or ""), str(row.get("student_email") or "").lower()) in already_sent
+    ]
+    if already_sent:
+        rows = [
+            row
+            for row in rows
+            if (str(row.get("roll_no") or ""), str(row.get("student_email") or "").lower()) not in already_sent
+        ]
     if limit is not None:
         rows = rows[:limit]
 
-    log_rows: list[dict[str, str]] = []
+    log_rows: list[dict[str, str]] = [
+        {
+            "created_at": _now(),
+            "roll_no": row.get("roll_no", ""),
+            "student_email": row.get("student_email", ""),
+            "status": "SKIPPED_ALREADY_SENT",
+            "message": "previous SENT entry exists; use --resend to override",
+            "subject": row.get("subject", ""),
+            "verified_sheet_pdf_path": row.get("verified_sheet_pdf_path", ""),
+        }
+        for row in skipped_rows
+    ]
     smtp: smtplib.SMTP | None = None
-    if not dry_run:
+    if not dry_run and rows:
         smtp = smtplib.SMTP(smtp_host, smtp_port, timeout=60)
         smtp.starttls(context=ssl.create_default_context())
         smtp.login(username, password)
@@ -474,11 +553,11 @@ def send_email_release(
         for row in rows:
             try:
                 sheet_path = _resolve_path(row["verified_sheet_pdf_path"], parsed_root)
-                summary_path = _resolve_path(row["summary_txt_path"], parsed_root)
+                summary_path = _resolve_path(row.get("summary_txt_path"), parsed_root)
                 body_path = _resolve_path(row["body_txt_path"], parsed_root)
                 if sheet_path is None or not sheet_path.exists():
                     raise FileNotFoundError(f"sheet attachment not found: {sheet_path}")
-                if summary_path is None or not summary_path.exists():
+                if row.get("summary_txt_path") and (summary_path is None or not summary_path.exists()):
                     raise FileNotFoundError(f"summary attachment not found: {summary_path}")
                 if body_path is None or not body_path.exists():
                     raise FileNotFoundError(f"email body not found: {body_path}")
@@ -489,7 +568,7 @@ def send_email_release(
                     recipient=row["student_email"],
                     subject=row["subject"],
                     body=body,
-                    attachments=[sheet_path, summary_path],
+                    attachments=[sheet_path] + ([summary_path] if summary_path is not None else []),
                 )
                 if dry_run:
                     status = "DRY_RUN"
@@ -499,6 +578,8 @@ def send_email_release(
                     smtp.send_message(message)
                     status = "SENT"
                     message_text = "sent"
+                    if delay_seconds > 0:
+                        time.sleep(delay_seconds)
             except Exception as exc:  # Continue sending other students.
                 status = "FAILED"
                 message_text = f"{type(exc).__name__}: {exc}"
@@ -517,7 +598,6 @@ def send_email_release(
         if smtp is not None:
             smtp.quit()
 
-    log_path = release_dir / EMAIL_LOG_CSV
     _append_log(log_path, log_rows)
     return log_rows, log_path
 
@@ -533,10 +613,11 @@ def build_parser() -> argparse.ArgumentParser:
     prepare.add_argument("--parsed-dir", required=True, type=Path)
     prepare.add_argument("--sender", default="professor@example.edu")
     prepare.add_argument("--sender-name", default=None)
-    prepare.add_argument("--subject", default="{exam_id}: evaluated OMR response sheet")
+    prepare.add_argument("--subject", default=EVALUATED_SUBJECT)
     prepare.add_argument("--body-template", default=None)
     prepare.add_argument("--include-unverified", action="store_true")
     prepare.add_argument("--include-needs-review", action="store_true")
+    prepare.add_argument("--sheet-only", action="store_true", help="Attach only the verified sheet; omit marks and answer summary")
 
     send = subparsers.add_parser("send", help="Send a prepared email queue through SMTP")
     send.add_argument("--queue-csv", required=True, type=Path)
@@ -550,6 +631,8 @@ def build_parser() -> argparse.ArgumentParser:
     send.add_argument("--send", action="store_true", help="Actually send. Without this, only a dry-run log is written.")
     send.add_argument("--limit", type=int, default=None)
     send.add_argument("--only-roll", default=None)
+    send.add_argument("--resend", action="store_true", help="Allow sending again to recipients already logged as SENT")
+    send.add_argument("--delay-seconds", type=float, default=0.25, help="Pause between real emails")
     return parser
 
 
@@ -565,6 +648,7 @@ def main(argv: list[str] | None = None) -> int:
                 body_template=args.body_template,
                 include_unverified=args.include_unverified,
                 include_needs_review=args.include_needs_review,
+                sheet_only=args.sheet_only,
             )
             print(f"Wrote {queue_path}")
             print(f"queued={metadata['queued']} skipped={metadata['skipped']}")
@@ -595,12 +679,15 @@ def main(argv: list[str] | None = None) -> int:
             dry_run=not args.send,
             limit=args.limit,
             only_roll=args.only_roll,
+            resend=args.resend,
+            delay_seconds=args.delay_seconds,
         )
         sent = sum(1 for row in rows if row["status"] == "SENT")
         dry = sum(1 for row in rows if row["status"] == "DRY_RUN")
         failed = sum(1 for row in rows if row["status"] == "FAILED")
+        skipped = sum(1 for row in rows if row["status"] == "SKIPPED_ALREADY_SENT")
         print(f"Wrote {log_path}")
-        print(f"sent={sent} dry_run={dry} failed={failed}")
+        print(f"sent={sent} dry_run={dry} failed={failed} already_sent={skipped}")
         if not args.send:
             print("dry_run=true add --send only after reviewing the queue/previews")
         return 0 if failed == 0 else 1

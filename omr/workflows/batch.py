@@ -33,7 +33,7 @@ from omr.reader.handwriting import (
     save_roll_number_crop_sets,
 )
 from omr.reader.identity import read_roll_number
-from omr.reader.scan import ScanError, align_scan_page, load_scan_pages
+from omr.reader.scan import ScanError, align_scan_page, iter_scan_pages
 from omr.reader.written import crop_written_responses
 from omr.workflows.parse import (
     DEFAULT_OUTPUT_ROOT,
@@ -1013,6 +1013,37 @@ def _identity_program(identity: dict[str, Any] | None) -> str:
     return ""
 
 
+def _reconcile_roster(
+    students: dict[str, Student] | None,
+    student_results: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    if students is None:
+        return None
+    detected_rolls = {
+        str(result.get("student", {}).get("roll_no") or "")
+        for result in student_results
+        if result.get("student", {}).get("roll_no")
+    }
+    missing_rolls = sorted(set(students) - detected_rolls)
+    unexpected_rolls = sorted(detected_rolls - set(students))
+    return {
+        "roster_total": len(students),
+        "detected_roster_students": len(set(students) & detected_rolls),
+        "missing_count": len(missing_rolls),
+        "unexpected_count": len(unexpected_rolls),
+        "missing_students": [
+            {
+                "roll_no": students[roll_no].roll_no,
+                "student_name": students[roll_no].name,
+                "student_email": students[roll_no].email,
+                "program": students[roll_no].program,
+            }
+            for roll_no in missing_rolls
+        ],
+        "unexpected_rolls": unexpected_rolls,
+    }
+
+
 def _student_report_row(
     result: dict[str, Any],
     manifest: dict,
@@ -1437,8 +1468,7 @@ def parse_exam_bundle(
 
     source_counter = 0
     for scan_path in _scan_files(Path(scans_path)):
-        raw_pages = load_scan_pages(scan_path, dpi)
-        for raw_page in raw_pages:
+        for raw_page in iter_scan_pages(scan_path, dpi):
             source_counter += 1
             identity_dir = root / "_page_identity" / f"source_{source_counter:04d}"
             try:
@@ -1522,6 +1552,7 @@ def parse_exam_bundle(
         )
 
     unmatched_results = [_write_unmatched_page(record, manifest, root, dpi) for record in unmatched]
+    roster_reconciliation = _reconcile_roster(students, student_results)
     index_path = root / "parse_index.json"
     index = {
         "exam_id": manifest["exam_id"],
@@ -1535,7 +1566,9 @@ def parse_exam_bundle(
             "needs_review": sum(1 for result in student_results if result["status"] == "needs_review"),
             "unmatched_pages": len(unmatched_results),
             "page_errors": len(page_errors),
+            "roster_missing": int(roster_reconciliation["missing_count"]) if roster_reconciliation else 0,
         },
+        "roster_reconciliation": roster_reconciliation,
         "students": [
             {
                 "roll_no": result["student"]["roll_no"],

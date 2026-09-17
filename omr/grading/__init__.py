@@ -7,7 +7,6 @@ mock, and future LLM-assisted written grading.
 """
 from .bubbles import fill_ratio, student_mark_fill_ratio
 from .mcq import MCQGrade, MCQOutcome, MCQReading, grade_mcq_responses, mcq_sample_centers, read_mcq_responses
-from .numeric import NumericOutcome, NumericReading, normalize_numeric_answer, numeric_sample_centers, read_numeric_responses
 from .written import (
     MockWrittenGrader,
     WrittenGradeRequest,
@@ -23,8 +22,6 @@ __all__ = [
     "MCQGrade",
     "MCQOutcome",
     "MCQReading",
-    "NumericOutcome",
-    "NumericReading",
     "MockWrittenGrader",
     "WrittenGradeRequest",
     "WrittenGradeResult",
@@ -35,10 +32,7 @@ __all__ = [
     "grade_written_answer",
     "grade_written_answers",
     "mcq_sample_centers",
-    "normalize_numeric_answer",
-    "numeric_sample_centers",
     "read_mcq_responses",
-    "read_numeric_responses",
     "student_mark_fill_ratio",
     "validate_written_grade_result",
 ]

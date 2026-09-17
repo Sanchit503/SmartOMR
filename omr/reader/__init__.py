@@ -24,6 +24,7 @@ from .scan import (
     align_scan_page,
     align_scan_pages,
     detect_page_index,
+    iter_scan_pages,
     load_scan_pages,
 )
 from .quality import assess_alignment_quality, save_alignment_overlay, save_alignment_report, save_sampling_overlay
@@ -45,6 +46,7 @@ __all__ = [
     "build_roll_ocr_backend",
     "build_written_ocr_backend",
     "detect_page_index",
+    "iter_scan_pages",
     "load_scan_pages",
     "normalize_handwritten_roll_text",
     "read_numerical_responses",

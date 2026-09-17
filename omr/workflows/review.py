@@ -743,6 +743,7 @@ def initialize_verification_index(
         "parser_grouping_mode": parse_index.get("grouping_mode"),
         "detected_page_sequence": parse_index.get("detected_page_sequence", []),
         "expected_pages": len(expected_pages),
+        "roster_reconciliation": parse_index.get("roster_reconciliation"),
         "created_at": _now(),
         "updated_at": None,
         "students": [

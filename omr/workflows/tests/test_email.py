@@ -34,6 +34,27 @@ def test_roster_loader_accepts_professor_excel_headers(tmp_path: Path):
     assert students["SP24ABC"].email == "s@example.edu"
 
 
+def test_roster_loader_accepts_real_portal_export_shape(tmp_path: Path):
+    roster = tmp_path / "portal-export.csv"
+    roster.write_text(
+        "Sl.No.,Roll No.,Class Type,Student Name,Student's Current Term,Registered For,\n"
+        ",,,,,,\n"
+        "1,PhD25111,Lecture,Tushar  Kumar ,July 2025/PhD/ECE-IIITD/Semester 3,,phd@example.edu\n"
+        "2,MT25007,Lecture,Aastha   ,July 2025/MTech (CSE)/Gen-IIITD/Semester 3,,mt@example.edu\n"
+        "3,2024479,Lecture,Rohit  Gola ,July 2024/BTech/CSAI-IIITD/Semester 5,,bt@example.edu\n",
+        encoding="utf-8",
+    )
+
+    students = load_students(roster)
+
+    assert list(students) == ["PHD25111", "MT25007", "2024479"]
+    assert students["PHD25111"].program == "PHD"
+    assert students["MT25007"].program == "MTECH"
+    assert students["2024479"].program == "BTECH"
+    assert students["PHD25111"].name == "Tushar Kumar"
+    assert students["MT25007"].email == "mt@example.edu"
+
+
 def test_prepare_email_release_queues_only_verified_eligible_students(tmp_path: Path):
     parsed = tmp_path / "parsed" / "CSE557_QUIZ1_2026"
     verified_sheet = parsed / "verified" / "students" / "2024001" / "sheet.pdf"
@@ -122,3 +143,73 @@ def test_prepare_email_release_queues_only_verified_eligible_students(tmp_path: 
     )
     assert rows[0]["status"] == "DRY_RUN"
     assert log_path.exists()
+
+    with log_path.open("a", newline="", encoding="utf-8") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(
+            [
+                "2026-09-17T00:00:00+00:00",
+                "2024001",
+                "a@example.edu",
+                "SENT",
+                "sent",
+                queue_rows[0]["subject"],
+                queue_rows[0]["verified_sheet_pdf_path"],
+            ]
+        )
+
+    repeated, _log_path = send_email_release(
+        queue_path,
+        smtp_host="smtp.example.edu",
+        username="professor@example.edu",
+        password="unused",
+        sender="professor@example.edu",
+        dry_run=False,
+    )
+    assert repeated[0]["status"] == "SKIPPED_ALREADY_SENT"
+
+    sheet_metadata, sheet_queue_path = prepare_email_release(
+        parsed,
+        sender="professor@example.edu",
+        sheet_only=True,
+    )
+    assert sheet_metadata["sheet_only"] is True
+    with sheet_queue_path.open(newline="", encoding="utf-8") as handle:
+        sheet_row = next(csv.DictReader(handle))
+    assert sheet_row["release_mode"] == "sheet_verification"
+    assert sheet_row["summary_txt_path"] == ""
+    assert sheet_row["marks_obtained"] == ""
+    body = (parsed / sheet_row["body_txt_path"]).read_text(encoding="utf-8")
+    assert "attached for verification" in body
+    assert "Marks:" not in body
+
+
+def test_prepare_email_release_reports_roster_students_without_sheets(tmp_path: Path):
+    parsed = tmp_path / "parsed" / "CSE557_QUIZ1_2026"
+    _write_json(
+        parsed / "verified_index.json",
+        {
+            "exam_id": "CSE557_QUIZ1_2026",
+            "students": [],
+            "roster_reconciliation": {
+                "missing_students": [
+                    {
+                        "roll_no": "2024999",
+                        "student_name": "Missing Student",
+                        "student_email": "missing@example.edu",
+                        "program": "BTECH",
+                    }
+                ]
+            },
+        },
+    )
+
+    metadata, queue_path = prepare_email_release(parsed)
+
+    assert metadata["queued"] == 0
+    assert metadata["skipped"] == 1
+    with (queue_path.parent / "email_skipped.csv").open(newline="", encoding="utf-8") as handle:
+        row = next(csv.DictReader(handle))
+    assert row["roll_no"] == "2024999"
+    assert row["status"] == "missing_sheet"
+    assert "no parsed student sheet" in row["reason"]
