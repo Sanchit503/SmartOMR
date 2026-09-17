@@ -32,6 +32,17 @@ optional answer key, and student roster. CSV/XLSX rosters are normalized into th
 blank row, `Roll No.`/`Student Name` headers, `Lecture` in `Class Type`, and an email column whose
 header is blank.
 
+The professor UI requires local roll-number OCR and refuses to start a processing run if Tesseract
+is unavailable. Run this preflight before uploading the final scanner PDF:
+
+```powershell
+.\.venv\Scripts\python.exe -m omr.health --check-handwriting-ocr
+```
+
+It must report `handwriting_ocr: ready`. On Windows, SmartOMR discovers the normal
+`C:\Program Files\Tesseract-OCR\tesseract.exe` installation automatically; a custom location can be
+set through `SMARTOMR_TESSERACT_CMD`.
+
 After processing, resolve unmatched pages and verify every student from the Review page. Check
 the `Missing Sheets` count against the roster before preparing email. Prepare and inspect the
 email queue using **Sheet Verification - no marks** when returning scanned answer sheets. Use

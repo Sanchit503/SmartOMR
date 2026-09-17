@@ -51,10 +51,18 @@ stored as `inputs/students.csv`; the uploaded source remains beside it for audit
 
 Only the first sheet of an `.xlsx` file is used.
 
-The UI automatically attempts local Tesseract roll-number OCR. On page 1 it
-compares the bubbled roll grid against the written roll boxes in the manifest.
-If both are readable and disagree, that student is marked `needs_review`.
-Continuation-page written roll OCR uses the same backend for grouping.
+The UI requires local Tesseract roll-number OCR. It refuses to process a run instead of silently
+falling back when that backend is unavailable. Before the final upload, run:
+
+```powershell
+.\.venv\Scripts\python.exe -m omr.health --check-handwriting-ocr
+```
+
+On page 1, SmartOMR independently reads the bubbled roll grid and the written roll boxes. A
+confident disagreement is marked `needs_review`; unreadable or low-confidence page-1 OCR is also
+reviewed because the bubbled identity was not independently confirmed. Continuation-page written
+roll OCR uses the same backend for grouping. The run dashboard must show
+`Roll OCR: local_tesseract`.
 
 ## Output
 

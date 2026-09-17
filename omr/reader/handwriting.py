@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 import re
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
@@ -137,6 +138,8 @@ class LocalTesseractRollOcr:
     """
 
     provider = "local_tesseract"
+    fast_cell_first = True
+    parallel_cell_reads = True
 
     def __init__(self, tesseract_cmd: str | None = None) -> None:
         try:
@@ -170,32 +173,20 @@ class LocalTesseractRollOcr:
         image = Image.open(crop_path).convert("L")
         candidates: list[dict[str, object]] = []
 
-        for variant_name, variant in _prepare_ocr_variants(image):
-            for psm in ("--psm 7", "--psm 8", "--psm 13"):
-                whole = self._read_image(variant, psm, whitelist="0123456789MTPHDSP")
-                candidates.append({"kind": "whole-strip", "variant": variant_name, "psm": psm, **whole})
-
-        expected_digits = _expected_digit_count(program)
-        if expected_digits:
-            segmented_text = ""
-            segment_confidences: list[float] = []
-            segment_payloads: list[dict[str, object]] = []
-            for cell in _segment_digit_cells(image, expected_digits):
-                read = self.read_digit_image(cell)
-                digit = _first_digit(read.text)
-                segmented_text += digit or "?"
-                if read.confidence is not None:
-                    segment_confidences.append(float(read.confidence))
-                segment_payloads.append({"text": read.text, "confidence": read.confidence, "raw": read.raw})
-            if "?" not in segmented_text:
-                candidates.append(
-                    {
-                        "kind": "cell-strip",
-                        "text": segmented_text,
-                        "confidence": float(np.median(segment_confidences)) if segment_confidences else None,
-                        "segments": segment_payloads,
-                    }
+        prepared = dict(_prepare_ocr_variants(image))
+        variant_names = [name for name in ("gray_clean", "otsu_clean") if name in prepared]
+        if not variant_names:
+            variant_names = list(prepared)[:1]
+        variants = [(name, prepared[name]) for name in variant_names]
+        with ThreadPoolExecutor(max_workers=len(variants)) as executor:
+            reads = list(
+                executor.map(
+                    lambda item: self._read_image(item[1], "--psm 7", whitelist="0123456789MTPHDSP"),
+                    variants,
                 )
+            )
+        for (variant_name, _variant), whole in zip(variants, reads):
+            candidates.append({"kind": "whole-strip", "variant": variant_name, "psm": "--psm 7", **whole})
 
         best = _best_ocr_candidate(candidates, program)
         return RollOcrResult(
@@ -210,15 +201,14 @@ class LocalTesseractRollOcr:
     def read_digit_image(self, image: Image.Image) -> RollOcrResult:
         attempts: list[dict[str, object]] = []
         votes: dict[str, list[float]] = {}
-        for variant_name, variant in _prepare_ocr_variants(image):
-            for psm in ("--psm 10", "--psm 13"):
-                read = self._read_image(variant, psm, whitelist="0123456789")
-                digit = _first_digit(read["text"])
-                attempts.append({"variant": variant_name, "psm": psm, "digit": digit, **read})
-                if digit is None:
-                    continue
-                confidence = _clamp_confidence(read.get("confidence"))
-                votes.setdefault(digit, []).append(confidence if confidence is not None else 0.58)
+        prepared = dict(_prepare_digit_ocr_variants(image))
+        variant_name = "pil_gray" if "pil_gray" in prepared else next(iter(prepared))
+        read = self._read_image(prepared[variant_name], "--psm 10", whitelist="0123456789")
+        digit = _first_digit(read["text"])
+        attempts.append({"variant": variant_name, "psm": "--psm 10", "digit": digit, **read})
+        if digit is not None:
+            confidence = _clamp_confidence(read.get("confidence"))
+            votes.setdefault(digit, []).append(confidence if confidence is not None else 0.58)
 
         if not votes:
             return RollOcrResult("", confidence=0.0, raw={"attempts": attempts})
@@ -236,7 +226,6 @@ class LocalTesseractRollOcr:
 
     def _read_image(self, image: Image.Image, psm_config: str, whitelist: str) -> dict[str, object]:
         config = f"{psm_config} -c tessedit_char_whitelist={whitelist}"
-        text = self.pytesseract.image_to_string(image, config=config).strip()
         confidences: list[float] = []
         try:
             data = self.pytesseract.image_to_data(
@@ -244,6 +233,7 @@ class LocalTesseractRollOcr:
                 config=config,
                 output_type=self.pytesseract.Output.DICT,
             )
+            text = "".join(str(value) for value in data.get("text", []) if str(value).strip())
             for value in data.get("conf", []):
                 try:
                     confidence = float(value)
@@ -252,7 +242,7 @@ class LocalTesseractRollOcr:
                 if confidence >= 0:
                     confidences.append(confidence / 100.0)
         except Exception:
-            pass
+            text = self.pytesseract.image_to_string(image, config=config).strip()
         compact = re.sub(r"[^0-9A-Za-z]+", "", text.upper())
         return {
             "text": compact,
@@ -486,10 +476,18 @@ def _read_write_in_roll_number(
     candidates: list[tuple[str, str, float | None, str, str]] = []
     for program in programs_to_read:
         crop_path = Path(crop_paths[program])
-        strip_result = ocr_backend.read_roll(crop_path, program=program)
-        strip_normalized = normalize_handwritten_roll_text(strip_result.text, program=program)
         cell_result = _read_roll_from_cells(ocr_backend, [Path(path) for path in cell_crop_paths.get(program, [])], program)
         cell_normalized = normalize_handwritten_roll_text(cell_result.text, program=program)
+        trusted_cells = bool(cell_normalized) and (valid_rolls is None or cell_normalized in valid_rolls)
+        if getattr(ocr_backend, "fast_cell_first", False) and trusted_cells:
+            strip_result = RollOcrResult(
+                "",
+                confidence=None,
+                raw={"skipped": "validated cell OCR succeeded"},
+            )
+        else:
+            strip_result = ocr_backend.read_roll(crop_path, program=program)
+        strip_normalized = normalize_handwritten_roll_text(strip_result.text, program=program)
         ocr_results[program] = {
             "strip": _ocr_result_payload(strip_result),
             "cells": _ocr_result_payload(cell_result),
@@ -596,14 +594,21 @@ def _read_roll_from_cells(
     if expected_count is None or len(cell_paths) != expected_count:
         return RollOcrResult("", confidence=0.0, raw={"reason": "missing exact cell geometry"})
 
+    def read_cell(cell_path: Path) -> RollOcrResult:
+        if hasattr(backend, "read_digit"):
+            return backend.read_digit(cell_path)  # type: ignore[attr-defined]
+        return backend.read_roll(cell_path, program=program)
+
+    if getattr(backend, "parallel_cell_reads", False) and len(cell_paths) > 1:
+        with ThreadPoolExecutor(max_workers=min(8, len(cell_paths))) as executor:
+            results = list(executor.map(read_cell, cell_paths))
+    else:
+        results = [read_cell(cell_path) for cell_path in cell_paths]
+
     digits = ""
     confidences: list[float] = []
     cell_payloads: list[dict[str, object]] = []
-    for cell_path in cell_paths:
-        if hasattr(backend, "read_digit"):
-            result = backend.read_digit(cell_path)  # type: ignore[attr-defined]
-        else:
-            result = backend.read_roll(cell_path, program=program)
+    for result in results:
         digit = _first_digit(result.text)
         digits += digit or "?"
         if result.confidence is not None:
@@ -613,7 +618,7 @@ def _read_roll_from_cells(
     if "?" in digits:
         return RollOcrResult(digits, confidence=0.0, raw={"cells": cell_payloads})
     text = _format_roll_digits(program, digits)
-    confidence = min(confidences) if confidences else 0.62
+    confidence = float(np.median(confidences)) if confidences else 0.62
     return RollOcrResult(text, confidence=confidence, raw={"cells": cell_payloads})
 
 
@@ -753,6 +758,24 @@ def _prepare_ocr_variants(image: Image.Image) -> list[tuple[str, Image.Image]]:
         "gray_clean": _remove_box_lines(normalized),
     }
     return [(name, Image.fromarray(value, mode="L")) for name, value in variants.items()]
+
+
+def _prepare_digit_ocr_variants(image: Image.Image) -> list[tuple[str, Image.Image]]:
+    """Prepare a boxed digit without morphology that can erase straight strokes."""
+    gray = ImageOps.autocontrast(image.convert("L"))
+    width, height = gray.size
+    margin_x = max(1, round(width * 0.08))
+    margin_y = max(1, round(height * 0.08))
+    if width > 2 * margin_x and height > 2 * margin_y:
+        gray = gray.crop((margin_x, margin_y, width - margin_x, height - margin_y))
+    pil_resized = ImageOps.expand(
+        ImageOps.autocontrast(
+            gray.resize((gray.width * 4, gray.height * 4), Image.Resampling.LANCZOS)
+        ),
+        border=16,
+        fill=255,
+    )
+    return [("pil_gray", pil_resized)]
 
 
 def _remove_box_lines(binary_or_gray: np.ndarray) -> np.ndarray:

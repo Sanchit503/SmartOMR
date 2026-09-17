@@ -182,7 +182,17 @@ def _page_identity(
             )
             payload["write_in_roll_read"] = asdict(write_in)
             write_roll_no = normalize_roll(write_in.roll_no or "") if write_in.roll_no else None
-            if roll_no and write_roll_no and roll_no != write_roll_no and write_in.confidence != "low":
+            if not write_roll_no:
+                flags.append(
+                    "page-1 write-in roll OCR could not be decoded confidently; "
+                    "the bubbled roll was not independently confirmed"
+                )
+            elif write_in.confidence == "low":
+                flags.append(
+                    f"page-1 write-in roll OCR {write_roll_no} has low confidence; "
+                    "the bubbled roll requires manual confirmation"
+                )
+            elif roll_no and roll_no != write_roll_no:
                 flags.append(f"page-1 write-in roll {write_roll_no} conflicts with bubbled roll {roll_no}")
             if not roll_no and write_roll_no:
                 return "write_in", write_roll_no, write_in.program, write_in.confidence, payload, flags
@@ -847,19 +857,35 @@ def _write_student_group(
         if roll.program:
             program = roll.program
         if roll_ocr_backend is not None:
-            write_in = read_write_in_roll_number(
-                images_by_page[1],
-                manifest,
-                dpi,
-                1,
-                output_dir / "identity",
-                ocr_backend=roll_ocr_backend,
-                selected_program=roll.program or program,
-                valid_rolls=set(students) if students else None,
-            )
-            roll_read["write_in_roll_read"] = asdict(write_in)
-            write_roll_no = normalize_roll(write_in.roll_no or "") if write_in.roll_no else None
-            if write_roll_no and write_roll_no != roll_no and write_in.confidence != "low":
+            page_one_identity = selected_by_page[1].identity_payload or {}
+            cached_write_in = page_one_identity.get("write_in_roll_read")
+            if isinstance(cached_write_in, dict):
+                write_in_payload = dict(cached_write_in)
+                crops, cell_crops = save_roll_number_crop_sets(
+                    images_by_page[1],
+                    manifest,
+                    1,
+                    output_dir / "identity",
+                    dpi,
+                )
+                write_in_payload["crop_paths"] = crops
+                write_in_payload["cell_crop_paths"] = cell_crops
+            else:
+                write_in = read_write_in_roll_number(
+                    images_by_page[1],
+                    manifest,
+                    dpi,
+                    1,
+                    output_dir / "identity",
+                    ocr_backend=roll_ocr_backend,
+                    selected_program=roll.program or program,
+                    valid_rolls=set(students) if students else None,
+                )
+                write_in_payload = asdict(write_in)
+            roll_read["write_in_roll_read"] = write_in_payload
+            write_roll_no = normalize_roll(str(write_in_payload.get("roll_no") or "")) or None
+            write_in_confidence = str(write_in_payload.get("confidence") or "low")
+            if write_roll_no and write_roll_no != roll_no and write_in_confidence != "low":
                 review_flags.append(f"page-1 write-in roll {write_roll_no} conflicts with grouped roll {roll_no}")
 
     student = _match_student(roll_no, program, students, review_flags)

@@ -411,6 +411,17 @@ def _build_ui_roll_ocr_backend() -> tuple[object | None, dict[str, Any]]:
     }
 
 
+def _require_ui_roll_ocr_backend() -> tuple[object, dict[str, Any]]:
+    backend, state = _build_ui_roll_ocr_backend()
+    if backend is None:
+        detail = str(state.get("warning") or "local roll OCR could not be initialized")
+        raise RuntimeError(
+            "Roll-number OCR is required for professor UI processing. "
+            f"{detail} Install Tesseract or set SMARTOMR_TESSERACT_CMD, then start the run again."
+        )
+    return backend, state
+
+
 def _xlsx_shared_strings(zf: zipfile.ZipFile) -> list[str]:
     path = "xl/sharedStrings.xml"
     if path not in zf.namelist():
@@ -657,7 +668,7 @@ class RunStore:
             run_dir = self.run_dir(run_id)
             parsed_root = run_dir / "parsed"
             self.write_state(run_id, stage="Preparing roll OCR cross-check")
-            roll_ocr_backend, roll_ocr_state = _build_ui_roll_ocr_backend()
+            roll_ocr_backend, roll_ocr_state = _require_ui_roll_ocr_backend()
             self.write_state(run_id, roll_ocr=roll_ocr_state)
             self.write_state(run_id, stage="Rendering PDF and aligning pages")
             results, index_path = parse_exam_bundle(

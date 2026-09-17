@@ -4,7 +4,6 @@ from __future__ import annotations
 import argparse
 import importlib
 import json
-import os
 import sys
 import tempfile
 from pathlib import Path
@@ -71,32 +70,21 @@ def _writable_check(path: Path | None) -> dict[str, Any]:
 
 def _handwriting_ocr_check() -> dict[str, Any]:
     try:
-        import pytesseract
+        from omr.reader.handwriting import build_roll_ocr_backend
+
+        backend = build_roll_ocr_backend("local")
     except Exception as exc:
         return {
             "name": "handwriting_ocr",
             "status": "error",
-            "detail": f"pytesseract unavailable: {type(exc).__name__}: {exc}",
+            "detail": f"{type(exc).__name__}: {exc}",
         }
-    command = os.environ.get("SMARTOMR_TESSERACT_CMD")
-    if command:
-        pytesseract.pytesseract.tesseract_cmd = command
-    try:
-        version = str(pytesseract.get_tesseract_version())
-    except Exception as exc:
-        return {
-            "name": "handwriting_ocr",
-            "status": "error",
-            "detail": f"tesseract binary unavailable: {type(exc).__name__}: {exc}",
-        }
-    result = {
+    return {
         "name": "handwriting_ocr",
         "status": "ready",
-        "version": version,
+        "provider": getattr(backend, "provider", "local"),
+        "version": str(getattr(backend, "version", "unknown")),
     }
-    if command:
-        result["command"] = command
-    return result
 
 
 def _written_htr_check() -> dict[str, Any]:

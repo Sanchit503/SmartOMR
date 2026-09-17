@@ -266,6 +266,42 @@ def test_batch_flags_first_page_write_in_roll_conflict(tmp_path: Path):
     assert payload["status_counts"]["needs_review"] == 1
 
 
+def test_batch_flags_unreadable_first_page_write_in_roll(tmp_path: Path):
+    result = generate_exam(
+        ExamConfig(
+            exam_id="BATCH_ROLL_UNREADABLE_TEST",
+            course_code="CSE202",
+            exam_name="Quiz",
+            exam_type="quiz",
+            num_mcq=5,
+            mcq_options=4,
+            marks_per_mcq=1,
+        ),
+        tmp_path / "exam",
+    )
+    manifest = result["manifest"]
+    pages = _render_pages(result["pdf_path"])
+    _fill_btech_roll(pages[1], manifest, "2024587")
+
+    bundle_path = tmp_path / "roll_unreadable_bundle.pdf"
+    pages[1].save(bundle_path, resolution=DPI)
+
+    students, _index_path = parse_exam_bundle(
+        bundle_path,
+        result["manifest_path"],
+        output_root=tmp_path / "parsed",
+        dpi=DPI,
+        ocr_backend=FakeOcr(digits="", roll_text=""),
+    )
+
+    assert len(students) == 1
+    assert students[0]["status"] == "needs_review"
+    assert any(
+        "page-1 write-in roll OCR could not be decoded confidently" in flag
+        for flag in students[0]["review_flags"]
+    )
+
+
 def test_batch_pdf_groups_page_major_scanner_order_without_continuation_ocr(tmp_path: Path):
     result = generate_exam(
         ExamConfig(

@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import io
 
+import pytest
+
 from omr.io.csv import load_students
+from omr.ui import app
 from omr.ui.app import UPLOAD_READ_SIZE, _canonicalize_roster, parse_multipart_upload
 
 
@@ -61,3 +64,14 @@ def test_canonicalize_roster_repairs_portal_export(tmp_path):
     assert list(students) == ["PHD25111", "MT25007", "2024479"]
     assert students["PHD25111"].email == "phd@example.edu"
     assert roster.read_text(encoding="utf-8").splitlines()[0] == "roll_no,name,email,program"
+
+
+def test_professor_ui_refuses_to_process_without_roll_ocr(monkeypatch):
+    monkeypatch.setattr(
+        app,
+        "_build_ui_roll_ocr_backend",
+        lambda: (None, {"enabled": False, "provider": "none", "warning": "Tesseract missing"}),
+    )
+
+    with pytest.raises(RuntimeError, match="Roll-number OCR is required.*Tesseract missing"):
+        app._require_ui_roll_ocr_backend()
