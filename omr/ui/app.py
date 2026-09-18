@@ -919,7 +919,10 @@ class SmartOmrUiHandler(BaseHTTPRequestHandler):
         dry_run = mode != "send"
         limit_value = (form.get("limit") or "").strip()
         limit = int(limit_value) if limit_value else None
+        confirm_value = (form.get("confirm_count") or "").strip()
+        confirm_count = int(confirm_value) if confirm_value else None
         only_roll = (form.get("only_roll") or "").strip() or None
+        test_recipient = (form.get("test_recipient") or "").strip() or None
         password = form.get("password") or ""
         if not dry_run and not password:
             raise ValueError("SMTP password/app password is required for real sending")
@@ -935,8 +938,12 @@ class SmartOmrUiHandler(BaseHTTPRequestHandler):
             limit=limit,
             only_roll=only_roll,
             delay_seconds=float(form.get("delay_seconds") or "0.25"),
+            smtp_security=form.get("smtp_security") or "starttls",
+            test_recipient=test_recipient,
+            confirm_count=confirm_count,
         )
         sent = sum(1 for row in rows if row["status"] == "SENT")
+        test_sent = sum(1 for row in rows if row["status"] == "TEST_SENT")
         dry = sum(1 for row in rows if row["status"] == "DRY_RUN")
         failed = sum(1 for row in rows if row["status"] == "FAILED")
         skipped = sum(1 for row in rows if row["status"] == "SKIPPED_ALREADY_SENT")
@@ -946,6 +953,7 @@ class SmartOmrUiHandler(BaseHTTPRequestHandler):
                 "created_at": _now(),
                 "mode": mode,
                 "sent": sent,
+                "test_sent": test_sent,
                 "dry_run": dry,
                 "failed": failed,
                 "already_sent": skipped,
@@ -1385,8 +1393,7 @@ class SmartOmrUiHandler(BaseHTTPRequestHandler):
   --sender "professor@gmail.com" `
   --sender-name "Course Staff"
 
-# real send after dry-run and one-email test
-$env:SMARTOMR_SMTP_PASSWORD = "GMAIL_APP_PASSWORD"
+# safe test: redirects one complete message to course staff
 .\\.venv\\Scripts\\python.exe -m omr.workflows.email send `
   --queue-csv "{queue_path}" `
   --smtp-host smtp.gmail.com `
@@ -1394,7 +1401,18 @@ $env:SMARTOMR_SMTP_PASSWORD = "GMAIL_APP_PASSWORD"
   --username "professor@gmail.com" `
   --sender "professor@gmail.com" `
   --sender-name "Course Staff" `
-  --limit 1 `
+  --test-recipient "professor@gmail.com" `
+  --send
+
+# real student send after reviewing the redirected test
+.\\.venv\\Scripts\\python.exe -m omr.workflows.email send `
+  --queue-csv "{queue_path}" `
+  --smtp-host smtp.gmail.com `
+  --smtp-port 587 `
+  --username "professor@gmail.com" `
+  --sender "professor@gmail.com" `
+  --sender-name "Course Staff" `
+  --confirm-count {len(queued)} `
   --send"""
             rows = "".join(
                 "<tr>"
@@ -1418,7 +1436,7 @@ $env:SMARTOMR_SMTP_PASSWORD = "GMAIL_APP_PASSWORD"
             </div>
             <section class="band">
               <h2>Send From UI</h2>
-              <p class="muted">Start with Dry Run, then send one test using Limit = 1. Real Send requires an SMTP/app password and will email students.</p>
+              <p class="muted">Start with Dry Run, then use Test Recipient to redirect one complete test to course staff. Students are contacted only by a confirmed real send.</p>
               <form method="post" action="/runs/{html.escape(run_id)}/email/send">
                 <div class="grid">
                   <div>
@@ -1435,6 +1453,13 @@ $env:SMARTOMR_SMTP_PASSWORD = "GMAIL_APP_PASSWORD"
                   <div>
                     <label>SMTP Port</label>
                     <input name="smtp_port" value="587">
+                  </div>
+                  <div>
+                    <label>SMTP Security</label>
+                    <select name="smtp_security">
+                      <option value="starttls">STARTTLS</option>
+                      <option value="ssl">SSL/TLS</option>
+                    </select>
                   </div>
                   <div>
                     <label>Username</label>
@@ -1454,7 +1479,15 @@ $env:SMARTOMR_SMTP_PASSWORD = "GMAIL_APP_PASSWORD"
                   </div>
                   <div>
                     <label>Limit</label>
-                    <input name="limit" placeholder="1 for test send">
+                    <input name="limit" placeholder="optional batch limit">
+                  </div>
+                  <div>
+                    <label>Test Recipient</label>
+                    <input name="test_recipient" placeholder="professor@iiitd.ac.in">
+                  </div>
+                  <div>
+                    <label>Confirm Recipient Count</label>
+                    <input name="confirm_count" type="number" min="1" placeholder="required for real student send">
                   </div>
                   <div>
                     <label>Only Roll No</label>

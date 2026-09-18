@@ -47,8 +47,69 @@ After processing, resolve unmatched pages and verify every student from the Revi
 the `Missing Sheets` count against the roster before preparing email. Prepare and inspect the
 email queue using **Sheet Verification - no marks** when returning scanned answer sheets. Use
 **Evaluated Sheet + Marks** only after grading data has been checked and finalized. Run a dry run,
-send one test email with `Limit = 1`, and only then perform the real send. Successful recipients
-are not sent again unless the CLI is explicitly invoked with `--resend`.
+redirect one test email to a course-staff address, and only then perform the real send. Successful
+recipients are not sent again unless the CLI is explicitly invoked with `--resend`.
+
+## Mail final PDFs from a folder
+
+This workflow is independent of OMR parsing. Supply the final per-student PDFs and the master
+roster. Name each PDF exactly `<roll_no>.pdf`, or use `<roll_no>/sheet.pdf`. The preparer validates
+that every PDF maps to one roster row, contains exactly two pages, is within the attachment size
+limit, and has no duplicate roll or recipient email. It then freezes hashed copies of the PDFs so
+later changes cannot silently alter an approved release.
+
+```powershell
+.\.venv\Scripts\python.exe -m omr.workflows.email prepare-folder `
+  --pdf-dir "D:\final_student_pdfs" `
+  --roster "D:\students.csv" `
+  --marks-file "D:\tentative_marks.xlsx" `
+  --body-template-file "D:\email_message.txt" `
+  --output-dir "data\mail_releases\CSE557_QUIZ1_2026" `
+  --exam-id "CSE557_QUIZ1_2026" `
+  --sender "professor@iiitd.ac.in" `
+  --sender-name "CSE557 Course Staff"
+```
+
+See [docs/EMAIL_RELEASE_WORKFLOW.md](docs/EMAIL_RELEASE_WORKFLOW.md) for the accepted marks columns,
+message placeholders, validation checklist, and complete safe-send sequence.
+
+Review `email_queue.csv`, `email_skipped.csv`, and the messages under `previews/`. A dry run opens
+no SMTP connection and sends nothing:
+
+```powershell
+.\.venv\Scripts\python.exe -m omr.workflows.email send `
+  --queue-csv "data\mail_releases\CSE557_QUIZ1_2026\email_queue.csv" `
+  --smtp-host smtp.gmail.com --smtp-port 587 --smtp-security starttls `
+  --username "professor@iiitd.ac.in" --sender "professor@iiitd.ac.in"
+```
+
+The first real operation must be a redirected test. It attaches one real student PDF but sends it
+only to the specified course-staff address; it does not mark the student as sent. The password is
+prompted without being written to a file or command line:
+
+```powershell
+.\.venv\Scripts\python.exe -m omr.workflows.email send `
+  --queue-csv "data\mail_releases\CSE557_QUIZ1_2026\email_queue.csv" `
+  --smtp-host smtp.gmail.com --smtp-port 587 --smtp-security starttls `
+  --username "professor@iiitd.ac.in" --sender "professor@iiitd.ac.in" `
+  --test-recipient "professor@iiitd.ac.in" --send
+```
+
+After checking that test, send to students by confirming the exact unsent count printed during
+preparation (example: 150):
+
+```powershell
+.\.venv\Scripts\python.exe -m omr.workflows.email send `
+  --queue-csv "data\mail_releases\CSE557_QUIZ1_2026\email_queue.csv" `
+  --smtp-host smtp.gmail.com --smtp-port 587 --smtp-security starttls `
+  --username "professor@iiitd.ac.in" --sender "professor@iiitd.ac.in" `
+  --confirm-count 150 --delay-seconds 0.5 --send
+```
+
+Each successful delivery is logged immediately in `email_send_log.csv`. Re-running the same
+command skips already-sent students and reports the new confirmation count required for the
+remaining recipients. Use the SMTP host, port, security mode, and app password or relay credential
+approved for the professor's college account.
 
 ## Generate a sheet
 

@@ -1,169 +1,146 @@
-# Email Release Workflow
+# Mailing Final Student PDFs
 
-This workflow sends each verified student either their response sheet for verification or their
-evaluated response sheet with marks. The local UI defaults to the safer sheet-verification mode.
+Use this workflow after the two-page PDF for each student has been checked. It does not depend on
+OMR grouping or OCR. It matches filenames to the master roster, imports tentative marks, creates
+reviewable email previews, and sends with safeguards against wrong attachments and duplicate mail.
 
-It is intentionally two-step:
+## 1. Prepare The Inputs
+
+Create one folder containing only final student PDFs:
 
 ```text
-prepare -> review queue/previews -> send
+final_student_pdfs/
+  2024432.pdf       BTech
+  MT25007.pdf       MTech
+  PHD25111.pdf      PhD
 ```
 
-Do not send directly from a raw 300-page PDF. First run SmartOMR, review flagged cases,
-and verify/approve student sheets.
+Filenames are case-insensitive, but the roll must match the roster after spaces are removed and
+letters are uppercased. Each PDF must have exactly two pages by default.
 
-## Release Modes
+The master roster must be a CSV with roll, name, email, and program columns. Common headings such
+as `Roll No`, `Student Name`, `Email ID`, and `Program` are accepted.
 
-### Sheet verification (recommended for returning scans)
+The tentative-marks file may be CSV or XLSX. It needs one roll column, one marks column, and either
+a maximum-marks column or the `--max-marks` command option. For example:
 
-Each message contains only the verified multi-page student PDF. It does not contain computed marks,
-correct answers, or a marks-summary attachment. This mode is appropriate after pages have been
-grouped and manually verified, even when grading is not final.
+```csv
+roll_no,marks_obtained,max_marks
+2024432,17,20
+MT25007,14.5,20
+PHD25111,19,20
+```
 
-In the UI, leave **Release Type** set to **Sheet Verification - no marks**. From the CLI, add
-`--sheet-only`:
+Create a UTF-8 text file named `email_message.txt`. Supported placeholders are
+`{display_name}`, `{name}`, `{roll_no}`, `{exam_id}`, `{marks_obtained}`, and `{max_marks}`.
+
+```text
+Dear {display_name},
+
+Please find attached your evaluated response sheet for {exam_id}.
+
+Tentative marks: {marks_obtained} / {max_marks}
+
+Please contact the course staff by the announced deadline if you find a discrepancy.
+
+Regards,
+CSE557 Course Staff
+```
+
+## 2. Install And Prepare
+
+From PowerShell in the cloned repository:
 
 ```powershell
-.\.venv\Scripts\python.exe -m omr.workflows.email prepare `
-  --parsed-dir "data\ui_runs\<run_id>\parsed\<exam_id>" `
-  --sender "professor@iiitd.ac.in" `
-  --sender-name "Course Staff" `
-  --sheet-only
+cd D:\SmartOMR
+git pull
+py -3.11 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -e .
 ```
 
-### Evaluated sheet and marks
-
-For each eligible student:
-
-- evaluated OMR PDF from `verified/students/<roll_no>/sheet.pdf`
-- text marks summary attachment
-- email body containing roll number and marks
-
-Use this mode only after objective results, written marks, and any manually assigned pages have
-been rechecked. It is the CLI default when `--sheet-only` is omitted.
-
-Students are queued only when:
-
-```text
-status = verified
-eligible_for_email = true
-student email is present
-verified sheet PDF exists
-```
-
-Needs-review or missing-page students are skipped by default. When a roster was uploaded, students
-for whom no sheet was detected are also included in `email_skipped.csv` with `missing_sheet` status.
-
-## Prepare Queue
+Prepare a frozen release. Replace the example paths and sender address:
 
 ```powershell
-cd "C:\IIIT Delhi\BTP\SmartOMR"
-
-.\.venv\Scripts\python.exe -m omr.workflows.email prepare `
-  --parsed-dir "data\ui_runs\<run_id>\parsed\<exam_id>" `
+.\.venv\Scripts\python.exe -m omr.workflows.email prepare-folder `
+  --pdf-dir "D:\Mailing\final_student_pdfs" `
+  --roster "D:\Mailing\students.csv" `
+  --marks-file "D:\Mailing\tentative_marks.xlsx" `
+  --body-template-file "D:\Mailing\email_message.txt" `
+  --output-dir "D:\Mailing\release" `
+  --exam-id "CSE557_QUIZ1_2026" `
   --sender "professor@iiitd.ac.in" `
-  --sender-name "Course Staff"
+  --sender-name "CSE557 Course Staff" `
+  --expected-pages 2
 ```
 
-This writes:
+If the marks file has no total column, add `--max-marks 20`. Preparation sends nothing. It stops
+on an unknown/duplicate roll, invalid email, missing recipient mark, malformed PDF, wrong page
+count, oversized attachment, or invalid message placeholder.
+
+## 3. Review Before Sending
+
+Open and verify:
 
 ```text
-email_release/email_queue.csv
-email_release/email_skipped.csv
-email_release/previews/<roll_no>.eml
-email_release/summaries/<roll_no>_marks_summary.txt  # evaluated mode only
-email_release/bodies/<roll_no>_email_body.txt
+release/email_queue.csv       exact recipients, marks, attachments, and subjects
+release/email_skipped.csv     roster students with no supplied PDF
+release/previews/*.eml        complete email previews with attachments
+release/attachments/*.pdf     frozen PDFs that will actually be sent
+release/bodies/*.txt          rendered message for each student
+release/email_release.json    release counts and integrity metadata
 ```
 
-Review before sending:
+Check the queued count, several BTech/MTech/PhD rows, marks, recipient addresses, and attachments.
+Do not edit files inside `release` after preparation; integrity checks intentionally reject edits.
 
-```text
-email_queue.csv       who will receive email
-email_skipped.csv     who will not receive email and why
-previews/*.eml        exact message previews
-```
-
-## Dry Run
-
-Dry run writes a log but sends nothing:
+Run a dry run. This opens no SMTP connection and sends nothing:
 
 ```powershell
 .\.venv\Scripts\python.exe -m omr.workflows.email send `
-  --queue-csv "data\ui_runs\<run_id>\parsed\<exam_id>\email_release\email_queue.csv" `
-  --smtp-host smtp.gmail.com `
-  --smtp-port 587 `
-  --username "professor@gmail.com" `
-  --sender "professor@gmail.com" `
-  --sender-name "Course Staff"
+  --queue-csv "D:\Mailing\release\email_queue.csv" `
+  --smtp-host smtp.gmail.com --smtp-port 587 --smtp-security starttls `
+  --username "professor@iiitd.ac.in" --sender "professor@iiitd.ac.in"
 ```
 
-Output:
+## 4. Send One Redirected Test
 
-```text
-email_release/email_send_log.csv
-```
-
-Rows will have:
-
-```text
-status = DRY_RUN
-```
-
-## Send For Real
-
-Set the SMTP password in an environment variable:
-
-```powershell
-$env:SMARTOMR_SMTP_PASSWORD = "app-password-or-smtp-password"
-```
-
-Then send one test email first:
+The first real send must go to a staff-controlled address. It uses one complete student email but
+does not contact that student and does not mark the student as sent:
 
 ```powershell
 .\.venv\Scripts\python.exe -m omr.workflows.email send `
-  --queue-csv "data\ui_runs\<run_id>\parsed\<exam_id>\email_release\email_queue.csv" `
-  --smtp-host smtp.gmail.com `
-  --smtp-port 587 `
-  --username "professor@gmail.com" `
-  --sender "professor@gmail.com" `
-  --sender-name "Course Staff" `
-  --limit 1 `
+  --queue-csv "D:\Mailing\release\email_queue.csv" `
+  --smtp-host smtp.gmail.com --smtp-port 587 --smtp-security starttls `
+  --username "professor@iiitd.ac.in" --sender "professor@iiitd.ac.in" `
+  --sender-name "CSE557 Course Staff" `
+  --test-recipient "course-staff@iiitd.ac.in" `
   --send
 ```
 
-If the test email is correct, send the rest:
+The password is requested in a hidden prompt. Never put it in the command, spreadsheet, repository,
+or chat. Inspect the received test email, marks, wording, and both PDF pages.
+
+## 5. Send The Confirmed Batch
+
+Use the exact unsent recipient count reported by the tool. Example for 150 recipients:
 
 ```powershell
 .\.venv\Scripts\python.exe -m omr.workflows.email send `
-  --queue-csv "data\ui_runs\<run_id>\parsed\<exam_id>\email_release\email_queue.csv" `
-  --smtp-host smtp.gmail.com `
-  --smtp-port 587 `
-  --username "professor@gmail.com" `
-  --sender "professor@gmail.com" `
-  --sender-name "Course Staff" `
+  --queue-csv "D:\Mailing\release\email_queue.csv" `
+  --smtp-host smtp.gmail.com --smtp-port 587 --smtp-security starttls `
+  --username "professor@iiitd.ac.in" --sender "professor@iiitd.ac.in" `
+  --sender-name "CSE557 Course Staff" `
+  --confirm-count 150 --delay-seconds 0.5 `
   --send
 ```
 
-Real sends pause for `0.25` seconds between messages by default. A successful `SENT` record prevents
-that roll/email pair from being sent again if the command or UI button is accidentally run twice.
-Use `--resend` only for a deliberate repeat after checking `email_send_log.csv`.
+Every successful delivery is immediately recorded in `release/email_send_log.csv`. If the command
+is interrupted, run it again with the new unsent count; already successful students are skipped.
+Do not use `--resend` unless a deliberate duplicate delivery has been approved.
 
-Preparing a queue never sends mail. Before a real batch send, inspect `email_queue.csv`,
-`email_skipped.csv`, and several `.eml` previews; run a dry run; then perform one real test send to
-an approved recipient or roll number. Do not use `--resend` for the remaining batch after that test:
-the successful test recipient will be skipped automatically while unsent rows continue.
+## SMTP Requirement
 
-## Gmail Note
-
-Normal Gmail password login usually does not work for SMTP. Use one of:
-
-```text
-Gmail App Password
-Google Workspace SMTP relay
-another SMTP account provided by the institute
-```
-
-If the professor only logs into Gmail in a browser for 10-15 minutes, that alone
-does not give Python permission to send 300 emails. We need SMTP credentials or
-an approved mail API/OAuth setup.
-
+A browser login or normal Google password is usually insufficient. The professor account needs an
+approved SMTP method: a Google app password, an institute SMTP relay, or another credential issued
+by IT. Confirm this before the mailing window. The release can be prepared and reviewed without any
+mail credential.
