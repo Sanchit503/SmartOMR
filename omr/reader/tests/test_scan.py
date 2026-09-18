@@ -120,6 +120,42 @@ def test_dark_background_photo_still_finds_inner_marker_contours(tmp_path):
     assert aligned.page_index == 1
 
 
+def test_scanner_frame_recovers_when_handwriting_touches_corner_marker(tmp_path):
+    import cv2
+
+    result = generate_exam(
+        ExamConfig(
+            exam_id="TOUCHED_MARKER_SCAN_TEST",
+            course_code="CSE101",
+            exam_name="Scan Test",
+            exam_type="quiz",
+            num_mcq=4,
+            mcq_options=4,
+            marks_per_mcq=1,
+            written_questions=[],
+        ),
+        tmp_path,
+    )
+    with pymupdf.open(result["pdf_path"]) as doc:
+        pix = doc[0].get_pixmap(dpi=DPI, colorspace=pymupdf.csGRAY)
+    page = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width).copy()
+    top_left = next(marker for marker in result["manifest"]["fiducials"] if marker["corner"] == "TL")
+    cx, cy = mm_to_px(top_left["x_mm"], top_left["y_mm"], DPI)
+    marker_half_size = round(top_left["size_mm"] * px_per_mm(DPI) / 2)
+    extension = round(4 * px_per_mm(DPI))
+    cv2.rectangle(
+        page,
+        (cx - marker_half_size - extension // 2, cy - marker_half_size - extension // 2),
+        (cx + marker_half_size + extension // 2, cy + marker_half_size + extension // 2),
+        0,
+        -1,
+    )
+
+    aligned = align_scan_page(page, result["manifest"], dpi=DPI)
+
+    assert aligned.page_index == 1
+
+
 def test_page_index_uses_ocr_when_bars_are_weak(monkeypatch):
     manifest = _manifest()
     width, height = canonical_size_px(manifest, DPI)

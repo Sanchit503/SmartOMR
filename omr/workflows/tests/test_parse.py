@@ -299,3 +299,94 @@ def test_numerical_payload_scores_value_and_preserves_written_digits(tmp_path: P
     assert responses[0]["value"] == 7
     assert responses[0]["correct_value"] == 7
     assert responses[0]["marks_awarded"] == 2
+
+
+def test_invalid_numerical_answer_key_is_rejected_before_scan_loading(tmp_path: Path):
+    result = generate_exam(
+        ExamConfig(
+            exam_id="NUMERICAL_KEY_PREFLIGHT_TEST",
+            course_code="CSE202",
+            exam_name="Numerical Quiz",
+            exam_type="quiz",
+            num_mcq=0,
+            numerical_questions=[NumericalQuestionConfig(q_no=1, max_marks=1, digits=2)],
+        ),
+        tmp_path / "exam",
+    )
+    answer_key = tmp_path / "answer_key.csv"
+    answer_key.write_text("q_no,answer,marks\n1,0,2\n", encoding="utf-8")
+
+    try:
+        parse_scan(
+            tmp_path / "scan-does-not-exist.pdf",
+            manifest_path=result["manifest_path"],
+            output_dir=tmp_path / "parsed",
+            answer_key_path=answer_key,
+            dpi=DPI,
+        )
+        assert False, "invalid numerical marks should fail during preflight"
+    except ValueError as exc:
+        assert "Q1 marks must match manifest max_marks" in str(exc)
+
+
+def test_zero_mark_numerical_key_drops_question_without_review(tmp_path: Path):
+    result = generate_exam(
+        ExamConfig(
+            exam_id="DROPPED_NUMERICAL_TEST",
+            course_code="CSE202",
+            exam_name="Numerical Quiz",
+            exam_type="quiz",
+            num_mcq=0,
+            numerical_questions=[NumericalQuestionConfig(q_no=1, max_marks=1, digits=2)],
+        ),
+        tmp_path / "dropped_exam",
+    )
+    page = _render_pages(result["pdf_path"])[1]
+    flags: list[str] = []
+
+    responses, score, total = _numerical_payload(
+        {1: np.asarray(page)},
+        result["manifest"],
+        DPI,
+        {1: AnswerKeyEntry(q_no=1, answer="0", marks=0)},
+        flags,
+    )
+
+    assert score == 0
+    assert total == 0
+    assert flags == []
+    assert responses[0]["dropped"] is True
+    assert responses[0]["printed_max_marks"] == 1
+    assert responses[0]["max_marks"] == 0
+    assert responses[0]["marks_awarded"] == 0
+
+
+def test_missing_numerical_answer_key_row_is_rejected_during_preflight(tmp_path: Path):
+    result = generate_exam(
+        ExamConfig(
+            exam_id="MISSING_NUMERICAL_KEY_TEST",
+            course_code="CSE202",
+            exam_name="Numerical Quiz",
+            exam_type="quiz",
+            num_mcq=0,
+            numerical_questions=[
+                NumericalQuestionConfig(q_no=1, max_marks=1, digits=2),
+                NumericalQuestionConfig(q_no=2, max_marks=1, digits=2),
+            ],
+        ),
+        tmp_path / "missing_key_exam",
+    )
+    answer_key = tmp_path / "answer_key.csv"
+    answer_key.write_text("q_no,answer,marks\n1,7,1\n", encoding="utf-8")
+
+    try:
+        parse_scan(
+            tmp_path / "scan-does-not-exist.pdf",
+            manifest_path=result["manifest_path"],
+            output_dir=tmp_path / "parsed",
+            answer_key_path=answer_key,
+            dpi=DPI,
+        )
+        assert False, "a missing numerical answer-key row should fail during preflight"
+    except ValueError as exc:
+        assert "missing numerical question(s): Q2" in str(exc)

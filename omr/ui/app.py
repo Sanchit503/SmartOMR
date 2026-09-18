@@ -51,7 +51,7 @@ from omr.workflows.review import (
 )
 
 
-APP_TITLE = "SmartOMR Professor Review"
+APP_TITLE = "SmartOMR"
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
 DEFAULT_DATA_DIR = Path("data")
@@ -671,6 +671,20 @@ class RunStore:
             roll_ocr_backend, roll_ocr_state = _require_ui_roll_ocr_backend()
             self.write_state(run_id, roll_ocr=roll_ocr_state)
             self.write_state(run_id, stage="Rendering PDF and aligning pages")
+
+            def update_progress(progress: dict[str, Any]) -> None:
+                phase = str(progress.get("phase") or "")
+                processed = int(progress.get("processed") or 0)
+                total = int(progress.get("total") or 0)
+                errors = int(progress.get("errors") or 0)
+                if phase == "reading_pages":
+                    stage = f"Reading and aligning page {processed}/{total}" if total else f"Reading page {processed}"
+                else:
+                    stage = f"Writing student bundle {processed}/{total}" if total else "Writing student bundles"
+                if errors:
+                    stage += f" ({errors} page error{'s' if errors != 1 else ''})"
+                self.write_state(run_id, stage=stage, progress=progress)
+
             results, index_path = parse_exam_bundle(
                 scans_path=inputs["scan_path"],
                 manifest_path=inputs["manifest_path"],
@@ -682,6 +696,7 @@ class RunStore:
                 min_group_confidence="high",
                 grouping_mode="auto",
                 ocr_backend=roll_ocr_backend,
+                progress_callback=update_progress,
             )
             parse_dir = index_path.parent
             self.write_state(run_id, stage="Preparing review dashboard")
@@ -1129,27 +1144,37 @@ class SmartOmrUiHandler(BaseHTTPRequestHandler):
                     )
         answer_rows = []
         for response in details.get("mcq_responses", []):
+            marks_display = (
+                "Dropped"
+                if response.get("dropped")
+                else f"{_fmt_num(response.get('marks_awarded'))} / {_fmt_num(response.get('marks'))}"
+            )
             answer_rows.append(
                 "<tr>"
                 f"<td>Q{html.escape(str(response.get('q_no')))}</td>"
                 "<td>MCQ</td>"
                 f"<td>{html.escape(str(response.get('selected_option') or ''))}</td>"
                 f"<td>{html.escape(str(response.get('correct_option') or ''))}</td>"
-                f"<td>{html.escape(_fmt_num(response.get('marks_awarded')))} / {html.escape(_fmt_num(response.get('marks')))}</td>"
-                f"<td>{_badge(response.get('outcome'))}</td>"
+                f"<td>{html.escape(marks_display)}</td>"
+                f"<td>{_badge('dropped' if response.get('dropped') else response.get('outcome'))}</td>"
                 f"<td>{html.escape(str(response.get('confidence') or ''))}</td>"
                 f"<td>{html.escape(str(response.get('review_reason') or ''))}</td>"
                 "</tr>"
             )
         for response in details.get("numerical_responses", []):
+            marks_display = (
+                "Dropped"
+                if response.get("dropped")
+                else f"{_fmt_num(response.get('marks_awarded'))} / {_fmt_num(response.get('max_marks'))}"
+            )
             answer_rows.append(
                 "<tr>"
                 f"<td>Q{html.escape(str(response.get('q_no')))}</td>"
                 "<td>Numeric</td>"
                 f"<td>{html.escape(str(response.get('value') if response.get('value') is not None else ''))}</td>"
                 f"<td>{html.escape(str(response.get('correct_value') if response.get('correct_value') is not None else ''))}</td>"
-                f"<td>{html.escape(_fmt_num(response.get('marks_awarded')))} / {html.escape(_fmt_num(response.get('max_marks')))}</td>"
-                f"<td>{_badge(response.get('outcome'))}</td>"
+                f"<td>{html.escape(marks_display)}</td>"
+                f"<td>{_badge('dropped' if response.get('dropped') else response.get('outcome'))}</td>"
                 f"<td>{html.escape(str(response.get('confidence') or ''))}</td>"
                 f"<td>{html.escape(' | '.join(str(flag) for flag in response.get('review_flags', [])))}</td>"
                 "</tr>"

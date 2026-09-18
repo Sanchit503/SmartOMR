@@ -180,27 +180,29 @@ def _student_score(parsed_root: Path, student: dict[str, Any], details: dict[str
 def _answer_rows(details: dict[str, Any]) -> list[dict[str, str]]:
     rows: list[dict[str, str]] = []
     for item in details.get("mcq_responses", []):
+        dropped = bool(item.get("dropped"))
         rows.append(
             {
                 "question": f"Q{item.get('q_no')}",
                 "type": "MCQ",
                 "student_answer": str(item.get("selected_option") or ""),
-                "correct_answer": str(item.get("correct_option") or ""),
-                "marks": f"{_format_number(item.get('marks_awarded'))}/{_format_number(item.get('marks'))}",
-                "status": str(item.get("outcome") or ""),
+                "correct_answer": "" if dropped else str(item.get("correct_option") or ""),
+                "marks": "Dropped" if dropped else f"{_format_number(item.get('marks_awarded'))}/{_format_number(item.get('marks'))}",
+                "status": "dropped" if dropped else str(item.get("outcome") or ""),
             }
         )
     for item in details.get("numerical_responses", []):
         value = item.get("value")
         correct = item.get("correct_value")
+        dropped = bool(item.get("dropped"))
         rows.append(
             {
                 "question": f"Q{item.get('q_no')}",
                 "type": "NUMERIC",
                 "student_answer": "" if value is None else str(value),
-                "correct_answer": "" if correct is None else str(correct),
-                "marks": f"{_format_number(item.get('marks_awarded'))}/{_format_number(item.get('max_marks'))}",
-                "status": str(item.get("outcome") or ""),
+                "correct_answer": "" if dropped or correct is None else str(correct),
+                "marks": "Dropped" if dropped else f"{_format_number(item.get('marks_awarded'))}/{_format_number(item.get('max_marks'))}",
+                "status": "dropped" if dropped else str(item.get("outcome") or ""),
             }
         )
     return rows

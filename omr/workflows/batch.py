@@ -14,7 +14,7 @@ import json
 import sys
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 from PIL import Image
@@ -48,6 +48,7 @@ from omr.workflows.parse import (
     _safe_id,
     _scan_files,
     _student_payload,
+    _validate_numerical_answer_key,
     _written_payload,
 )
 from omr.reader.written_ocr import WrittenOcrBackend, build_written_ocr_backend, read_written_answer_texts
@@ -133,6 +134,22 @@ def _resolve_answer_key_path(exam_id: str, data_dir: Path, explicit: Path | None
         return explicit
     candidate = data_dir / "answer_keys" / f"{_safe_id(exam_id)}_answer_key.csv"
     return candidate if candidate.exists() else None
+
+
+def _scan_page_count(scan_files: list[Path]) -> int:
+    total = 0
+    for scan_path in scan_files:
+        if scan_path.suffix.lower() != ".pdf":
+            total += 1
+            continue
+        try:
+            import pymupdf
+
+            with pymupdf.open(scan_path) as document:
+                total += document.page_count
+        except Exception:
+            return 0
+    return total
 
 
 def _relative_identity_payload(payload: dict[str, Any] | None, output_dir: Path) -> dict[str, Any] | None:
@@ -1473,6 +1490,7 @@ def parse_exam_bundle(
     min_group_confidence: str = "high",
     grouping_mode: str = "auto",
     written_ocr_backend: WrittenOcrBackend | None = None,
+    progress_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> tuple[list[dict[str, Any]], Path]:
     if min_group_confidence not in CONFIDENCE_RANK:
         raise ValueError(f"unknown minimum group confidence: {min_group_confidence}")
@@ -1488,12 +1506,15 @@ def parse_exam_bundle(
     valid_rolls = set(students) if students else None
     default_marks = float(manifest["exam"].get("marks_per_mcq", 1.0))
     answer_key = load_answer_key(answer_key_path, default_marks=default_marks) if answer_key_path else None
+    _validate_numerical_answer_key(manifest, answer_key)
 
     page_records_for_bundle: list[_PageRecord] = []
     page_errors: list[dict[str, Any]] = []
 
+    scan_files = _scan_files(Path(scans_path))
+    total_source_pages = _scan_page_count(scan_files)
     source_counter = 0
-    for scan_path in _scan_files(Path(scans_path)):
+    for scan_path in scan_files:
         for raw_page in iter_scan_pages(scan_path, dpi):
             source_counter += 1
             identity_dir = root / "_page_identity" / f"source_{source_counter:04d}"
@@ -1509,6 +1530,15 @@ def parse_exam_bundle(
                 )
             except Exception as exc:
                 page_errors.append(_write_page_error(root, scan_path, source_counter, exc))
+                if progress_callback is not None:
+                    progress_callback(
+                        {
+                            "phase": "reading_pages",
+                            "processed": source_counter,
+                            "total": total_source_pages,
+                            "errors": len(page_errors),
+                        }
+                    )
                 continue
 
             record = _PageRecord(
@@ -1523,6 +1553,15 @@ def parse_exam_bundle(
                 review_flags=flags,
             )
             page_records_for_bundle.append(record)
+            if progress_callback is not None:
+                progress_callback(
+                    {
+                        "phase": "reading_pages",
+                        "processed": source_counter,
+                        "total": total_source_pages,
+                        "errors": len(page_errors),
+                    }
+                )
 
     applied_grouping_mode = (
         _infer_grouping_mode(page_records_for_bundle, manifest) if grouping_mode == "auto" else grouping_mode
@@ -1560,7 +1599,8 @@ def parse_exam_bundle(
         grouped, unmatched = identity_grouped, identity_unmatched
 
     student_results: list[dict[str, Any]] = []
-    for roll_no, student_page_records in sorted(grouped.items()):
+    grouped_students = sorted(grouped.items())
+    for student_number, (roll_no, student_page_records) in enumerate(grouped_students, start=1):
         student_results.append(
             _write_student_group(
                 roll_no,
@@ -1576,6 +1616,15 @@ def parse_exam_bundle(
                 written_ocr_backend,
             )
         )
+        if progress_callback is not None:
+            progress_callback(
+                {
+                    "phase": "writing_students",
+                    "processed": student_number,
+                    "total": len(grouped_students),
+                    "errors": len(page_errors),
+                }
+            )
 
     unmatched_results = [_write_unmatched_page(record, manifest, root, dpi) for record in unmatched]
     roster_reconciliation = _reconcile_roster(students, student_results)

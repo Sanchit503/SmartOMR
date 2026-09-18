@@ -58,6 +58,7 @@ class _AlignmentSource:
     source_confidence: float
     marker_estimates: np.ndarray | None
     points_to_original: np.ndarray | None = None
+    prefer_marker_estimates: bool = False
 
 
 CORNER_ORDER = ("TL", "TR", "BR", "BL")
@@ -506,10 +507,15 @@ def _select_fiducials(
     manifest: dict,
     allow_inferred: bool = True,
     marker_estimates: np.ndarray | None = None,
+    prefer_marker_estimates: bool = False,
 ) -> tuple[np.ndarray, float]:
     candidates = _dedupe_square_candidates(
         _find_dark_square_candidates(gray) + _find_edge_square_candidates(gray)
     )[:30]
+    if allow_inferred and prefer_marker_estimates:
+        estimated_quad = _find_estimated_marker_quad(candidates, gray.shape, manifest, marker_estimates)
+        if estimated_quad is not None:
+            return estimated_quad
     if len(candidates) < 3:
         estimated_quad = _find_estimated_marker_quad(candidates, gray.shape, manifest, marker_estimates)
         if allow_inferred and estimated_quad is not None:
@@ -658,6 +664,17 @@ def _alignment_sources(
     dpi: float,
 ) -> list[_AlignmentSource]:
     sources: list[_AlignmentSource] = []
+    frame_estimates = _image_frame_marker_estimates(gray_detection.shape, manifest, dpi)
+    if frame_estimates is not None:
+        sources.append(
+            _AlignmentSource(
+                label="marker geometry plus scanner frame",
+                detection_image=gray_raw,
+                source_confidence=0.82,
+                marker_estimates=frame_estimates,
+                prefer_marker_estimates=True,
+            )
+        )
     page_quad = _find_page_quad(gray_detection, manifest)
     if page_quad is not None:
         marker_estimates = _project_expected_fiducials_from_page_quad(page_quad[0], manifest, dpi)
@@ -684,6 +701,33 @@ def _alignment_sources(
         )
     sources.append(_AlignmentSource("marker geometry", gray_raw, 1.0, None))
     return sources
+
+
+def _image_frame_marker_estimates(
+    gray_shape: tuple[int, ...],
+    manifest: dict,
+    dpi: float,
+) -> np.ndarray | None:
+    """Estimate fiducials from the image frame for full-page scanner output.
+
+    Flatbed and document scanners commonly produce an image whose frame is the
+    paper itself. This gives us a useful fallback when handwriting touches a
+    corner marker and changes that marker's apparent contour size. Phone
+    photos with background around the sheet are excluded by the aspect check
+    and continue through the page-contour and free-geometry paths.
+    """
+    height, width = gray_shape[:2]
+    expected_aspect = _page_aspect(manifest)
+    actual_aspect = width / max(float(height), 1.0)
+    if expected_aspect <= 0 or abs(actual_aspect - expected_aspect) / expected_aspect > 0.08:
+        return None
+
+    canonical_width, canonical_height = canonical_size_px(manifest, dpi)
+    scale = np.array(
+        [width / max(float(canonical_width), 1.0), height / max(float(canonical_height), 1.0)],
+        dtype=np.float32,
+    )
+    return _expected_fiducials_px(manifest, dpi) * scale
 
 
 def _alignment_error(errors: list[str]) -> ScanError:
@@ -910,6 +954,7 @@ def align_scan_page(gray: np.ndarray, manifest: dict, dpi: float, source_index: 
                 manifest,
                 allow_inferred=True,
                 marker_estimates=source.marker_estimates,
+                prefer_marker_estimates=source.prefer_marker_estimates,
             )
             original_points = _map_points_to_original(source_points, source.points_to_original)
             canonical, orientation_confidence = _warp_with_best_orientation(

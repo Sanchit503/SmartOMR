@@ -206,16 +206,20 @@ def _mcq_payload(
 
     for reading in readings:
         q_no = reading.q_no
-        if reading.needs_human_review:
+        key_entry = answer_key.get(q_no) if answer_key is not None else None
+        dropped = key_entry is not None and key_entry.marks == 0
+        if reading.needs_human_review and not dropped:
             review_flags.append(f"Q{q_no}: {reading.review_reason}")
 
         correct_answer = None
         marks = None
         marks_awarded = None
         if answer_key is not None:
-            key_entry = answer_key.get(q_no)
             if key_entry is None:
                 review_flags.append(f"answer key is missing Q{q_no}")
+                marks = 0.0
+                marks_awarded = 0.0
+            elif dropped:
                 marks = 0.0
                 marks_awarded = 0.0
             else:
@@ -240,6 +244,7 @@ def _mcq_payload(
                 "correct_option": correct_answer,
                 "marks": marks,
                 "marks_awarded": marks_awarded,
+                "dropped": dropped,
                 "fill_ratios": reading.fill_ratios,
                 "ink_densities": reading.ink_densities,
             }
@@ -252,7 +257,10 @@ def _mcq_payload(
 
 def _numerical_payload(images_by_page, manifest, dpi, answer_key, review_flags):
     entries = {entry["q_no"]: entry for entry in manifest.get("numerical_block", [])}
-    total = sum(entry["max_marks"] for entry in entries.values())
+    total = sum(
+        answer_key[q_no].marks if answer_key is not None and q_no in answer_key else entry["max_marks"]
+        for q_no, entry in entries.items()
+    )
     score = 0.0
     complete = True
     responses = []
@@ -264,23 +272,37 @@ def _numerical_payload(images_by_page, manifest, dpi, answer_key, review_flags):
         review_flags.extend(f"numerical Q{entry['q_no']} is on missing page {entry['page']}" for entry in missing)
     for reading in read_numerical_responses(images_by_page, readable_manifest, dpi):
         entry = entries[reading.q_no]
-        payload = asdict(reading)
-        payload.update(max_marks=entry["max_marks"], correct_value=None, marks_awarded=None)
-        review_flags.extend(f"Q{reading.q_no}: {flag}" for flag in reading.review_flags)
         key = answer_key.get(reading.q_no) if answer_key is not None else None
+        dropped = key is not None and key.marks == 0
+        payload = asdict(reading)
+        payload.update(
+            max_marks=0.0 if dropped else entry["max_marks"],
+            printed_max_marks=entry["max_marks"],
+            correct_value=None,
+            marks_awarded=0.0 if dropped else None,
+            dropped=dropped,
+        )
+        if not dropped:
+            review_flags.extend(f"Q{reading.q_no}: {flag}" for flag in reading.review_flags)
         if key is not None:
-            if not re.fullmatch(r"[0-9]+", key.answer) or len(key.answer) > 100:
+            if dropped:
+                pass
+            elif not re.fullmatch(r"[0-9]+", key.answer) or len(key.answer) > 100:
                 raise ValueError(f"numerical answer key Q{reading.q_no} must be a non-negative whole number")
-            expected = int(key.answer)
-            if expected >= 10 ** entry["positions"]:
-                raise ValueError(f"numerical answer key Q{reading.q_no} exceeds its digit capacity")
-            if not math.isfinite(key.marks) or key.marks != entry["max_marks"]:
-                raise ValueError(f"numerical answer key Q{reading.q_no} marks must match manifest max_marks")
-            payload["correct_value"] = expected
-            if not reading.needs_human_review:
-                awarded = entry["max_marks"] if reading.outcome == "answered" and reading.value == expected else 0.0
-                payload["marks_awarded"] = awarded
-                score += awarded
+            else:
+                expected = int(key.answer)
+                if expected >= 10 ** entry["positions"]:
+                    raise ValueError(f"numerical answer key Q{reading.q_no} exceeds its digit capacity")
+                if not math.isfinite(key.marks) or key.marks != entry["max_marks"]:
+                    raise ValueError(
+                        f"numerical answer key Q{reading.q_no} marks must match manifest max_marks "
+                        "or be 0 for a dropped question"
+                    )
+                payload["correct_value"] = expected
+                if not reading.needs_human_review:
+                    awarded = key.marks if reading.outcome == "answered" and reading.value == expected else 0.0
+                    payload["marks_awarded"] = awarded
+                    score += awarded
         elif answer_key is not None:
             review_flags.append(f"answer key is missing numerical Q{reading.q_no}")
         if payload["marks_awarded"] is None:
@@ -289,6 +311,36 @@ def _numerical_payload(images_by_page, manifest, dpi, answer_key, review_flags):
     if answer_key is None:
         return responses, None, None
     return responses, score if complete else None, total
+
+
+def _validate_numerical_answer_key(
+    manifest: dict,
+    answer_key: dict[int, AnswerKeyEntry] | None,
+) -> None:
+    """Reject invalid numerical key entries before any scan rendering begins."""
+    if answer_key is None:
+        return
+    numerical_entries = manifest.get("numerical_block", [])
+    missing = sorted(int(entry["q_no"]) for entry in numerical_entries if int(entry["q_no"]) not in answer_key)
+    if missing:
+        questions = ", ".join(f"Q{q_no}" for q_no in missing)
+        raise ValueError(f"answer key is missing numerical question(s): {questions}")
+    for entry in numerical_entries:
+        q_no = int(entry["q_no"])
+        key = answer_key.get(q_no)
+        if key is None:
+            continue
+        if not math.isfinite(key.marks) or key.marks not in {0, entry["max_marks"]}:
+            raise ValueError(
+                f"numerical answer key Q{q_no} marks must match manifest max_marks "
+                "or be 0 for a dropped question"
+            )
+        if key.marks == 0:
+            continue
+        if not re.fullmatch(r"[0-9]+", key.answer) or len(key.answer) > 100:
+            raise ValueError(f"numerical answer key Q{q_no} must be a non-negative whole number")
+        if int(key.answer) >= 10 ** int(entry["positions"]):
+            raise ValueError(f"numerical answer key Q{q_no} exceeds its digit capacity")
 
 
 def _mcq_answer_summary(result: dict) -> list[dict]:
@@ -358,6 +410,7 @@ def parse_scan(
     students = load_students(students_path) if students_path else None
     default_marks = float(manifest["exam"].get("marks_per_mcq", 1.0))
     answer_key = load_answer_key(answer_key_path, default_marks=default_marks) if answer_key_path else None
+    _validate_numerical_answer_key(manifest, answer_key)
 
     raw_pages = load_scan_pages(scan_path, dpi)
     aligned_pages = align_scan_pages(raw_pages, manifest, dpi, allow_partial=allow_partial)
