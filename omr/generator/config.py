@@ -6,6 +6,7 @@ from typing import Literal
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 ExamType = Literal["quiz", "midsem", "endsem"]
+SectionKind = Literal["mcq", "numerical", "written"]
 DEFAULT_UNIVERSITY_NAME = "IIIT Delhi"
 
 
@@ -32,6 +33,7 @@ class ExamConfig(BaseModel):
     marks_per_mcq: float = 1
     written_questions: list[WrittenQuestionConfig] = Field(default_factory=list)
     numerical_questions: list[NumericalQuestionConfig] = Field(default_factory=list)
+    section_order: list[SectionKind] = Field(default_factory=list)
     roster_csv: str | None = None
 
     @field_validator("written_questions")
@@ -72,4 +74,16 @@ class ExamConfig(BaseModel):
             raise ValueError("numerical question numbering collides with MCQs")
         if numbers and any(q.q_no <= max(numbers) for q in self.written_questions):
             raise ValueError("written question numbers must follow all numerical questions")
+        present = {
+            "mcq": bool(self.num_mcq),
+            "numerical": bool(self.numerical_questions),
+            "written": bool(self.written_questions),
+        }
+        if self.section_order:
+            if len(self.section_order) != len(set(self.section_order)):
+                raise ValueError("section_order cannot contain the same section twice")
+            if set(self.section_order) != {kind for kind, exists in present.items() if exists}:
+                raise ValueError("section_order must include each non-empty section exactly once")
+        else:
+            self.section_order = [kind for kind in ("mcq", "numerical", "written") if present[kind]]
         return self

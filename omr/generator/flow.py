@@ -231,11 +231,11 @@ def _place_written(cur: _Cursor, written_questions, after_content: bool) -> list
     return entries
 
 
-def _place_numerical(cur: _Cursor, questions, after_mcqs: bool) -> list[NumericalEntry]:
+def _place_numerical(cur: _Cursor, questions, after_content: bool) -> list[NumericalEntry]:
     entries: list[NumericalEntry] = []
     if not questions:
         return entries
-    if after_mcqs:
+    if after_content:
         cur.y += SECTION_GAP_MM
     remaining = list(questions)
     needs_header = True
@@ -287,9 +287,20 @@ def _flow_with(config, option_letters: list[str], columns: int) -> FlowResult | 
         return None
 
     cur = _Cursor(page=1, y=content_top_mm(1))
-    mcq_entries = _place_mcqs(cur, config.num_mcq, option_letters, columns)
-    numerical_entries = _place_numerical(cur, config.numerical_questions, after_mcqs=bool(mcq_entries))
-    written_entries = _place_written(cur, config.written_questions, after_content=bool(mcq_entries or numerical_entries))
+    mcq_entries: list[MCQEntry] = []
+    numerical_entries: list[NumericalEntry] = []
+    written_entries: list[WrittenEntry] = []
+    has_content = False
+    for section in config.section_order:
+        if section == "mcq":
+            mcq_entries = _place_mcqs(cur, config.num_mcq, option_letters, columns)
+            has_content = has_content or bool(mcq_entries)
+        elif section == "numerical":
+            numerical_entries = _place_numerical(cur, config.numerical_questions, after_content=has_content)
+            has_content = has_content or bool(numerical_entries)
+        else:
+            written_entries = _place_written(cur, config.written_questions, after_content=has_content)
+            has_content = has_content or bool(written_entries)
     return FlowResult(
         mcq_entries=mcq_entries,
         written_entries=written_entries,

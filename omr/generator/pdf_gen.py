@@ -309,13 +309,18 @@ def _draw_continuation_identity(c: canvas.Canvas, layout: SheetLayout, page_no: 
 # ---------------------------------------------------------------------------
 
 def _section_heading(layout: SheetLayout, title: str, is_first: bool) -> str:
-    sections = [
-        name for name, entries in (
-            ("Multiple Choice", layout.mcq_entries),
-            ("Numerical Answers", layout.numerical_entries),
-            ("Written Answers", layout.written_entries),
-        ) if entries
-    ]
+    titles = {
+        "mcq": "Multiple Choice",
+        "numerical": "Numerical Answers",
+        "written": "Written Answers",
+    }
+    present = {
+        "mcq": bool(layout.mcq_entries),
+        "numerical": bool(layout.numerical_entries),
+        "written": bool(layout.written_entries),
+    }
+    order = layout.section_order or ["mcq", "numerical", "written"]
+    sections = [titles[kind] for kind in order if present.get(kind)]
     prefix = f"Section {chr(ord('A') + sections.index(title))} - " if len(sections) > 1 else ""
     suffix = "" if is_first else "  (continued)"
     return f"{prefix}{title}{suffix}"

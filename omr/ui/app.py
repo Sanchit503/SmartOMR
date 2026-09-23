@@ -30,6 +30,8 @@ from typing import Any, BinaryIO
 from xml.etree import ElementTree
 
 from omr.contracts import load_manifest
+from omr.generator.config import ExamConfig, NumericalQuestionConfig, WrittenQuestionConfig
+from omr.generator.generate import generate_exam
 from omr.io.csv import load_students
 from omr.reader.handwriting import build_roll_ocr_backend
 from omr.ui import inspection
@@ -327,6 +329,7 @@ def _html_page(title: str, body: str, *, refresh_seconds: int | None = None) -> 
   <header>
     <strong>{APP_TITLE}</strong>
     <a href="/">Exams</a>
+    <a href="/generate">Generate OMR</a>
     <a href="/new">New Run</a>
   </header>
   <main>{body}</main>
@@ -530,6 +533,23 @@ def _normalize_tabular_upload(path: Path, target_csv: Path) -> Path:
         _convert_xlsx_to_csv(path, target_csv)
         return target_csv
     raise ValueError(f"unsupported tabular upload type: {path.suffix}; use CSV or XLSX")
+
+
+def _parse_question_rows(text: str, kind: str) -> list[WrittenQuestionConfig] | list[NumericalQuestionConfig]:
+    rows = []
+    for raw in text.splitlines():
+        values = [part for part in re.split(r"[,\s]+", raw.strip()) if part]
+        if not values:
+            continue
+        if len(values) != 3:
+            raise ValueError(f"{kind} rows must be: question-number marks lines-or-digits")
+        q_no, marks, size = int(values[0]), float(values[1]), int(values[2])
+        rows.append(
+            WrittenQuestionConfig(q_no=q_no, max_marks=marks, lines=size)
+            if kind == "written"
+            else NumericalQuestionConfig(q_no=q_no, max_marks=marks, digits=size)
+        )
+    return rows
 
 
 def _write_marks_csv(run_dir: Path, parse_dir: Path, index: dict[str, Any]) -> Path:
@@ -856,6 +876,8 @@ class SmartOmrUiHandler(BaseHTTPRequestHandler):
         try:
             if path == "/":
                 self._page_runs()
+            elif path == "/generate":
+                self._page_generate()
             elif path == "/new":
                 self._page_new()
             elif path == "/artifact":
@@ -902,6 +924,8 @@ class SmartOmrUiHandler(BaseHTTPRequestHandler):
         try:
             if path == "/runs":
                 self._create_run()
+            elif path == "/generate":
+                self._generate_omr()
             elif path.startswith("/runs/"):
                 parts = [part for part in path.split("/") if part]
                 if len(parts) == 3 and parts[2] in {"inspect", "evaluate"}:
@@ -1144,11 +1168,60 @@ class SmartOmrUiHandler(BaseHTTPRequestHandler):
         """.format("".join(rows) or '<tr><td colspan="6" class="empty">No runs yet</td></tr>')
         body = f"""
         <h1>Exam Runs</h1>
-        <div class="actions"><a class="button" href="/new">New Run</a></div>
+        <div class="actions"><a class="button" href="/generate">Generate OMR</a><a class="button secondary" href="/new">Check Copies</a></div>
         <h2>Recent Runs</h2>
         {table}
         """
         self._send_html("Exam Runs", body)
+
+    def _page_generate(self) -> None:
+        body = """
+        <h1>Generate OMR</h1>
+        <form method="post" action="/generate" class="band">
+          <div class="grid">
+            <div><label>Exam ID</label><input name="exam_id" required placeholder="CSE557_QUIZ1_2026"></div>
+            <div><label>Course Code</label><input name="course_code" required placeholder="CSE557"></div>
+            <div><label>Exam Name</label><input name="exam_name" required placeholder="Quiz 1"></div>
+            <div><label>Exam Type</label><select name="exam_type"><option value="quiz">Quiz</option><option value="midsem">Midsem</option><option value="endsem">Endsem</option></select></div>
+          </div>
+          <h2>Answer Sections</h2>
+          <p class="muted">Add sections in the order they should print. One section has no label; multiple sections print as Section A, Section B, and so on.</p>
+          <div class="actions"><button type="button" class="secondary" data-add="mcq">Add Multiple Choice</button><button type="button" class="secondary" data-add="numerical">Add Numerical</button><button type="button" class="secondary" data-add="written">Add Written</button></div>
+          <input type="hidden" id="section-order" name="section_order">
+          <div id="sections"></div>
+          <p id="no-sections" class="muted">Add at least one answer section.</p>
+          <button type="submit">Generate PDF and Manifest</button>
+        </form>
+        <script>
+        (() => { const box=document.getElementById('sections'), order=document.getElementById('section-order'), blank=document.getElementById('no-sections');
+          const labels={mcq:'Multiple Choice',numerical:'Numerical Answers',written:'Written Answers'};
+          const fields={mcq:'<div class="grid"><div><label>Questions</label><input name="num_mcq" type="number" min="1" value="14" required></div><div><label>Options</label><input name="mcq_options" type="number" min="2" max="6" value="4" required></div><div><label>Marks each</label><input name="marks_per_mcq" type="number" min="0.01" step="0.01" value="1" required></div></div>',numerical:'<label>Questions</label><textarea name="numerical_questions" required placeholder="One per line: question-number marks digits&#10;15 1 3"></textarea>',written:'<label>Questions</label><textarea name="written_questions" required placeholder="One per line: question-number marks lines&#10;16 5 8"></textarea>'};
+          function refresh(){const cards=[...box.children];order.value=cards.map(x=>x.dataset.kind).join(',');blank.hidden=cards.length>0;document.querySelectorAll('[data-add]').forEach(b=>b.disabled=!!box.querySelector(`[data-kind="${b.dataset.add}"]`));}
+          document.querySelectorAll('[data-add]').forEach(button=>button.onclick=()=>{const kind=button.dataset.add;if(box.querySelector(`[data-kind="${kind}"]`))return;const card=document.createElement('section');card.dataset.kind=kind;card.className='band';card.innerHTML=`<div class="actions" style="justify-content:space-between"><strong>${labels[kind]}</strong><button type="button" class="secondary">Remove</button></div>${fields[kind]}`;card.querySelector('button').onclick=()=>{card.remove();refresh();};box.append(card);refresh();});refresh();
+        })();
+        </script>
+        """
+        self._send_html("Generate OMR", body)
+
+    def _generate_omr(self) -> None:
+        form = self._urlencoded_form()
+        exam_id = _safe_id(form.get("exam_id") or "")
+        order = [kind for kind in (form.get("section_order") or "").split(",") if kind]
+        config = ExamConfig(
+            exam_id=exam_id,
+            course_code=(form.get("course_code") or "").strip(),
+            exam_name=(form.get("exam_name") or "").strip(),
+            exam_type=(form.get("exam_type") or "quiz").strip(),
+            num_mcq=int(form.get("num_mcq") or 0),
+            mcq_options=int(form.get("mcq_options") or 4),
+            marks_per_mcq=float(form.get("marks_per_mcq") or 1),
+            numerical_questions=_parse_question_rows(form.get("numerical_questions") or "", "numerical"),
+            written_questions=_parse_question_rows(form.get("written_questions") or "", "written"),
+            section_order=order,
+        )
+        output_dir = self.store.config.data_dir / "generated_omr" / f"{exam_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        result = generate_exam(config, output_dir)
+        self._send_html("OMR Generated", f'''<h1>OMR Generated</h1><div class="actions band"><a class="button" href="{_asset_url(result['pdf_path'])}">Download OMR PDF</a><a class="button secondary" href="{_asset_url(result['manifest_path'])}">Download Manifest JSON</a><a class="button secondary" href="/new">Check Copies</a></div><p class="muted">{html.escape(str(output_dir))}</p>''')
 
     def _page_new(self) -> None:
         body = """

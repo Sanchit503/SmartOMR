@@ -304,6 +304,16 @@ def _load_student_details(student: dict[str, Any], parsed_root: Path) -> tuple[d
 
 
 def _score_from_details(details: dict[str, Any], student: dict[str, Any]) -> tuple[float | None, float | None]:
+    if details.get("manual_score_override") is not None:
+        total = details.get("manual_total_override")
+        return float(details.get("manual_score_override") or 0.0), (
+            float(total) if total is not None else None
+        )
+    if student.get("manual_score_override") is not None:
+        total = student.get("manual_total_override")
+        return float(student.get("manual_score_override") or 0.0), (
+            float(total) if total is not None else None
+        )
     score = 0.0
     total = 0.0
     saw_any = False

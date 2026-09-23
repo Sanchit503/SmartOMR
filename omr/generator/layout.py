@@ -209,6 +209,7 @@ class SheetLayout:
     mcq_columns: int = field(default=0)
     num_pages: int = field(default=1)
     numerical_entries: list[NumericalEntry] = field(default_factory=list)
+    section_order: list[str] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -365,6 +366,7 @@ def build_layout(config) -> SheetLayout:  # config: ExamConfig, typed loosely to
         mcq_entries=flow.mcq_entries,
         written_entries=flow.written_entries,
         numerical_entries=flow.numerical_entries,
+        section_order=config.section_order,
         mcq_options=config.mcq_options,
         mcq_columns=flow.mcq_columns,
         num_pages=flow.num_pages,
