@@ -41,7 +41,6 @@ from .metrics import (
     MCQ_COLUMN_CANDIDATES,
     MCQ_ROW_PITCH_MM,
     NUMERICAL_COLUMN_GAP_MM,
-    NUMERICAL_GRID_OFFSET_X_MM,
     NUMERICAL_GRID_OFFSET_Y_MM,
     NUMERICAL_DIGIT_PITCH_MM,
     NUMERICAL_POSITION_PITCH_MM,
@@ -60,6 +59,7 @@ from .metrics import (
     min_mcq_column_width_mm,
     numerical_slot_width_mm,
     numerical_slot_height_mm,
+    numerical_grid_offset_x_mm,
     usable_width_mm,
     written_box_height_mm,
     written_slot_height_mm,
@@ -81,8 +81,8 @@ class MCQEntry:
 
 @dataclass(frozen=True)
 class WrittenEntry:
-    """One ruled answer box. `y_mm` is its TOP edge; the "Qn [k marks]" label
-    sits in the WRITTEN_HEADER_MM band above it."""
+    """One ruled answer box. `y_mm` is its top edge; the question/line-count
+    label sits in the WRITTEN_HEADER_MM band above it."""
 
     q_no: int
     x_mm: float
@@ -239,23 +239,34 @@ def _place_numerical(cur: _Cursor, questions, after_mcqs: bool) -> list[Numerica
         cur.y += SECTION_GAP_MM
     remaining = list(questions)
     needs_header = True
-    slots_per_row = 2
     while remaining:
         header = NUMERICAL_SECTION_HEADER_MM if needs_header else 0.0
-        row = remaining[:slots_per_row]
+        row = []
+        used_width = 0.0
+        for question in remaining:
+            width = numerical_slot_width_mm(question.digits)
+            if width > usable_width_mm() + EPS:
+                raise LayoutTooTight(f"numerical question Q{question.q_no} is too wide for A4")
+            gap = NUMERICAL_COLUMN_GAP_MM if row else 0.0
+            if used_width + gap + width > usable_width_mm() + EPS:
+                break
+            row.append(question)
+            used_width += gap + width
         row_height = max(numerical_slot_height_mm(question.digits) for question in row)
         if cur.y + header + row_height > PAGE_BOTTOM_MM + EPS:
             cur.next_page()
             needs_header = True
+            if cur.y + NUMERICAL_SECTION_HEADER_MM + row_height > PAGE_BOTTOM_MM + EPS:
+                raise LayoutTooTight("numerical grid is too tall for an A4 page")
             continue
         cur.y += header
         needs_header = False
-        for column, question in enumerate(row):
+        x = MARGIN_MM
+        for question in row:
             width = numerical_slot_width_mm(question.digits)
-            x = MARGIN_MM + column * (width + NUMERICAL_COLUMN_GAP_MM)
             entries.append(NumericalEntry(
                 q_no=question.q_no,
-                x_mm=x + NUMERICAL_GRID_OFFSET_X_MM,
+                x_mm=x + numerical_grid_offset_x_mm(question.digits),
                 y_mm=cur.y + NUMERICAL_GRID_OFFSET_Y_MM,
                 positions=question.digits,
                 digit_pitch_mm=NUMERICAL_DIGIT_PITCH_MM,
@@ -263,6 +274,7 @@ def _place_numerical(cur: _Cursor, questions, after_mcqs: bool) -> list[Numerica
                 max_marks=question.max_marks,
                 page=cur.page,
             ))
+            x += width + NUMERICAL_COLUMN_GAP_MM
         remaining = remaining[len(row):]
         cur.y += row_height + NUMERICAL_QUESTION_GAP_MM
     return entries

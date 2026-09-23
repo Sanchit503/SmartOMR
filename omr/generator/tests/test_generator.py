@@ -103,7 +103,7 @@ def test_written_q_no_colliding_with_mcq_numbering_rejected():
         )
 
 
-def test_numerical_questions_are_horizontal_and_manifest_driven():
+def test_numerical_questions_are_vertical_and_manifest_driven():
     config = sample_config(
         num_mcq=5,
         numerical_questions=[
@@ -117,7 +117,7 @@ def test_numerical_questions_are_horizontal_and_manifest_driven():
 
     assert layout.total_marks == 15
     assert [entry["q_no"] for entry in manifest["numerical_block"]] == [6, 7]
-    assert all(entry["orientation"] == "horizontal" for entry in manifest["numerical_block"])
+    assert all(entry["orientation"] == "vertical" for entry in manifest["numerical_block"])
     assert all(entry["answer_type"] == "unsigned_integer" for entry in manifest["numerical_block"])
     assert all(entry["leading_zeros"] == "required" for entry in manifest["numerical_block"])
     first, second = manifest["numerical_block"]
@@ -130,15 +130,15 @@ def test_numerical_question_rows_have_clear_vertical_separation():
         num_mcq=0,
         numerical_questions=[
             NumericalQuestionConfig(q_no=q_no, max_marks=1, digits=2)
-            for q_no in range(1, 5)
+            for q_no in range(1, 9)
         ],
         written_questions=[],
     )
     entries = build_layout(config).numerical_entries
 
-    assert entries[0].y_mm == entries[1].y_mm
-    assert entries[2].y_mm == entries[3].y_mm
-    assert entries[2].y_mm - entries[0].y_mm == pytest.approx(
+    assert len({e.y_mm for e in entries[:4]}) == 1
+    assert len({e.y_mm for e in entries[4:]}) == 1
+    assert entries[4].y_mm - entries[0].y_mm == pytest.approx(
         numerical_slot_height_mm(2) + NUMERICAL_QUESTION_GAP_MM
     )
 

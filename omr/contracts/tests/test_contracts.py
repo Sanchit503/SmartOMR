@@ -17,6 +17,7 @@ from omr.contracts.geometry import (
     A4_HEIGHT_MM,
     A4_WIDTH_MM,
     canonical_size_px,
+    digit_grid_centers_mm,
     mm_to_px,
     px_per_mm,
 )
@@ -26,7 +27,7 @@ from omr.contracts.manifest import (
     load_manifest,
     validate_manifest,
 )
-from omr.generator.config import ExamConfig, WrittenQuestionConfig
+from omr.generator.config import ExamConfig, NumericalQuestionConfig, WrittenQuestionConfig
 from omr.generator.layout import build_layout
 from omr.generator.manifest import build_manifest
 
@@ -122,6 +123,67 @@ def test_load_manifest_validates_on_the_way_in(tmp_path):
     path.write_text(json.dumps(manifest), encoding="utf-8")
     with pytest.raises(ManifestError):
         load_manifest(path)
+
+
+def numerical_manifest():
+    config = ExamConfig(
+        exam_id="NUMERICAL_CONTRACT", course_code="TEST", exam_name="Quiz", exam_type="quiz",
+        num_mcq=0, numerical_questions=[NumericalQuestionConfig(q_no=1, max_marks=1, digits=3)],
+    )
+    return build_manifest(build_layout(config))
+
+
+@pytest.mark.parametrize("orientation", ["horizontal", "vertical"])
+def test_numerical_axes_follow_manifest_orientation(orientation):
+    grid = dict(orientation=orientation, positions=3, x_mm=20, y_mm=50,
+                digit_pitch_mm=5.2, position_pitch_mm=12)
+    centers = digit_grid_centers_mm(grid)
+    assert len(centers) == 30
+    assert centers[(0, 0)] == (20, 50)
+    assert centers[(2, 9)] == pytest.approx(
+        (66.8, 74) if orientation == "horizontal" else (44, 96.8)
+    )
+
+
+def test_explicit_vertical_roll_grid_keeps_legacy_geometry():
+    grid = dict(orientation="vertical", columns=7, x_mm=28, y_mm=62,
+                col_pitch_mm=10, row_pitch_mm=6)
+    centers = digit_grid_centers_mm(grid)
+    assert len(centers) == 70
+    assert centers[(6, 9)] == (88, 116)
+
+
+@pytest.mark.parametrize("orientation", ["horizontal", "vertical"])
+@pytest.mark.parametrize("axis", ["x_mm", "y_mm"])
+def test_numerical_bounds_use_the_correct_axes(orientation, axis):
+    manifest = numerical_manifest()
+    entry = manifest["numerical_block"][0]
+    entry["orientation"] = orientation
+    span = (9 * entry["digit_pitch_mm"] if (axis == "x_mm") == (orientation == "horizontal")
+            else (entry["positions"] - 1) * entry["position_pitch_mm"])
+    page_size = manifest["page"]["width_mm" if axis == "x_mm" else "height_mm"]
+    entry[axis] = page_size - span - manifest["bubble_radius_mm"]
+    assert validate_manifest(manifest) is manifest
+    entry[axis] += 0.1
+    with pytest.raises(ManifestError, match="beyond the page"):
+        validate_manifest(manifest)
+
+
+def test_vertical_numerical_grids_require_v6_not_a_relabelled_v5():
+    manifest = numerical_manifest()
+    manifest["schema_version"] = 5
+    with pytest.raises(ManifestError, match="unsupported answer format"):
+        validate_manifest(manifest)
+    manifest["numerical_block"][0]["orientation"] = "horizontal"
+    assert validate_manifest(manifest) is manifest
+
+
+@pytest.mark.parametrize("orientation", ["diagonal", None, ""])
+def test_unknown_numerical_orientation_is_rejected(orientation):
+    manifest = numerical_manifest()
+    manifest["numerical_block"][0]["orientation"] = orientation
+    with pytest.raises(ManifestError, match="unsupported answer format"):
+        validate_manifest(manifest)
 
 
 # ---- dependency direction ----

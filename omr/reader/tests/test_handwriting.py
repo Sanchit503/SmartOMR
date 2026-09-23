@@ -29,7 +29,7 @@ class FakeOcr:
         self.confidence = confidence
         self.digits = list(digits or text)
 
-    def read_roll(self, crop_path: Path, program: str | None = None) -> RollOcrResult:
+    def read_roll(self, crop_path: Path, program: str | None = None, valid_rolls: set[str] | None = None) -> RollOcrResult:
         return RollOcrResult(self.text, self.confidence)
 
     def read_digit(self, crop_path: Path) -> RollOcrResult:

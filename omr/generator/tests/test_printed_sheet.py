@@ -15,7 +15,7 @@ import numpy as np
 import pymupdf
 import pytest
 
-from omr.contracts.geometry import mm_to_px, px_per_mm
+from omr.contracts.geometry import digit_grid_centers_mm, mm_to_px, px_per_mm
 from omr.generator.config import ExamConfig, NumericalQuestionConfig, WrittenQuestionConfig
 from omr.generator.generate import generate_exam
 from omr.generator.metrics import (
@@ -25,13 +25,15 @@ from omr.generator.metrics import (
     CONT_MTECH_SELECTOR_X_MM,
     CONT_PROGRAM_SELECTOR_Y_MM,
     MARGIN_MM,
-    NUMERICAL_GRID_OFFSET_X_MM,
+    NUMERICAL_GRID_OFFSET_Y_MM,
     PAGE_HEIGHT_MM,
     PAGE_WIDTH_MM,
     corner_keepouts,
     identity_box,
+    numerical_grid_offset_x_mm,
+    numerical_slot_width_mm,
 )
-from omr.grading.bubbles import fill_ratio, ink_density, student_mark_fill_ratio
+from omr.grading.bubbles import STUDENT_MARK_CORE_RATIO, fill_ratio, ink_density, student_mark_fill_ratio
 
 DPI = 200
 WHITE_FLOOR = 250  # anything above this is blank paper
@@ -75,6 +77,9 @@ def a_config(**overrides) -> ExamConfig:
 
 def every_bubble_center_mm(manifest: dict):
     """(page, label, x_mm, y_mm) for every bubble the sheet prints."""
+    for entry in manifest.get("numerical_block", []):
+        for (position, digit), (x_mm, y_mm) in digit_grid_centers_mm(entry).items():
+            yield entry["page"], f"Q{entry['q_no']}[{position}]={digit}", x_mm, y_mm
     for entry in manifest["mcq_block"]:
         for i, opt in enumerate(entry["options"]):
             x = entry["x_mm"] + manifest["mcq_label_offset_mm"] + i * manifest["mcq_option_pitch_mm"]
@@ -100,13 +105,20 @@ def every_bubble_center_mm(manifest: dict):
 # Nothing is printed inside a bubble
 # ---------------------------------------------------------------------------
 
-def test_every_bubble_prints_completely_empty(tmp_path):
+@pytest.mark.parametrize("numerical", [False, True])
+def test_every_bubble_prints_completely_empty(tmp_path, numerical):
     """The defect this replaces: option letters were drawn straddling the
     bubble outline and digit labels sat dead-center inside the roll-number
     bubbles, so an untouched bubble measured 0.20-0.26 against a 0.50 fill
     threshold — half the usable signal range gone before a student had
     written anything."""
-    manifest, pages = render(tmp_path, a_config())
+    config = a_config()
+    if numerical:
+        config = a_config(num_mcq=0, written_questions=[], numerical_questions=[
+            NumericalQuestionConfig(q_no=digits, max_marks=1, digits=digits)
+            for digits in range(1, 9)
+        ])
+    manifest, pages = render(tmp_path, config)
     radius_px = max(1, round(manifest["bubble_sample_radius_mm"] * px_per_mm(DPI)))
 
     worst = []
@@ -150,10 +162,15 @@ def test_student_fill_signal_resists_shifted_empty_bubble_outline(tmp_path):
     student_ratio = student_mark_fill_ratio(pages[1], shifted_x, cy, radius_px)
 
     assert full_ratio > 0.02, "test setup should include leaked outline ink"
-    assert student_ratio < 0.02
+    # A single edge pixel in the smaller core is 1/49 at 200 DPI. Bound the
+    # contamination in pixels rather than relaxing the reader's thresholds.
+    core_radius = max(1, round(radius_px * STUDENT_MARK_CORE_RATIO))
+    yy, xx = np.ogrid[-core_radius:core_radius + 1, -core_radius:core_radius + 1]
+    core_pixels = np.count_nonzero(xx * xx + yy * yy <= core_radius * core_radius)
+    assert student_ratio <= max(0.02, 1 / core_pixels)
 
 
-def test_numerical_rows_use_place_values_without_redundant_write_in_boxes(tmp_path):
+def test_numerical_columns_have_no_place_labels_or_redundant_write_in_boxes(tmp_path):
     result = generate_exam(
         a_config(
             num_mcq=0,
@@ -168,24 +185,49 @@ def test_numerical_rows_use_place_values_without_redundant_write_in_boxes(tmp_pa
     with pymupdf.open(result["pdf_path"]) as document:
         page = document[0]
         text = page.get_text()
-        assert all(label in text for label in ("Hundreds", "Tens", "Ones"))
-        assert text.index("Hundreds") < text.index("Tens") < text.index("Ones")
+        assert all(label not in text for label in ("Hundreds", "Tens", "Ones"))
         assert "Digit 1" not in text
 
-        # No small vector rectangle should remain in the lane between the
-        # place-value label and its first 0-9 bubble.
+        # Inspect the whole question region, including the space above the grid.
+        left = entry["x_mm"] - numerical_grid_offset_x_mm(entry["positions"])
+        top = entry["y_mm"] - NUMERICAL_GRID_OFFSET_Y_MM
         for drawing in page.get_drawings():
             if not any(item[0] == "re" for item in drawing["items"]):
                 continue
             rect = drawing["rect"]
             center_x_mm = (rect.x0 + rect.x1) / 2 / points_per_mm
             center_y_mm = (rect.y0 + rect.y1) / 2 / points_per_mm
-            for position in range(entry["positions"]):
-                row_y_mm = entry["y_mm"] + position * entry["position_pitch_mm"]
-                assert not (
-                    entry["x_mm"] - NUMERICAL_GRID_OFFSET_X_MM / 2 < center_x_mm < entry["x_mm"] - 3
-                    and abs(center_y_mm - row_y_mm) < 4
-                ), "a redundant numerical write-in box was printed"
+            assert not (
+                left < center_x_mm < left + numerical_slot_width_mm(entry["positions"])
+                and top < center_y_mm < entry["y_mm"] + 9 * entry["digit_pitch_mm"] + 2
+            ), "a redundant numerical write-in box was printed"
+
+
+def test_question_marks_are_metadata_only_not_printed_on_answer_sheet(tmp_path):
+    config = a_config(
+        num_mcq=1,
+        marks_per_mcq=1.5,
+        numerical_questions=[NumericalQuestionConfig(q_no=2, max_marks=2.5, digits=2)],
+        written_questions=[WrittenQuestionConfig(q_no=3, max_marks=5.5, lines=2)],
+    )
+    result = generate_exam(config, tmp_path)
+
+    with pymupdf.open(result["pdf_path"]) as document:
+        text = "\n".join(page.get_text() for page in document)
+
+    assert "Section A - Multiple Choice" in text
+    assert "Q2" in text
+    assert "Q3  -  answer in a maximum of 2 lines" in text
+    assert "mark each" not in text
+    assert "[1.5 mark" not in text
+    assert "[2.5 mark" not in text
+    assert "[5.5 mark" not in text
+
+    manifest = result["manifest"]
+    assert manifest["exam"]["marks_per_mcq"] == 1.5
+    assert manifest["exam"]["total_marks"] == 9.5
+    assert manifest["numerical_block"][0]["max_marks"] == 2.5
+    assert manifest["written_block"][0]["max_marks"] == 5.5
 
 
 # ---------------------------------------------------------------------------

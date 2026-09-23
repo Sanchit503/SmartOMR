@@ -26,14 +26,18 @@ Per the roadmap in PROJECT_SPEC.md Section 12:
 python -m omr.ui.app
 ```
 
-Open `http://127.0.0.1:8765`, then upload the scanned PDF, matching manifest,
-optional answer key, and student roster. CSV/XLSX rosters are normalized into the canonical
+Open `http://127.0.0.1:8765`, then upload the scanned PDF and matching manifest.
+The first step is **Scan Inspection**: every source page remains in the inventory, with
+original/aligned/overlay views, alignment checks, failures, progress, and retry/resume.
+This step does not read roll numbers, group students, grade, or send email.
+The answer key and student roster are optional uploads. CSV/XLSX rosters are normalized into the canonical
 `roll_no,name,email,program` shape. The IIITD portal export is supported even when it contains a
 blank row, `Roll No.`/`Student Name` headers, `Lecture` in `Class Type`, and an email column whose
 header is blank.
 
-The professor UI requires local roll-number OCR and refuses to start a processing run if Tesseract
-is unavailable. Run this preflight before uploading the final scanner PDF:
+After inspection, **Run OCR & Grouping** starts the existing evaluation workflow separately.
+Only that step requires local roll-number OCR. Inspection does not require Tesseract.
+Run this preflight before evaluation:
 
 ```powershell
 .\.venv\Scripts\python.exe -m omr.health --check-handwriting-ocr
@@ -266,9 +270,10 @@ python -m omr.workflows.batch \
 `data/answer_keys/<exam_id>_answer_key.csv`. Each PDF page is aligned independently, page identity is
 read, and pages are grouped even when page 1 and page 2 are far apart in the uploaded PDF.
 
-By default, `smartomr-batch` uses `--grouping-mode auto`: it aligns every page, reads the machine
-page-index bars, detects the scanner order, and groups continuation pages automatically when the
-evidence is clean.
+By default, `smartomr-batch` uses `--grouping-mode auto`. It aligns every page and uses an
+identity-first rule: page 1 becomes a verified anchor only when its bubbled and handwritten roll
+numbers match, and a continuation page is attached only when its handwritten roll resolves to that
+same exact roll number.
 
 ```bash
 python -m omr.workflows.batch \
@@ -277,13 +282,10 @@ python -m omr.workflows.batch \
   --data-dir data
 ```
 
-Auto mode recognizes `A1 B1 C1 A2 B2 C2` as `page-major` and `A1 A2 B1 B2 C1 C2` as
-`sheet-major`. If the detected page sequence is irregular, it compares the boxed roll-number
-write-ins across pages and can attach continuation pages by visual similarity to page 1. If neither
-page order nor write-in similarity is safe enough, it uses adaptive handwritten digit similarity as
-a final fallback, then leaves uncertain pages in review. Manual overrides are available with
-`--grouping-mode identity`, `--grouping-mode page-major`, `--grouping-mode sheet-major`, or
-`--grouping-mode write-in-similarity` for debugging a scanner workflow.
+Source order does not matter: page 2 may appear before page 1. Missing, unreadable, conflicting,
+duplicate, or non-roster identities remain in the review queue instead of being guessed. Explicit
+`--grouping-mode page-major` and `--grouping-mode sheet-major` overrides remain available only for
+controlled scanner workflows whose physical page order has been independently verified.
 
 Output is written under `data/parsed/<exam_id>/students/<roll_no>/`:
 
@@ -580,6 +582,10 @@ prototype_eval/  Backward-compatible professor-demo CLI and sample CSVs; impleme
 data/exams/      Generated PDFs + manifests (gitignored)
 ```
 
+See [Repository Hygiene](docs/REPOSITORY_HYGIENE.md) for maintained entrypoints,
+local-data boundaries, and the recoverable archive of old root experiments.
+Existing `eval_output/` files remain in place locally and are now gitignored.
+
 ### Why `contracts/` exists
 
 PROJECT_SPEC.md Section 2, principle 1 says the generator and the parser share **one** manifest. That only
@@ -737,23 +743,36 @@ Each entry in `numerical_questions` is independent:
 | Field | What it does |
 |---|---|
 | `q_no` | Printed beside the grid; must follow all MCQ question numbers |
-| `max_marks` | Marks awarded for an exact numeric match |
-| `digits` | 1–8 answer positions. Each position is one labeled place-value row of 0–9 bubbles |
+| `max_marks` | Stored in the manifest for grading an exact match; not printed beside the question |
+| `digits` | 1–8 answer positions. Each position is one vertical column of 0–9 bubbles |
 
-Rows run from the most significant place down to `Ones`, and there is no duplicate handwritten
-digit box. Students fill every row, including leading zeros: answer `7` uses `007` in a three-digit
-grid. Two numerical questions are packed side by side when they fit.
+Columns run left to right from the most significant digit to the least significant,
+without place-value headings or duplicate handwriting boxes. Students fill every
+column, including leading zeros: answer `7` uses `007` in a three-digit grid.
+Four two-digit numerical questions are packed side by side.
 
 Each entry in `written_questions` is independent:
 
 | Field | What it does |
 |---|---|
 | `q_no` | Printed on the answer box; must follow all MCQ and numerical question numbers |
-| `max_marks` | Printed next to the question number |
+| `max_marks` | Stored in the manifest for grading; not printed beside the question |
 | `lines` | How many ruled lines the answer box gets — the box height scales automatically, so a 2-line short-answer box and a 6-line derivation box come out very different sizes on the same sheet |
 
-There is no fixed count for either section. The layout engine packs MCQs first, horizontal numerical
+There is no fixed count for either section. The layout engine packs MCQs first, vertical numerical
 grids second, then written-answer boxes, each sized to its own `lines` value.
+
+New numerical grids have unlabelled digit columns spaced 9 mm apart, with
+0-9 labels down the left and no redundant handwriting boxes. One-, two-, and
+three-digit questions fit four across; wider questions receive more space. A
+question is never split across pages. All newly printed bubbles are 3.5 mm in
+diameter, with a 1.26 mm sampling radius published in the manifest.
+
+New sheets use manifest schema v6. The reader still accepts original v4/v5
+manifests, including horizontal numerical grids and the older 4 mm bubbles.
+Always use the manifest generated with the actual printed PDF; never replace an
+old sheet's manifest with a regenerated one. Print a small sample at 100% scale
+and check real filled scans before using the new size for a class batch.
 
 ### Multi-page exams — how the flow works
 
@@ -815,7 +834,7 @@ All under `omr/generator/configs/`:
 - `endsem_heavy_written.json` — 8 MCQs + 4 written questions with varying line counts, 1 page
 - `mcq_options_6.json` — 15 MCQs with 6 options each (A–F) instead of the usual 4
 - `multi_page_20q.json` — 10 MCQs + 10 written questions at 3 lines each -> 2 pages
-- `mixed_numerical.json` — MCQ + compact horizontal numerical grids + written answers
+- `mixed_numerical.json` — MCQ + vertical numerical grids + written answers
 - `example_impossible_question.json` — a single question too tall for any page, to show the hard-stop case
 
 ## Known Phase 1 limitations

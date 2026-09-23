@@ -1,0 +1,2 @@
+# Preserve PDF fixtures byte-for-byte across platforms.
+*.pdf binary

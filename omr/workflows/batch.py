@@ -55,7 +55,7 @@ from omr.reader.written_ocr import WrittenOcrBackend, build_written_ocr_backend,
 
 
 CONFIDENCE_RANK = {"low": 0, "medium": 1, "high": 2}
-GROUPING_MODES = {"auto", "identity", "page-major", "sheet-major", "write-in-similarity"}
+GROUPING_MODES = {"auto", "identity", "page-major", "sheet-major"}
 HANDWRITTEN_OCR_NOT_CONFIGURED_FLAG = "handwritten roll OCR is not configured; saved roll crop(s) for manual review"
 PAGE_MAJOR_IDENTITY_KIND = "page_major_order"
 SHEET_MAJOR_IDENTITY_KIND = "sheet_major_order"
@@ -232,6 +232,18 @@ def _strong_enough(confidence: str, minimum: str) -> bool:
     return CONFIDENCE_RANK.get(confidence, 0) >= CONFIDENCE_RANK[minimum]
 
 
+def _page_one_write_in_matches_bubbles(record: _PageRecord) -> bool:
+    if record.identity_kind != "bubbled" or not record.roll_no:
+        return False
+    payload = record.identity_payload or {}
+    write_in = payload.get("write_in_roll_read")
+    if not isinstance(write_in, dict):
+        return False
+    write_roll_no = normalize_roll(str(write_in.get("roll_no") or "")) or None
+    write_confidence = str(write_in.get("confidence") or "low")
+    return write_roll_no == record.roll_no and _strong_enough(write_confidence, "medium")
+
+
 def _best_page(existing: _PageRecord, challenger: _PageRecord) -> _PageRecord:
     existing_score = (
         CONFIDENCE_RANK.get(existing.confidence, 0),
@@ -249,14 +261,37 @@ def _best_page(existing: _PageRecord, challenger: _PageRecord) -> _PageRecord:
 def _group_records_by_identity(
     records: list[_PageRecord],
     min_group_confidence: str,
+    page_one_index: int = 1,
 ) -> tuple[dict[str, list[_PageRecord]], list[_PageRecord]]:
     grouped: dict[str, list[_PageRecord]] = {}
     unmatched: list[_PageRecord] = []
-    for record in records:
+
+    verified_anchor_rolls: set[str] = set()
+    ordered = sorted(records, key=lambda item: item.source_index)
+    for record in ordered:
+        if record.aligned_page.page_index != page_one_index:
+            continue
         if record.roll_no and _strong_enough(record.confidence, min_group_confidence):
             grouped.setdefault(record.roll_no, []).append(record)
+            if _page_one_write_in_matches_bubbles(record):
+                verified_anchor_rolls.add(record.roll_no)
         else:
             unmatched.append(record)
+
+    for record in ordered:
+        if record.aligned_page.page_index == page_one_index:
+            continue
+        if not record.roll_no or not _strong_enough(record.confidence, min_group_confidence):
+            unmatched.append(record)
+            continue
+        if record.roll_no not in verified_anchor_rolls:
+            record.review_flags.append(
+                f"continuation page OCR read {record.roll_no}, but no page-1 sheet has the same "
+                "roll confirmed by both bubbles and handwriting"
+            )
+            unmatched.append(record)
+            continue
+        grouped.setdefault(record.roll_no, []).append(record)
     return grouped, unmatched
 
 
@@ -374,204 +409,6 @@ def _roll_digits_for_similarity(roll_no: str | None, cell_count: int) -> str | N
     if len(digits) < cell_count:
         return None
     return digits[-cell_count:]
-
-
-def _write_in_similarity_weights(anchors: list[_PageRecord], cell_count: int) -> np.ndarray:
-    rolls = [
-        digits
-        for digits in (_roll_digits_for_similarity(anchor.roll_no, cell_count) for anchor in anchors)
-        if digits is not None
-    ]
-    if len(rolls) < 2:
-        return np.ones(cell_count, dtype=np.float32)
-    weights = np.full(cell_count, 0.20, dtype=np.float32)
-    for index in range(cell_count):
-        if len({roll[index] for roll in rolls}) > 1:
-            weights[index] = 1.0
-    if float(np.sum(weights)) <= 0:
-        return np.ones(cell_count, dtype=np.float32)
-    return weights
-
-
-def _write_in_similarity_score(
-    anchor: _WriteInSignature,
-    continuation: _WriteInSignature,
-    weights: np.ndarray,
-) -> float:
-    if anchor.features.shape != continuation.features.shape:
-        return 0.0
-    cell_scores = 1.0 - np.mean((anchor.features - continuation.features) ** 2, axis=1)
-    if weights.shape[0] != cell_scores.shape[0]:
-        weights = np.ones(cell_scores.shape[0], dtype=np.float32)
-    return float(np.clip(np.average(cell_scores, weights=weights), 0.0, 1.0))
-
-
-def _write_in_similarity_matches(
-    anchors: list[_PageRecord],
-    continuations: list[_PageRecord],
-    manifest: dict,
-    dpi: float,
-) -> list[_WriteInMatch]:
-    cache: dict[tuple[int, str], _WriteInSignature | None] = {}
-    scores: dict[tuple[int, int], float] = {}
-    weights_by_cell_count: dict[int, np.ndarray] = {}
-    for anchor in anchors:
-        for continuation in continuations:
-            if anchor.program and continuation.program and anchor.program != continuation.program:
-                continue
-            program = continuation.program or anchor.program
-            anchor_signature = _write_in_signature(anchor, manifest, dpi, program, cache)
-            continuation_signature = _write_in_signature(continuation, manifest, dpi, program, cache)
-            if anchor_signature is None or continuation_signature is None:
-                continue
-            cell_count = anchor_signature.features.shape[0]
-            weights = weights_by_cell_count.setdefault(
-                cell_count,
-                _write_in_similarity_weights(anchors, cell_count),
-            )
-            scores[(anchor.source_index, continuation.source_index)] = _write_in_similarity_score(
-                anchor_signature,
-                continuation_signature,
-                weights,
-            )
-
-    if not scores:
-        return []
-
-    anchor_by_source = {record.source_index: record for record in anchors}
-    continuation_by_source = {record.source_index: record for record in continuations}
-    matches: list[_WriteInMatch] = []
-    used_anchors: set[int] = set()
-    used_continuations: set[int] = set()
-    ranked = sorted(scores.items(), key=lambda item: item[1], reverse=True)
-    for (anchor_index, continuation_index), score in ranked:
-        if score < WRITE_IN_SIMILARITY_MIN_SCORE:
-            continue
-        if anchor_index in used_anchors or continuation_index in used_continuations:
-            continue
-        anchor_next = max(
-            (
-                other_score
-                for (other_anchor, other_continuation), other_score in scores.items()
-                if other_anchor == anchor_index and other_continuation != continuation_index
-            ),
-            default=0.0,
-        )
-        continuation_next = max(
-            (
-                other_score
-                for (other_anchor, other_continuation), other_score in scores.items()
-                if other_anchor != anchor_index and other_continuation == continuation_index
-            ),
-            default=0.0,
-        )
-        matches.append(
-            _WriteInMatch(
-                anchor=anchor_by_source[anchor_index],
-                continuation=continuation_by_source[continuation_index],
-                score=score,
-                anchor_margin=score - anchor_next,
-                continuation_margin=score - continuation_next,
-            )
-        )
-        used_anchors.add(anchor_index)
-        used_continuations.add(continuation_index)
-    return matches
-
-
-def _write_in_similarity_record(record: _PageRecord, match: _WriteInMatch) -> _PageRecord:
-    anchor = match.anchor
-    review_flags = [
-        flag for flag in record.review_flags if flag != HANDWRITTEN_OCR_NOT_CONFIGURED_FLAG
-    ]
-    margin = min(match.anchor_margin, match.continuation_margin)
-    if margin < WRITE_IN_SIMILARITY_REVIEW_MARGIN:
-        review_flags.append(
-            "continuation page attached by write-in roll similarity with a close match margin "
-            f"(score {match.score:.3f}, margin {margin:.3f}); review before using for final grading/email"
-        )
-    if record.roll_no and anchor.roll_no and record.roll_no != anchor.roll_no:
-        review_flags.append(
-            f"write-in similarity attached page {record.aligned_page.page_index} to roll {anchor.roll_no}, "
-            f"but continuation-page OCR read {record.roll_no}"
-        )
-    if record.program and anchor.program and record.program != anchor.program:
-        review_flags.append(
-            f"write-in similarity attached page {record.aligned_page.page_index} to roll {anchor.roll_no}, "
-            f"but continuation program reads {record.program} while page 1 reads {anchor.program}"
-        )
-
-    identity_payload = dict(record.identity_payload or {})
-    identity_payload.update(
-        {
-            "grouping_mode": "write-in-similarity",
-            "grouped_roll_no": anchor.roll_no,
-            "grouped_program": anchor.program,
-            "grouped_from_page1_source_index": anchor.source_index,
-            "similarity_score": match.score,
-            "similarity_margin": margin,
-            "original_identity_kind": record.identity_kind,
-            "original_roll_no": record.roll_no,
-            "original_confidence": record.confidence,
-        }
-    )
-    return replace(
-        record,
-        identity_kind=WRITE_IN_SIMILARITY_IDENTITY_KIND,
-        roll_no=anchor.roll_no,
-        program=record.program or anchor.program,
-        confidence="high" if margin >= WRITE_IN_SIMILARITY_REVIEW_MARGIN else "medium",
-        identity_payload=identity_payload,
-        review_flags=review_flags,
-    )
-
-
-def _group_records_by_write_in_similarity(
-    records: list[_PageRecord],
-    manifest: dict,
-    min_group_confidence: str,
-    dpi: float,
-) -> tuple[dict[str, list[_PageRecord]], list[_PageRecord]]:
-    grouped: dict[str, list[_PageRecord]] = {}
-    unmatched: list[_PageRecord] = []
-    anchors = [
-        record
-        for record in sorted(records, key=lambda item: item.source_index)
-        if record.aligned_page.page_index == manifest["roll_number_block"].get("page", 1)
-        and record.roll_no
-        and _strong_enough(record.confidence, min_group_confidence)
-    ]
-    anchor_sources = {record.source_index for record in anchors}
-    for anchor in anchors:
-        grouped.setdefault(anchor.roll_no or "", []).append(anchor)
-
-    assigned_continuations: set[int] = set()
-    for page_index in range(1, manifest["num_pages"] + 1):
-        if page_index == manifest["roll_number_block"].get("page", 1):
-            continue
-        continuations = [
-            record
-            for record in sorted(records, key=lambda item: item.source_index)
-            if record.aligned_page.page_index == page_index
-            and record.source_index not in assigned_continuations
-        ]
-        for match in _write_in_similarity_matches(anchors, continuations, manifest, dpi):
-            grouped.setdefault(match.anchor.roll_no or "", []).append(
-                _write_in_similarity_record(match.continuation, match)
-            )
-            assigned_continuations.add(match.continuation.source_index)
-
-    for record in sorted(records, key=lambda item: item.source_index):
-        if record.source_index in anchor_sources or record.source_index in assigned_continuations:
-            continue
-        if record.roll_no and _strong_enough(record.confidence, min_group_confidence):
-            grouped.setdefault(record.roll_no, []).append(record)
-            continue
-        if record.aligned_page.page_index != manifest["roll_number_block"].get("page", 1):
-            record.review_flags.append("continuation page could not be matched by write-in roll similarity")
-        unmatched.append(record)
-
-    return grouped, unmatched
 
 
 def _positional_sequence_review_flag(grouping_mode: str, manifest: dict, page_sequence: list[int]) -> str:
@@ -1475,6 +1312,57 @@ def _write_review_reports(
     }
 
 
+
+def _save_aligned_page(aligned: AlignedPage, identity_dir: Path) -> None:
+    meta = {
+        "page_index": aligned.page_index,
+        "source_index": aligned.source_index,
+        "alignment_confidence": aligned.alignment_confidence,
+        "page_mark_confidence": aligned.page_mark_confidence,
+    }
+
+    # Save images
+    if hasattr(aligned.image, "save"):
+        aligned.image.save(identity_dir / "aligned_image.png")
+    else:
+        Image.fromarray(aligned.image).save(identity_dir / "aligned_image.png")
+
+    if aligned.debug_image is not None:
+        if hasattr(aligned.debug_image, "save"):
+            aligned.debug_image.save(identity_dir / "aligned_debug.png")
+        else:
+            Image.fromarray(aligned.debug_image).save(identity_dir / "aligned_debug.png")
+
+    with open(identity_dir / "aligned.json", "w") as f:
+        json.dump(meta, f)
+
+def _load_aligned_page(identity_dir: Path) -> AlignedPage | None:
+    json_path = identity_dir / "aligned.json"
+    img_path = identity_dir / "aligned_image.png"
+    if not json_path.exists() or not img_path.exists():
+        return None
+
+    try:
+        with open(json_path) as f:
+            meta = json.load(f)
+        img = Image.open(img_path).copy()
+
+        debug_img = None
+        debug_path = identity_dir / "aligned_debug.png"
+        if debug_path.exists():
+            debug_img = Image.open(debug_path).copy()
+
+        return AlignedPage(
+            page_index=meta["page_index"],
+            source_index=meta["source_index"],
+            image=img,
+            alignment_confidence=meta["alignment_confidence"],
+            page_mark_confidence=meta["page_mark_confidence"],
+            debug_image=debug_img,
+        )
+    except Exception:
+        return None
+
 def parse_exam_bundle(
     scans_path: str | Path,
     manifest_path: str | Path,
@@ -1518,9 +1406,15 @@ def parse_exam_bundle(
         for raw_page in iter_scan_pages(scan_path, dpi):
             source_counter += 1
             identity_dir = root / "_page_identity" / f"source_{source_counter:04d}"
+            identity_dir.mkdir(parents=True, exist_ok=True)
             try:
-                aligned = align_scan_page(raw_page, manifest, dpi, source_index=source_counter)
+                aligned = _load_aligned_page(identity_dir)
+                if aligned is None:
+                    aligned = align_scan_page(raw_page, manifest, dpi, source_index=source_counter)
+                    _save_aligned_page(aligned, identity_dir)
+
                 identity_kind, roll_no, program, confidence, identity_payload, flags = _page_identity(
+
                     aligned,
                     manifest,
                     dpi,
@@ -1563,35 +1457,13 @@ def parse_exam_bundle(
                     }
                 )
 
-    applied_grouping_mode = (
-        _infer_grouping_mode(page_records_for_bundle, manifest) if grouping_mode == "auto" else grouping_mode
-    )
+    applied_grouping_mode = "identity" if grouping_mode == "auto" else grouping_mode
     identity_grouped, identity_unmatched = _group_records_by_identity(
         page_records_for_bundle,
         min_group_confidence,
+        page_one_index=int(manifest["roll_number_block"].get("page", 1)),
     )
-    if applied_grouping_mode == "identity" and grouping_mode == "auto":
-        similarity_grouped, similarity_unmatched = _group_records_by_write_in_similarity(
-            page_records_for_bundle,
-            manifest,
-            min_group_confidence,
-            dpi,
-        )
-        if sum(len(group_records) for group_records in similarity_grouped.values()) > sum(
-            len(group_records) for group_records in identity_grouped.values()
-        ):
-            applied_grouping_mode = "write-in-similarity"
-            grouped, unmatched = similarity_grouped, similarity_unmatched
-        else:
-            grouped, unmatched = identity_grouped, identity_unmatched
-    elif applied_grouping_mode == "write-in-similarity":
-        grouped, unmatched = _group_records_by_write_in_similarity(
-            page_records_for_bundle,
-            manifest,
-            min_group_confidence,
-            dpi,
-        )
-    elif applied_grouping_mode == "page-major":
+    if applied_grouping_mode == "page-major":
         grouped, unmatched = _group_records_by_page_major(page_records_for_bundle, manifest, min_group_confidence)
     elif applied_grouping_mode == "sheet-major":
         grouped, unmatched = _group_records_by_sheet_major(page_records_for_bundle, manifest, min_group_confidence)
@@ -1754,7 +1626,7 @@ def build_parser() -> argparse.ArgumentParser:
         default="auto",
         choices=sorted(GROUPING_MODES),
         help=(
-            "auto detects scanner order from page-index bars; identity groups pages by read roll number; "
+            "auto uses exact roll identity (page-1 bubbles plus handwriting, then continuation handwriting); "
             "page-major expects A1 B1 ... A2 B2 ...; sheet-major expects A1 A2 ... B1 B2 ..."
         ),
     )

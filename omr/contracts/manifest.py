@@ -34,7 +34,9 @@ from pathlib import Path
 # v5 adds numerical digit grids and a PHD selector sharing the five-digit
 # postgraduate grid. Continue accepting v4 sheets; old readers reject v5
 # rather than silently dropping those printed features.
-MANIFEST_SCHEMA_VERSION = 5
+# v6 adds vertical numerical grids. Keep v4/v5 readable with their original
+# geometry; an older reader must reject a new sheet rather than swap axes.
+MANIFEST_SCHEMA_VERSION = 6
 
 _TOP_LEVEL_KEYS = (
     "exam_id",
@@ -217,8 +219,9 @@ def _validate_numerical_block(manifest: dict) -> None:
         if type(entry["page"]) is not int or not 1 <= entry["page"] <= manifest["num_pages"]:
             raise ManifestError(f"numerical Q{q_no} has an invalid page")
         if type(entry["positions"]) is not int or not 1 <= entry["positions"] <= 8:
-            raise ManifestError(f"numerical Q{q_no} must have 1 to 8 place-value rows")
-        if (entry["orientation"] != "horizontal" or entry["answer_type"] != "unsigned_integer"
+            raise ManifestError(f"numerical Q{q_no} must have 1 to 8 place-value positions")
+        orientations = ("horizontal", "vertical") if manifest.get("schema_version", 4) >= 6 else ("horizontal",)
+        if (entry["orientation"] not in orientations or entry["answer_type"] != "unsigned_integer"
                 or entry["leading_zeros"] != "required"):
             raise ManifestError(f"numerical Q{q_no} uses an unsupported answer format")
         for key in ("x_mm", "y_mm", "digit_pitch_mm", "position_pitch_mm", "max_marks"):
@@ -228,8 +231,11 @@ def _validate_numerical_block(manifest: dict) -> None:
         radius = manifest["bubble_radius_mm"]
         if min(entry["digit_pitch_mm"], entry["position_pitch_mm"]) <= 2 * radius:
             raise ManifestError(f"numerical Q{q_no} has overlapping bubbles")
-        right = entry["x_mm"] + 9 * entry["digit_pitch_mm"] + radius
-        bottom = entry["y_mm"] + (entry["positions"] - 1) * entry["position_pitch_mm"] + radius
+        digit_span = 9 * entry["digit_pitch_mm"]
+        position_span = (entry["positions"] - 1) * entry["position_pitch_mm"]
+        horizontal = entry["orientation"] == "horizontal"
+        right = entry["x_mm"] + (digit_span if horizontal else position_span) + radius
+        bottom = entry["y_mm"] + (position_span if horizontal else digit_span) + radius
         if (min(entry["x_mm"], entry["y_mm"]) < radius
                 or right > manifest["page"]["width_mm"] or bottom > manifest["page"]["height_mm"]):
             raise ManifestError(f"numerical Q{q_no} extends beyond the page")
@@ -247,16 +253,16 @@ def validate_manifest(manifest: dict) -> dict:
         raise ManifestError(f"manifest is missing required keys: {', '.join(missing)}")
 
     version = manifest.get("schema_version", 4)
-    if version not in (4, MANIFEST_SCHEMA_VERSION):
+    if version not in (4, 5, MANIFEST_SCHEMA_VERSION):
         raise ManifestError(
             f"manifest schema_version is {version}, but this code reads version "
-            f"4 or {MANIFEST_SCHEMA_VERSION}. Regenerate the sheet, or use a matching "
+            f"4, 5 or {MANIFEST_SCHEMA_VERSION}. Regenerate the sheet, or use a matching "
             "version of SmartOMR to grade it."
         )
-    if version == 5 and "numerical_block" not in manifest:
-        raise ManifestError("v5 manifest is missing numerical_block")
+    if version >= 5 and "numerical_block" not in manifest:
+        raise ManifestError(f"v{version} manifest is missing numerical_block")
     if version == 4 and manifest.get("numerical_block"):
-        raise ManifestError("numerical grids require manifest schema_version 5")
+        raise ManifestError("numerical grids require manifest schema_version 5 or later")
 
     _validate_roll_number_block(manifest, version)
 

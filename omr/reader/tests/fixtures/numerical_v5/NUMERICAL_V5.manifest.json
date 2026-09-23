@@ -1,0 +1,208 @@
+{
+  "schema_version": 5,
+  "exam_id": "NUMERICAL_V5",
+  "exam": {
+    "university_name": "IIIT Delhi",
+    "course_code": "TEST",
+    "exam_name": "Legacy numerical fixture",
+    "exam_type": "quiz",
+    "marks_per_mcq": 1,
+    "mcq_options": 4,
+    "mcq_columns": 0,
+    "total_marks": 4.0
+  },
+  "num_pages": 1,
+  "page": {
+    "width_mm": 210.0,
+    "height_mm": 297.0
+  },
+  "printer_safe_margin_mm": 10.0,
+  "bubble_radius_mm": 2.0,
+  "bubble_sample_radius_mm": 1.44,
+  "mcq_option_pitch_mm": 8.0,
+  "mcq_label_offset_mm": 12.0,
+  "fiducial_size_mm": 7.0,
+  "fiducial_keepouts_mm": [
+    {
+      "x0_mm": 8.5,
+      "y0_mm": 8.5,
+      "x1_mm": 22.5,
+      "y1_mm": 22.5
+    },
+    {
+      "x0_mm": 187.5,
+      "y0_mm": 8.5,
+      "x1_mm": 201.5,
+      "y1_mm": 22.5
+    },
+    {
+      "x0_mm": 8.5,
+      "y0_mm": 274.5,
+      "x1_mm": 22.5,
+      "y1_mm": 288.5
+    },
+    {
+      "x0_mm": 187.5,
+      "y0_mm": 274.5,
+      "x1_mm": 201.5,
+      "y1_mm": 288.5
+    }
+  ],
+  "orientation_keepout_mm": {
+    "half_width_mm": 5.25,
+    "x0_mm": 24.25,
+    "y0_mm": 10.25,
+    "x1_mm": 34.75,
+    "y1_mm": 20.75
+  },
+  "fiducials": [
+    {
+      "page": 1,
+      "corner": "TL",
+      "x_mm": 15.5,
+      "y_mm": 15.5,
+      "size_mm": 7.0
+    },
+    {
+      "page": 1,
+      "corner": "TR",
+      "x_mm": 194.5,
+      "y_mm": 15.5,
+      "size_mm": 7.0
+    },
+    {
+      "page": 1,
+      "corner": "BL",
+      "x_mm": 15.5,
+      "y_mm": 281.5,
+      "size_mm": 7.0
+    },
+    {
+      "page": 1,
+      "corner": "BR",
+      "x_mm": 194.5,
+      "y_mm": 281.5,
+      "size_mm": 7.0
+    }
+  ],
+  "orientation_marker": [
+    {
+      "page": 1,
+      "x_mm": 29.5,
+      "y_mm": 15.5,
+      "size_mm": 3.5,
+      "marks_corner": "TL"
+    }
+  ],
+  "page_marks": [
+    {
+      "page": 1,
+      "index": 1,
+      "x_mm": 180.5,
+      "y_mm": 15.5,
+      "width_mm": 4.0,
+      "height_mm": 1.8,
+      "filled": true
+    }
+  ],
+  "continuation_program_choices": [],
+  "write_in_fields": [
+    {
+      "page": 1,
+      "name": "roll_number",
+      "program": "BTECH",
+      "programs": [
+        "BTECH"
+      ],
+      "x_mm": 24.5,
+      "y_mm": 51.0,
+      "width_mm": 67.0,
+      "height_mm": 7.0,
+      "cells": 7,
+      "cell_pitch_mm": 10.0,
+      "cell_width_mm": 7.0
+    },
+    {
+      "page": 1,
+      "name": "roll_number",
+      "program": null,
+      "programs": [
+        "MTECH",
+        "PHD"
+      ],
+      "x_mm": 124.5,
+      "y_mm": 51.0,
+      "width_mm": 47.0,
+      "height_mm": 7.0,
+      "cells": 5,
+      "cell_pitch_mm": 10.0,
+      "cell_width_mm": 7.0
+    }
+  ],
+  "roll_number_block": {
+    "page": 1,
+    "program_selector": {
+      "BTECH": {
+        "x_mm": 28.0,
+        "y_mm": 47.5
+      },
+      "MTECH": {
+        "x_mm": 128.0,
+        "y_mm": 47.5
+      },
+      "PHD": {
+        "x_mm": 153.0,
+        "y_mm": 47.5
+      }
+    },
+    "program_grid_keys": {
+      "BTECH": "btech_digits",
+      "MTECH": "mtech_digits",
+      "PHD": "mtech_digits"
+    },
+    "btech_digits": {
+      "columns": 7,
+      "x_mm": 28.0,
+      "y_mm": 62.0,
+      "col_pitch_mm": 10.0,
+      "row_pitch_mm": 6.0
+    },
+    "mtech_digits": {
+      "columns": 5,
+      "x_mm": 128.0,
+      "y_mm": 62.0,
+      "col_pitch_mm": 10.0,
+      "row_pitch_mm": 6.0
+    }
+  },
+  "mcq_block": [],
+  "written_block": [],
+  "numerical_block": [
+    {
+      "q_no": 1,
+      "x_mm": 37.0,
+      "y_mm": 147.5,
+      "positions": 3,
+      "digit_pitch_mm": 5.2,
+      "position_pitch_mm": 7.0,
+      "max_marks": 2.0,
+      "page": 1,
+      "orientation": "horizontal",
+      "answer_type": "unsigned_integer",
+      "leading_zeros": "required"
+    },
+    {
+      "q_no": 2,
+      "x_mm": 133.0,
+      "y_mm": 147.5,
+      "positions": 3,
+      "digit_pitch_mm": 5.2,
+      "position_pitch_mm": 7.0,
+      "max_marks": 2.0,
+      "page": 1,
+      "orientation": "horizontal",
+      "answer_type": "unsigned_integer",
+      "leading_zeros": "required"
+    }
+  ]
+}

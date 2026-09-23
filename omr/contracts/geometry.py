@@ -54,6 +54,15 @@ def digit_grid_centers_mm(grid: dict) -> dict[tuple[int, int], tuple[float, floa
             for position in range(grid["positions"])
             for digit in range(10)
         }
+    if grid.get("orientation") == "vertical" and "positions" in grid:
+        return {
+            (position, digit): (
+                grid["x_mm"] + position * grid["position_pitch_mm"],
+                grid["y_mm"] + digit * grid["digit_pitch_mm"],
+            )
+            for position in range(grid["positions"])
+            for digit in range(10)
+        }
     return {
         (column, digit): (grid["x_mm"] + column * grid["col_pitch_mm"],
                           grid["y_mm"] + digit * grid["row_pitch_mm"])

@@ -6,7 +6,7 @@ It does not require a database yet.
 ## Start
 
 ```powershell
-cd "C:\IIIT Delhi\BTP\SmartOMR"
+cd "D:\SmartOMR"
 .\.venv\Scripts\python.exe -m omr.ui.app
 ```
 
@@ -47,12 +47,47 @@ The IIITD portal CSV export is normalized automatically. Blank rows are skipped,
 `Lecture` in `Class Type` is replaced by a safe program inference from the roll number/current
 term, repeated spaces in names are collapsed, and an otherwise unnamed column is accepted as the
 email column only when the row contains exactly one valid email address. The normalized copy is
-stored as `inputs/students.csv`; the uploaded source remains beside it for audit.
+stored as `inputs/students.csv`; uploaded originals remain in separate input subdirectories for audit.
 
 Only the first sheet of an `.xlsx` file is used.
 
-The UI requires local Tesseract roll-number OCR. It refuses to process a run instead of silently
-falling back when that backend is unavailable. Before the final upload, run:
+## Source-page Inspection
+
+The upload starts **inspection only**, requiring just the scan and matching manifest. It inventories
+all source pages before alignment, then processes one page at a time at 200 DPI (PDFs). Single-page
+images retain their input resolution. Multi-frame images must be converted to PDF first, because
+the downstream batch reader supports only single-frame image inputs.
+
+The workspace has a searchable/filterable source list, original/aligned/overlay image modes,
+zoom and page navigation, and per-page alignment evidence. Source page number and detected sheet
+page number are separate: source 42 can be sheet page 2. Repeated sheet-page numbers are normal
+in an exam bundle. Alignment failure does not remove a source page or stop later pages.
+
+The original preview is a grayscale raster; the unchanged uploaded file is also available.
+A pending page receives its preview when the worker reaches it. Failed rendering remains an
+explicit failed page even if no preview can be produced.
+
+No roll OCR, grouping, grading, roster lookup, or email runs in this stage. An aligned page is
+not a verified identity. Quality scores are diagnostic scores, not calibrated probabilities.
+The UI intentionally does not improve or certify the underlying OCR or alignment accuracy.
+
+`Retry Failed Pages` skips completed aligned/review pages. After a server restart, interrupted
+inspection can be resumed. Scan and manifest SHA-256 checks prevent reuse after input changes.
+Inspection writes progress atomically. Only one processing operation runs in this local UI at a
+time; wait for it before uploading another run. A batch evaluation is not resumable here: create
+a new run if an interrupted batch already wrote artifacts. Existing review output is never reset
+by clicking evaluation twice.
+
+After inspection completes, `Run OCR & Grouping` explicitly starts the existing evaluation
+pipeline. Alignment warnings/failures remain visible for inspection; this action does not approve
+those pages or send mail. PDF decoding/alignment currently runs again in evaluation because its
+identity workflow has a separate artifact contract. This extra pass is a known time/disk cost,
+not a performance improvement. Inspect before committing to a long evaluation.
+
+## Evaluation Prerequisite
+
+Only evaluation requires local Tesseract roll-number OCR. It refuses to evaluate instead of silently
+falling back when that backend is unavailable. Before evaluation, run:
 
 ```powershell
 .\.venv\Scripts\python.exe -m omr.health --check-handwriting-ocr
@@ -76,6 +111,9 @@ Important files:
 
 ```text
 inputs/                         uploaded files
+inspection/index.json          all source pages, input hashes, progress, quality and errors
+inspection/source_0001/         immutable per-attempt original/aligned/overlay images
+inspection/source_0001/*/quality.json   full per-page alignment measurements
 parsed/<exam_id>/parse_index.json
 parsed/<exam_id>/email_release/email_skipped.csv
 parsed/<exam_id>/students/<roll_no>/student.json
@@ -90,7 +128,10 @@ run_state.json
 
 ```text
 Exam runs
-  -> open one exam run
+  -> upload PDF + matching manifest (roster and answer key optional)
+  -> inspect every source page and alignment failures
+  -> explicitly run OCR & grouping
+  -> open Student Review
   -> compare detected students with Roster and Missing Sheets counts
   -> open Review Cases
   -> assign unmatched pages to a roll or ignore confirmed duplicates/stray pages
@@ -106,7 +147,19 @@ A student cannot be verified while an expected page is missing. Roster students 
 sheet remain visible in the review page and are written to `email_skipped.csv`; they never silently
 disappear from the release count.
 
-Statuses come from the parser:
+The student UI separates parsing from verification. Parser `ready` is displayed as
+`PENDING_VERIFICATION`, not `AUTO_GRADED`. Rejected and missing-page decisions stay distinct.
+Verified grouping is labelled `MANUALLY_CHECKED`; this does not imply that marks were reviewed.
+Without a key, marks display as `Not graded`, not `0 / 0`.
+
+Student images and the source-page table use the same current selection as verified PDF creation,
+including manual replacements. After manual assignment, the old parser PDF is not offered as the
+current PDF. Verification creates the new PDF. Original response tables are withheld and the UI
+shows `Regrading required` until a separate grading workflow handles the corrected selection.
+This increment does not implement that regrading workflow. The dashboard's CSV is explicitly
+labelled **Original Parser Marks CSV**, not a final reviewed marks export.
+
+Raw parser statuses are preserved in artifacts:
 
 ```text
 ready

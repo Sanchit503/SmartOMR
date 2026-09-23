@@ -57,6 +57,7 @@ def read_numerical_responses(
         centers = numerical_sample_centers(gray, manifest, entry, dpi)
         columns = []
         flags = []
+        position_name = "column" if entry["orientation"] == "vertical" else "row"
         for column in range(entry["positions"]):
             ratios, inks = {}, {}
             for digit in range(10):
@@ -73,7 +74,7 @@ def read_numerical_responses(
                 "review_reason": reason, "fill_ratios": ratios, "ink_densities": inks,
             })
             if review:
-                flags.append(f"place-value row {column + 1}: {reason}")
+                flags.append(f"place-value {position_name} {column + 1}: {reason}")
 
         outcomes = [column["outcome"] for column in columns]
         if MCQOutcome.MULTIPLE.value in outcomes:
@@ -84,7 +85,7 @@ def read_numerical_responses(
             outcome = "blank"
         elif MCQOutcome.BLANK.value in outcomes:
             outcome = "incomplete"
-            flags.append("some place-value rows are blank; fill every row including leading zeros")
+            flags.append(f"some place-value {position_name}s are blank; fill every {position_name} including leading zeros")
         else:
             outcome = "answered"
         text = "".join(column["selected_digit"] for column in columns) if outcome == "answered" else None

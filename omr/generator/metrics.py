@@ -18,15 +18,15 @@ Vertical structure of a page, top to bottom:
          instructions
     ---- IDENTITY_BOX_TOP  bordered identity block
          page 1:  program bubbles, roll write-in cells,
-                  the two 0-9 digit grids            (ends ~120mm)
+                  the two 0-9 digit grids            (ends ~119mm)
          page 2+: compact program + roll boxes       (ends 50mm)
     ---- content_top_mm()   questions start here, and flow down
-         Section A MCQs, then Section B written answers, continuously
+         MCQs, numerical grids, then written answers, continuously
     ---- PAGE_BOTTOM_MM --  top of the bottom markers' quiet zones (274.5mm)
     ---- 287mm -----------  printer-safe margin: no ink at all below here
 
 The two identity bands are why page 1 holds fewer questions than a
-continuation page: 124.5mm of page 1 is spent on the bubbled roll-number
+continuation page: 124.25mm of page 1 is spent on the bubbled roll-number
 grid, versus 55mm on a continuation page's write-in strip.
 """
 from __future__ import annotations
@@ -110,11 +110,11 @@ PAGE_MARK_RIGHT_MM = PAGE_WIDTH_MM - FIDUCIAL_INSET_MM - 14.0
 # ---------------------------------------------------------------------------
 # Bubbles
 # ---------------------------------------------------------------------------
-BUBBLE_RADIUS_MM = 2.0  # drawn radius (4mm across — comfortable to fill by hand)
+BUBBLE_RADIUS_MM = 1.75  # 3.5mm diameter; older sheets retain their manifest's size
 
 # The reader measures a smaller disc than the one printed, so the bubble's
 # own outline stroke never counts as student ink. At the default 1pt stroke
-# the outline straddles r=2.0mm; 0.72 keeps the sample well clear of it.
+# the outline straddles the drawn radius; 0.72 keeps the sample clear of it.
 BUBBLE_SAMPLE_RATIO = 0.72
 BUBBLE_SAMPLE_RADIUS_MM = BUBBLE_RADIUS_MM * BUBBLE_SAMPLE_RATIO
 
@@ -148,7 +148,7 @@ ROLL_GRID_TITLE_Y_MM = PROGRAM_SELECTOR_Y_MM
 ROLL_WRITE_IN_TOP_MM = 51.0
 
 DIGIT_COL_PITCH_MM = 10.0
-DIGIT_ROW_PITCH_MM = 6.0  # 4mm bubble + 2mm clear between rows
+DIGIT_ROW_PITCH_MM = 6.0  # 3.5mm bubble + 2.5mm nominal gap between rows
 ROLL_BLOCK_TOP_MM = 62.0  # center of the digit-0 row
 DIGIT_ROW_LABEL_DX_MM = 7.5  # row label sits this far LEFT of column 0
 
@@ -195,17 +195,16 @@ MCQ_LABEL_OFFSET_MM = 12.0  # "Q123" at 8pt is 8.4mm wide, so this clears it
 MCQ_COLUMN_CANDIDATES = (2, 3, 4)
 
 NUMERICAL_DIGIT_PITCH_MM = 5.2
-NUMERICAL_POSITION_PITCH_MM = 7.0
-# Reserve enough room for the longest supported place-value label
-# ("Hundred thousands") without entering the 10 mm printer-safe margin.
-NUMERICAL_GRID_OFFSET_X_MM = 25.0
-NUMERICAL_GRID_OFFSET_Y_MM = 11.0
+NUMERICAL_POSITION_PITCH_MM = 9.0
+# Keep a lane for the 0-9 row labels and clearance below the question title.
+NUMERICAL_GRID_OFFSET_X_MM = 9.0
+NUMERICAL_GRID_OFFSET_Y_MM = 8.0
 NUMERICAL_COLUMN_GAP_MM = 6.0
 NUMERICAL_QUESTION_GAP_MM = 5.0
 NUMERICAL_SECTION_HEADER_MM = 12.0
-NUMERICAL_SLOT_WIDTH_MM = (PAGE_WIDTH_MM - 2 * MARGIN_MM) / 2 - NUMERICAL_COLUMN_GAP_MM / 2
+NUMERICAL_MIN_SLOT_WIDTH_MM = 42.0  # Four slots + three 6mm gaps fill the 186mm content width
 
-WRITTEN_HEADER_MM = 6.0  # "Q21 [5 marks]" label above the box
+WRITTEN_HEADER_MM = 6.0  # Question number and line-count guidance above the box
 WRITTEN_LINE_MM = 7.0  # height of one ruled writing line, same for every box
 WRITTEN_GAP_MM = 5.0  # between one answer box and the next question's label
 
@@ -330,16 +329,24 @@ def written_box_height_mm(lines: int) -> float:
 
 
 def numerical_slot_width_mm(digits: int) -> float:
-    del digits
-    return NUMERICAL_SLOT_WIDTH_MM
+    return max(
+        NUMERICAL_MIN_SLOT_WIDTH_MM,
+        2 * NUMERICAL_GRID_OFFSET_X_MM + (digits - 1) * NUMERICAL_POSITION_PITCH_MM,
+    )
 
 
 def numerical_slot_height_mm(digits: int) -> float:
-    return NUMERICAL_GRID_OFFSET_Y_MM + (digits - 1) * NUMERICAL_POSITION_PITCH_MM + BUBBLE_RADIUS_MM + 2.0
+    # Every column contains ten digits, irrespective of the answer's length.
+    return NUMERICAL_GRID_OFFSET_Y_MM + 9 * NUMERICAL_DIGIT_PITCH_MM + BUBBLE_RADIUS_MM + 2.0
+
+
+def numerical_grid_offset_x_mm(digits: int) -> float:
+    """Centre the columns within their question's slot, including narrow grids."""
+    return (numerical_slot_width_mm(digits) - (digits - 1) * NUMERICAL_POSITION_PITCH_MM) / 2
 
 
 def written_slot_height_mm(lines: int) -> float:
-    """Box plus the "Qn [k marks]" label above it."""
+    """Box plus the question/line-count label above it."""
     return WRITTEN_HEADER_MM + written_box_height_mm(lines)
 
 

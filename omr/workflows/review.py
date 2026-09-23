@@ -778,7 +778,8 @@ def load_or_initialize_verified_index(parsed_dir: str | Path) -> tuple[dict[str,
     return initialize_verification_index(parsed_dir)
 
 
-def _selected_student_pages(student: dict[str, Any]) -> list[dict[str, Any]]:
+def selected_student_pages(student: dict[str, Any]) -> list[dict[str, Any]]:
+    """Current page selection, including manual replacements, in template order."""
     selected: dict[int, dict[str, Any]] = {}
     for page in student.get("pages", []):
         page_no = page.get("page")
@@ -803,7 +804,7 @@ def _create_verified_sheet_pdf(parsed_dir: Path, student: dict[str, Any]) -> str
             return _json_path(output_path, parsed_dir)
 
     images: list[Image.Image] = []
-    for page in _selected_student_pages(student):
+    for page in selected_student_pages(student):
         image_path = _resolve_path(page.get("canonical_image_path"), parsed_dir)
         if image_path is None or not image_path.exists():
             raise FileNotFoundError(f"canonical page image not found for roll {student['roll_no']}: {image_path}")

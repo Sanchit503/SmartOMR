@@ -163,7 +163,7 @@ def _calibrate_digit_grid(gray: np.ndarray, manifest: dict, dpi: float, grid: di
 
     The global page warp is anchored by the four fiducials, but phone photos
     and old printed copies can still leave a millimetre-scale local drift in
-    a bubble block. Both the vertical roll grid and horizontal numerical grid
+    a bubble block. Both roll grids and numerical grids in either orientation
     contain a regular array of printed circles, so use those outlines as local
     registration marks before deciding which digit is filled.
     """
@@ -233,10 +233,14 @@ def _calibrate_digit_grid(gray: np.ndarray, manifest: dict, dpi: float, grid: di
         )
 
     horizontal = grid.get("orientation") == "horizontal"
-    x_count = 10 if horizontal else grid["columns"]
-    y_count = grid["positions"] if horizontal else 10
-    x_pitch = grid["digit_pitch_mm"] if horizontal else grid["col_pitch_mm"]
-    y_pitch = grid["position_pitch_mm"] if horizontal else grid["row_pitch_mm"]
+    if "positions" in grid:
+        x_count = 10 if horizontal else grid["positions"]
+        y_count = grid["positions"] if horizontal else 10
+        x_pitch = grid["digit_pitch_mm"] if horizontal else grid["position_pitch_mm"]
+        y_pitch = grid["position_pitch_mm"] if horizontal else grid["digit_pitch_mm"]
+    else:
+        x_count, y_count = grid["columns"], 10
+        x_pitch, y_pitch = grid["col_pitch_mm"], grid["row_pitch_mm"]
     x_clusters = _cluster_values([p[0] / scale for p in points], tolerance_mm=min(2.5, x_pitch * 0.4))
     y_clusters = _cluster_values([p[1] / scale for p in points], tolerance_mm=min(2.5, y_pitch * 0.4))
     x_centers = _best_regular_run(x_clusters, x_count, x_pitch)

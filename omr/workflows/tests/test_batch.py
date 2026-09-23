@@ -25,12 +25,50 @@ class FakeOcr:
         self.digits = list(digits)
         self.roll_text = roll_text
 
-    def read_roll(self, crop_path: Path, program: str | None = None) -> RollOcrResult:
+    def read_roll(self, crop_path: Path, program: str | None = None, valid_rolls: set[str] | None = None) -> RollOcrResult:
         return RollOcrResult(self.roll_text, confidence=0.95)
 
     def read_digit(self, crop_path: Path) -> RollOcrResult:
         digit = self.digits.pop(0) if self.digits else ""
         return RollOcrResult(digit, confidence=0.95)
+
+
+class PageAwareFakeOcr:
+    provider = "fake_page_aware"
+
+    def __init__(self, page_rolls: dict[int, str]) -> None:
+        self.page_rolls = page_rolls
+
+    @staticmethod
+    def _page_index(crop_path: Path) -> int:
+        return 1 if "page_1_" in crop_path.name else 2
+
+    def read_roll(self, crop_path: Path, program: str | None = None, valid_rolls: set[str] | None = None) -> RollOcrResult:
+        return RollOcrResult(self.page_rolls[self._page_index(crop_path)], confidence=0.95)
+
+    def read_digit(self, crop_path: Path) -> RollOcrResult:
+        page_index = self._page_index(crop_path)
+        cell_index = int(crop_path.stem.rsplit("_", 1)[-1]) - 1
+        return RollOcrResult(self.page_rolls[page_index][cell_index], confidence=0.95)
+
+
+class SourceAwareFakeOcr:
+    provider = "fake_source_aware"
+    fast_cell_first = True
+
+    def __init__(self, source_rolls: dict[int, str]) -> None:
+        self.source_rolls = source_rolls
+
+    def _roll(self, crop_path: Path) -> str:
+        source_index = int(crop_path.parent.name.rsplit("_", 1)[-1])
+        return self.source_rolls[source_index]
+
+    def read_roll(self, crop_path: Path, program: str | None = None, valid_rolls: set[str] | None = None) -> RollOcrResult:
+        return RollOcrResult(self._roll(crop_path), confidence=0.95)
+
+    def read_digit(self, crop_path: Path) -> RollOcrResult:
+        cell_index = int(crop_path.stem.rsplit("_", 1)[-1]) - 1
+        return RollOcrResult(self._roll(crop_path)[cell_index], confidence=0.95)
 
 
 def test_roster_reconciliation_exposes_missing_and_unexpected_rolls():
@@ -266,6 +304,48 @@ def test_batch_flags_first_page_write_in_roll_conflict(tmp_path: Path):
     assert payload["status_counts"]["needs_review"] == 1
 
 
+def test_page_one_write_in_conflict_blocks_continuation_attachment(tmp_path: Path):
+    result = generate_exam(
+        ExamConfig(
+            exam_id="BATCH_ANCHOR_CONFLICT_TEST",
+            course_code="CSE202",
+            exam_name="Endsem",
+            exam_type="endsem",
+            num_mcq=10,
+            mcq_options=4,
+            marks_per_mcq=1,
+            written_questions=[WrittenQuestionConfig(q_no=11 + i, max_marks=2, lines=2) for i in range(8)],
+        ),
+        tmp_path / "exam",
+    )
+    manifest = result["manifest"]
+    pages = _render_pages(result["pdf_path"])
+    _fill_btech_roll(pages[1], manifest, "2024587")
+    _fill_continuation_program(pages[2], manifest, "BTECH")
+    bundle_path = tmp_path / "anchor_conflict_bundle.pdf"
+    pages[2].save(bundle_path, save_all=True, append_images=[pages[1]], resolution=DPI)
+
+    students, index_path = parse_exam_bundle(
+        bundle_path,
+        result["manifest_path"],
+        output_root=tmp_path / "parsed",
+        dpi=DPI,
+        ocr_backend=PageAwareFakeOcr({1: "2024999", 2: "2024587"}),
+        min_group_confidence="medium",
+    )
+
+    assert len(students) == 1
+    assert students[0]["student"]["roll_no"] == "2024587"
+    assert {page["page_index"] for page in students[0]["pages"]} == {1}
+    payload = json.loads(index_path.read_text(encoding="utf-8"))
+    assert payload["status_counts"]["unmatched_pages"] == 1
+    assert payload["unmatched_pages"][0]["page_index"] == 2
+    assert any(
+        "no page-1 sheet has the same roll confirmed by both bubbles and handwriting" in flag
+        for flag in payload["unmatched_pages"][0]["review_flags"]
+    )
+
+
 def test_batch_flags_unreadable_first_page_write_in_roll(tmp_path: Path):
     result = generate_exam(
         ExamConfig(
@@ -302,7 +382,7 @@ def test_batch_flags_unreadable_first_page_write_in_roll(tmp_path: Path):
     )
 
 
-def test_batch_pdf_groups_page_major_scanner_order_without_continuation_ocr(tmp_path: Path):
+def test_batch_explicitly_groups_page_major_scanner_order_without_continuation_ocr(tmp_path: Path):
     result = generate_exam(
         ExamConfig(
             exam_id="PAGE_MAJOR_BATCH_TEST",
@@ -341,6 +421,7 @@ def test_batch_pdf_groups_page_major_scanner_order_without_continuation_ocr(tmp_
         output_root=tmp_path / "parsed",
         dpi=DPI,
         min_group_confidence="high",
+        grouping_mode="page-major",
     )
 
     assert {student["student"]["roll_no"] for student in students} == {"2024001", "2024002"}
@@ -352,13 +433,13 @@ def test_batch_pdf_groups_page_major_scanner_order_without_continuation_ocr(tmp_
         assert (identity_dir / "page_2_btech_roll_crop.png").exists()
 
     payload = json.loads(index_path.read_text(encoding="utf-8"))
-    assert payload["requested_grouping_mode"] == "auto"
+    assert payload["requested_grouping_mode"] == "page-major"
     assert payload["grouping_mode"] == "page-major"
     assert payload["status_counts"]["unmatched_pages"] == 0
     assert payload["status_counts"]["page_errors"] == 0
 
 
-def test_batch_pdf_groups_sheet_major_scanner_order_without_continuation_ocr(tmp_path: Path):
+def test_batch_explicitly_groups_sheet_major_scanner_order_without_continuation_ocr(tmp_path: Path):
     result = generate_exam(
         ExamConfig(
             exam_id="SHEET_MAJOR_BATCH_TEST",
@@ -397,6 +478,7 @@ def test_batch_pdf_groups_sheet_major_scanner_order_without_continuation_ocr(tmp
         output_root=tmp_path / "parsed",
         dpi=DPI,
         min_group_confidence="high",
+        grouping_mode="sheet-major",
     )
 
     assert {student["student"]["roll_no"] for student in students} == {"2024003", "2024004"}
@@ -406,13 +488,13 @@ def test_batch_pdf_groups_sheet_major_scanner_order_without_continuation_ocr(tmp
         assert any(read["kind"] == "sheet_major_order" and read["page_index"] == 2 for read in student["identity_reads"])
 
     payload = json.loads(index_path.read_text(encoding="utf-8"))
-    assert payload["requested_grouping_mode"] == "auto"
+    assert payload["requested_grouping_mode"] == "sheet-major"
     assert payload["grouping_mode"] == "sheet-major"
     assert payload["status_counts"]["unmatched_pages"] == 0
     assert payload["status_counts"]["page_errors"] == 0
 
 
-def test_batch_auto_groups_irregular_order_by_write_in_similarity_without_continuation_ocr(tmp_path: Path):
+def test_batch_auto_does_not_guess_irregular_order_from_write_in_similarity(tmp_path: Path):
     result = generate_exam(
         ExamConfig(
             exam_id="WRITE_IN_MATCH_BATCH_TEST",
@@ -449,31 +531,22 @@ def test_batch_auto_groups_irregular_order_by_write_in_similarity_without_contin
     bundle_path = tmp_path / "irregular_write_in_bundle.pdf"
     bundle_pages[0].save(bundle_path, save_all=True, append_images=bundle_pages[1:], resolution=DPI)
 
-    students, index_path = parse_exam_bundle(
+    auto_students, auto_index_path = parse_exam_bundle(
         bundle_path,
         result["manifest_path"],
-        output_root=tmp_path / "parsed",
+        output_root=tmp_path / "parsed_auto",
         dpi=DPI,
         min_group_confidence="high",
     )
 
-    assert {student["student"]["roll_no"] for student in students} == {"2024503", "2024544"}
-    for student in students:
-        assert {page["page_index"] for page in student["pages"]} == {1, 2}
-        sheet_pdf_path = Path(student["details_path"]).parent / student["sheet_pdf_path"]
-        with pymupdf.open(sheet_pdf_path) as doc:
-            assert len(doc) == 2
-        assert any(read["kind"] == "write_in_similarity" for read in student["identity_reads"])
-
-    payload = json.loads(index_path.read_text(encoding="utf-8"))
-    assert payload["requested_grouping_mode"] == "auto"
-    assert payload["grouping_mode"] == "write-in-similarity"
-    assert payload["detected_page_sequence"] == [1, 2, 2, 1]
-    assert payload["status_counts"]["unmatched_pages"] == 0
-    assert payload["status_counts"]["page_errors"] == 0
+    assert {student["student"]["roll_no"] for student in auto_students} == {"2024503", "2024544"}
+    assert all({page["page_index"] for page in student["pages"]} == {1} for student in auto_students)
+    auto_payload = json.loads(auto_index_path.read_text(encoding="utf-8"))
+    assert auto_payload["grouping_mode"] == "identity"
+    assert auto_payload["status_counts"]["unmatched_pages"] == 2
 
 
-def test_batch_auto_groups_three_page_arbitrary_order_by_write_in_similarity(tmp_path: Path):
+def test_batch_auto_leaves_unreadable_three_page_arbitrary_order_unmatched(tmp_path: Path):
     result = generate_exam(
         ExamConfig(
             exam_id="THREE_PAGE_WRITE_IN_MATCH_TEST",
@@ -533,19 +606,150 @@ def test_batch_auto_groups_three_page_arbitrary_order_by_write_in_similarity(tmp
         "2048921",
     }
     for student in parsed_students:
-        assert {page["page_index"] for page in student["pages"]} == {1, 2, 3}
+        assert {page["page_index"] for page in student["pages"]} == {1}
         sheet_pdf_path = Path(student["details_path"]).parent / student["sheet_pdf_path"]
         with pymupdf.open(sheet_pdf_path) as doc:
-            assert len(doc) == 3
-        assert sum(read["kind"] == "write_in_similarity" for read in student["identity_reads"]) == 2
+            assert len(doc) == 1
 
     payload = json.loads(index_path.read_text(encoding="utf-8"))
     assert payload["requested_grouping_mode"] == "auto"
-    assert payload["grouping_mode"] == "write-in-similarity"
+    assert payload["grouping_mode"] == "identity"
     assert payload["expected_pages"] == 3
     assert payload["detected_page_sequence"] == [2, 3, 1, 3, 2, 1, 1, 3, 2]
-    assert payload["status_counts"]["unmatched_pages"] == 0
+    assert payload["status_counts"]["unmatched_pages"] == 6
     assert payload["status_counts"]["page_errors"] == 0
+
+
+def _assert_random_order_identity_grouping(
+    tmp_path: Path,
+    *,
+    written_question_count: int,
+    expected_pages: int,
+    order: list[tuple[str, int]],
+    unreadable_source: int | None = None,
+) -> None:
+    result = generate_exam(
+        ExamConfig(
+            exam_id=f"RANDOM_{expected_pages}_PAGE_IDENTITY_TEST",
+            course_code="CSE222",
+            exam_name="Endsem",
+            exam_type="endsem",
+            num_mcq=10,
+            mcq_options=4,
+            marks_per_mcq=1,
+            written_questions=[
+                WrittenQuestionConfig(q_no=11 + i, max_marks=2, lines=3)
+                for i in range(written_question_count)
+            ],
+        ),
+        tmp_path / "exam",
+    )
+    manifest = result["manifest"]
+    assert manifest["num_pages"] == expected_pages
+    base_pages = _render_pages(result["pdf_path"])
+    students = {
+        "A": {"roll": "2024503", "pages": {page: image.copy() for page, image in base_pages.items()}},
+        "B": {"roll": "2037618", "pages": {page: image.copy() for page, image in base_pages.items()}},
+        "C": {"roll": "2048921", "pages": {page: image.copy() for page, image in base_pages.items()}},
+    }
+    for student in students.values():
+        _fill_btech_roll(student["pages"][1], manifest, student["roll"])
+        for page_index in range(2, expected_pages + 1):
+            _fill_continuation_program(
+                student["pages"][page_index],
+                manifest,
+                "BTECH",
+                page_index=page_index,
+            )
+
+    source_rolls = {
+        source_index: students[student_key]["roll"]
+        for source_index, (student_key, _page_index) in enumerate(order, start=1)
+    }
+    if unreadable_source is not None:
+        source_rolls[unreadable_source] = "2099999"
+    bundle_pages = [students[student_key]["pages"][page_index] for student_key, page_index in order]
+    bundle_path = tmp_path / f"random_{expected_pages}_page_bundle.pdf"
+    bundle_pages[0].save(bundle_path, save_all=True, append_images=bundle_pages[1:], resolution=DPI)
+
+    parsed_students, index_path = parse_exam_bundle(
+        bundle_path,
+        result["manifest_path"],
+        output_root=tmp_path / "parsed",
+        dpi=DPI,
+        min_group_confidence="medium",
+        ocr_backend=SourceAwareFakeOcr(source_rolls),
+    )
+
+    payload = json.loads(index_path.read_text(encoding="utf-8"))
+    assert payload["grouping_mode"] == "identity"
+    expected_unmatched = 1 if unreadable_source is not None else 0
+    assert payload["status_counts"]["unmatched_pages"] == expected_unmatched
+    if unreadable_source is not None:
+        assert payload["unmatched_pages"][0]["source_index"] == unreadable_source
+
+    expected_page_numbers = set(range(1, expected_pages + 1))
+    for parsed_student in parsed_students:
+        roll_no = parsed_student["student"]["roll_no"]
+        expected_sources = {
+            source_index
+            for source_index, (student_key, _page_index) in enumerate(order, start=1)
+            if students[student_key]["roll"] == roll_no and source_index != unreadable_source
+        }
+        expected_student_pages = {
+            page_index
+            for source_index, (student_key, page_index) in enumerate(order, start=1)
+            if students[student_key]["roll"] == roll_no and source_index != unreadable_source
+        }
+        assert {source["source_index"] for source in parsed_student["source_pages"]} == expected_sources
+        assert {page["page_index"] for page in parsed_student["pages"]} == expected_student_pages
+        sheet_pdf_path = Path(parsed_student["details_path"]).parent / parsed_student["sheet_pdf_path"]
+        with pymupdf.open(sheet_pdf_path) as document:
+            assert len(document) == len(expected_student_pages)
+        if unreadable_source is None:
+            assert expected_student_pages == expected_page_numbers
+
+
+def test_batch_groups_three_page_students_in_random_source_order_by_exact_identity(tmp_path: Path):
+    _assert_random_order_identity_grouping(
+        tmp_path,
+        written_question_count=10,
+        expected_pages=3,
+        order=[
+            ("C", 2),
+            ("A", 3),
+            ("B", 1),
+            ("C", 3),
+            ("A", 2),
+            ("A", 1),
+            ("C", 1),
+            ("B", 3),
+            ("B", 2),
+        ],
+    )
+
+
+def test_batch_groups_four_page_students_and_isolates_unreadable_page(tmp_path: Path):
+    _assert_random_order_identity_grouping(
+        tmp_path,
+        written_question_count=16,
+        expected_pages=4,
+        order=[
+            ("C", 4),
+            ("A", 2),
+            ("B", 3),
+            ("C", 1),
+            ("A", 4),
+            ("B", 1),
+            ("C", 2),
+            ("A", 1),
+            ("B", 4),
+            ("C", 3),
+            ("B", 2),
+            ("A", 3),
+        ],
+        unreadable_source=9,
+    )
 
 
 def test_batch_unmatched_late_page_saves_written_crops(tmp_path: Path):

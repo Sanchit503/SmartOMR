@@ -33,7 +33,7 @@ class RollOcrResult:
 class RollOcrBackend(Protocol):
     provider: str
 
-    def read_roll(self, crop_path: Path, program: str | None = None) -> RollOcrResult:
+    def read_roll(self, crop_path: Path, program: str | None = None, valid_rolls: set[str] | None = None) -> RollOcrResult:
         ...
 
 
@@ -47,7 +47,7 @@ class LocalDigitModelRollOcr:
 
         self.model = OpenCVDigitKnn(model_path)
 
-    def read_roll(self, crop_path: Path, program: str | None = None) -> RollOcrResult:
+    def read_roll(self, crop_path: Path, program: str | None = None, valid_rolls: set[str] | None = None) -> RollOcrResult:
         expected_digits = _expected_digit_count(program)
         if expected_digits is None:
             return RollOcrResult("", confidence=0.0, raw={"reason": "program_required_for_digit_model"})
@@ -96,7 +96,7 @@ class LocalEnsembleRollOcr:
         self.backends = backends
         self.warnings = warnings or []
 
-    def read_roll(self, crop_path: Path, program: str | None = None) -> RollOcrResult:
+    def read_roll(self, crop_path: Path, program: str | None = None, valid_rolls: set[str] | None = None) -> RollOcrResult:
         results = [backend.read_roll(crop_path, program=program) for backend in self.backends]
         candidates: list[dict[str, object]] = []
         for result in results:
@@ -169,7 +169,7 @@ class LocalTesseractRollOcr:
                 "Tesseract OCR binary is not available. Install Tesseract or set SMARTOMR_TESSERACT_CMD."
             ) from exc
 
-    def read_roll(self, crop_path: Path, program: str | None = None) -> RollOcrResult:
+    def read_roll(self, crop_path: Path, program: str | None = None, valid_rolls: set[str] | None = None) -> RollOcrResult:
         image = Image.open(crop_path).convert("L")
         candidates: list[dict[str, object]] = []
 
@@ -486,7 +486,7 @@ def _read_write_in_roll_number(
                 raw={"skipped": "validated cell OCR succeeded"},
             )
         else:
-            strip_result = ocr_backend.read_roll(crop_path, program=program)
+            strip_result = ocr_backend.read_roll(crop_path, program=program, valid_rolls=valid_rolls)
         strip_normalized = normalize_handwritten_roll_text(strip_result.text, program=program)
         ocr_results[program] = {
             "strip": _ocr_result_payload(strip_result),
@@ -589,6 +589,7 @@ def _read_roll_from_cells(
     backend: RollOcrBackend,
     cell_paths: list[Path],
     program: str | None,
+    valid_rolls: set[str] | None = None,
 ) -> RollOcrResult:
     expected_count = _expected_digit_count(program)
     if expected_count is None or len(cell_paths) != expected_count:

@@ -164,7 +164,7 @@ Print four solid black square markers, one in each corner, on every sheet, regar
     { "q_no": 1, "x_mm": 20, "y_mm": 110, "options": ["A", "B", "C", "D"] }
   ],
   "numerical_block": [
-    { "q_no": 21, "page": 1, "positions": 3, "orientation": "horizontal", "answer_type": "unsigned_integer", "leading_zeros": "required" }
+    { "q_no": 21, "page": 1, "positions": 3, "orientation": "vertical", "answer_type": "unsigned_integer", "leading_zeros": "required" }
   ],
   "written_block": [
     { "q_no": 22, "x_mm": 20, "y_mm": 220, "width_mm": 170, "height_mm": 18, "max_marks": 5 }
@@ -194,18 +194,17 @@ Pipeline (same for both, this is the convergence point from principle 3):
 
 If fiducials can't be reliably detected (torn corner, extreme blur), or if the page warps but fails the quality gate, flag the sheet `needs_review` rather than guessing a transform.
 
-For sheet-fed scanner bundles, default to automatic grouping. The system first reads the page-index
-bars and infers the clean scanner order:
-- `page-major`: all page 1s first, then all page 2s, etc. (`A1 B1 C1 A2 B2 C2`).
-- `sheet-major`: each student's full sheet stays together (`A1 A2 B1 B2 C1 C2`).
-- `write-in-similarity`: irregular order, but continuation-page boxed roll handwriting visually
-  matches a confident page-1 boxed roll.
-- `identity`: fallback mode; every page is attached only when its own roll identity is read confidently.
+For sheet-fed scanner bundles, default to identity-first automatic grouping:
+- Page 1 is an anchor only when the bubbled roll and boxed handwritten roll resolve to the same
+  roster identity.
+- Every continuation page is attached only when its own boxed handwritten roll resolves to that
+  same exact verified anchor.
+- Input order is irrelevant, so a continuation page may occur before its page 1 in the source PDF.
+- Missing, unreadable, conflicting, duplicate, and non-roster identities stay in human review.
 
-Automatic positional grouping still depends on page-1 identity. The kth continuation page is
-attached only to the kth confident page-1 roll in a fully verified sequence. Similarity grouping
-uses a one-to-one best-score assignment between fixed roll boxes and keeps close matches in review.
-If order, similarity, identity, and adaptive digit checks all fail, those pages stay in review.
+`page-major` (`A1 B1 C1 A2 B2 C2`) and `sheet-major` (`A1 A2 B1 B2 C1 C2`) are explicit operator
+overrides for independently verified scanner order. Automatic mode never groups by positional or
+visual-handwriting similarity.
 
 The current file-based workflow also writes `review_report.csv` and `review_report.html` beside
 `parse_index.json`. These are the local version of the future review queue: they show ready
@@ -238,9 +237,9 @@ Straightforward once Module 5/6 give you canonical images and manifest coordinat
 2. Exactly one bubble above threshold → that's the answer, compare to `mcq_correct_option`.
 3. Zero bubbles or multiple bubbles above threshold → treat as invalid/blank (0 marks), but log it distinctly from "answered wrong" so the professor can spot scanning issues vs. genuine blanks.
 
-For each numerical answer, read one selected `0–9` bubble per place-value row from the horizontal
-manifest grid. Rows are printed from the most significant place down to ones (for example,
-`Hundreds`, `Tens`, `Ones`). Every row must be filled, including leading zeros (`7` is `007` in a
+For each numerical answer, read one selected `0–9` bubble per place-value column from the vertical
+manifest grid. Columns run left to right from the most significant place to ones,
+without printed place-value headings, with digits 0-9 running downward. Every column must be filled, including leading zeros (`7` is `007` in a
 3-position grid). Compare the reconstructed integer to the numerical answer key. A completely blank grid is an
 unanswered response worth zero; incomplete, faint, or multiply marked grids require human review.
 
@@ -376,10 +375,18 @@ Bubble radius, option pitch, and block positions are **layout decisions the gene
 and publishes through the manifest — they are deliberately NOT in `contracts/`, so the reader
 learns them at parse time rather than sharing a constant that could drift.
 
-**Sheet flow (settled, don't undo):** questions flow continuously — MCQs first, compact horizontal
+**Sheet flow (settled, don't undo):** questions flow continuously — MCQs first, vertical
 numerical grids second, then written answers starting in whatever space remains, breaking to a
 new page only when the next row or answer box does not fit. There is exactly one placement algorithm
 (`flow.py`) for every exam, because two of them disagreed and produced half-empty pages.
+
+Numerical questions use at least 42 mm of width and 6 mm between allocations:
+four 2-digit questions across, not five. Wider answers receive wider allocations;
+digit columns are 10 mm apart, with 0-9 labels beside the grid. Place-value headings
+and numerical handwriting boxes stay removed.
+New bubbles are 3.5 mm in diameter (1.75 mm radius); the sampling radius is 1.26 mm.
+Schema v6 records vertical numerical geometry. Continue reading v4/v5 manifests
+using their original orientations and sizes, without rewriting old artifacts.
 
 **Identity per page (settled):** every page carries compact BTECH, MTECH, and PHD identity choices:
 BTECH has 7 write-in boxes; MTECH and PHD share 5 because their prefixes are implied by the selector. It also

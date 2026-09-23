@@ -52,6 +52,7 @@ include = ["omr*", "prototype_eval*"]
 
 [tool.setuptools.package-data]
 "omr.generator" = ["configs/*.json"]
+"omr.ui" = ["static/*.css", "static/*.js", "static/icons/*.svg", "static/icons/LICENSE"]
 
 [tool.pytest.ini_options]
 pythonpath = ["."]

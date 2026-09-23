@@ -4,9 +4,11 @@ from pathlib import Path
 
 import numpy as np
 import pymupdf
+import pytest
 from PIL import Image, ImageDraw
 
 from omr.contracts.geometry import digit_grid_centers_mm, mm_to_px, px_per_mm
+from omr.contracts.manifest import load_manifest
 from omr.generator.config import ExamConfig, NumericalQuestionConfig
 from omr.generator.generate import generate_exam
 from omr.reader.numerical import read_numerical_responses
@@ -15,7 +17,14 @@ from omr.reader.numerical import read_numerical_responses
 DPI = 200
 
 
-def _sheet(tmp_path: Path) -> tuple[dict, Image.Image]:
+def _sheet(tmp_path: Path, orientation: str) -> tuple[dict, Image.Image]:
+    if orientation == "horizontal":
+        fixture = Path(__file__).parent / "fixtures" / "numerical_v5" / "NUMERICAL_V5"
+        with pymupdf.open(fixture.with_suffix(".pdf")) as document:
+            pix = document[0].get_pixmap(dpi=DPI, colorspace=pymupdf.csGRAY)
+        return load_manifest(fixture.with_suffix(".manifest.json")), Image.frombytes(
+            "L", (pix.width, pix.height), pix.samples,
+        )
     result = generate_exam(
         ExamConfig(
             exam_id="NUMERICAL_READER_TEST",
@@ -48,8 +57,9 @@ def _fill_answer(draw: ImageDraw.ImageDraw, manifest: dict, q_no: int, digits: s
         _fill(draw, manifest, *centers[(position, int(digit))])
 
 
-def test_reads_horizontal_numerical_grid_with_leading_zeros(tmp_path: Path):
-    manifest, page = _sheet(tmp_path)
+@pytest.mark.parametrize("orientation", ["horizontal", "vertical"])
+def test_reads_numerical_grid_with_leading_zeros(tmp_path: Path, orientation):
+    manifest, page = _sheet(tmp_path, orientation)
     draw = ImageDraw.Draw(page)
     _fill_answer(draw, manifest, 1, "007")
 
@@ -65,8 +75,9 @@ def test_reads_horizontal_numerical_grid_with_leading_zeros(tmp_path: Path):
     assert not readings[1].needs_human_review
 
 
-def test_incomplete_numerical_grid_is_sent_to_review(tmp_path: Path):
-    manifest, page = _sheet(tmp_path)
+@pytest.mark.parametrize("orientation", ["horizontal", "vertical"])
+def test_incomplete_numerical_grid_is_sent_to_review(tmp_path: Path, orientation):
+    manifest, page = _sheet(tmp_path, orientation)
     entry = manifest["numerical_block"][0]
     draw = ImageDraw.Draw(page)
     _fill(draw, manifest, *digit_grid_centers_mm(entry)[(0, 4)])
@@ -79,8 +90,9 @@ def test_incomplete_numerical_grid_is_sent_to_review(tmp_path: Path):
     assert any("leading zeros" in flag for flag in reading.review_flags)
 
 
-def test_multiple_digits_in_one_position_are_not_guessed(tmp_path: Path):
-    manifest, page = _sheet(tmp_path)
+@pytest.mark.parametrize("orientation", ["horizontal", "vertical"])
+def test_multiple_digits_in_one_position_are_not_guessed(tmp_path: Path, orientation):
+    manifest, page = _sheet(tmp_path, orientation)
     entry = manifest["numerical_block"][0]
     centers = digit_grid_centers_mm(entry)
     draw = ImageDraw.Draw(page)
@@ -97,8 +109,9 @@ def test_multiple_digits_in_one_position_are_not_guessed(tmp_path: Path):
     assert any("above the fill threshold" in flag for flag in reading.review_flags)
 
 
-def test_horizontal_grid_local_registration_handles_two_mm_drift(tmp_path: Path):
-    manifest, page = _sheet(tmp_path)
+@pytest.mark.parametrize("orientation", ["horizontal", "vertical"])
+def test_grid_local_registration_handles_two_mm_drift(tmp_path: Path, orientation):
+    manifest, page = _sheet(tmp_path, orientation)
     _fill_answer(ImageDraw.Draw(page), manifest, 1, "907")
     shift = round(2.0 * px_per_mm(DPI))
     shifted = Image.new("L", page.size, 255)
@@ -110,3 +123,29 @@ def test_horizontal_grid_local_registration_handles_two_mm_drift(tmp_path: Path)
     assert reading.digits_text == "907"
     assert reading.value == 907
     assert not reading.needs_human_review
+
+
+@pytest.mark.parametrize("orientation", ["horizontal", "vertical"])
+def test_regular_grid_calibration_fallback_supports_both_orientations(tmp_path, monkeypatch, orientation):
+    from omr.reader import identity
+
+    manifest, page = _sheet(tmp_path, orientation)
+    _fill_answer(ImageDraw.Draw(page), manifest, 1, "583")
+    monkeypatch.setattr(identity, "fit_candidate_local_transform", lambda *args, **kwargs: None)
+    calibration = identity._calibrate_digit_grid(np.asarray(page), manifest, DPI, manifest["numerical_block"][0])
+    assert calibration is not None
+    reading = read_numerical_responses({1: np.asarray(page)}, manifest, DPI)[0]
+    assert reading.digits_text == "583"
+    assert not reading.needs_human_review
+
+
+@pytest.mark.parametrize("orientation", ["horizontal", "vertical"])
+def test_simulation_verifier_keeps_legacy_and_current_sheets_readable(tmp_path, orientation):
+    from omr.verify import verify_sheet
+
+    _sheet(tmp_path, orientation)
+    path = (Path(__file__).parent / "fixtures/numerical_v5/NUMERICAL_V5.manifest.json"
+            if orientation == "horizontal" else tmp_path / "exam/NUMERICAL_READER_TEST.manifest.json")
+    result = verify_sheet(path)
+    assert result.ok, result.format()
+    assert result.recovered == 2

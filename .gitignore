@@ -15,3 +15,11 @@ dist/
 htmlcov/
 .coverage
 *.log
+
+# Local experiment artifacts, including student-derived data.
+/eval_output/
+/smartomr_crops/
+/benchmark_crops.csv
+/training_labels.csv
+/*.pth
+/.git_diff.txt

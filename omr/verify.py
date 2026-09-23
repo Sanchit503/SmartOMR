@@ -39,7 +39,7 @@ from pathlib import Path
 import numpy as np
 
 from .contracts import load_manifest
-from .contracts.geometry import mm_to_px, px_per_mm
+from .contracts.geometry import digit_grid_centers_mm, mm_to_px, px_per_mm
 from .grading.mcq import MCQOutcome, grade_mcq_responses, read_mcq_responses
 from .reader.numerical import read_numerical_responses
 
@@ -179,10 +179,10 @@ def verify_sheet(
     for entry in manifest.get("numerical_block", []):
         text = str(rng.randrange(10 ** entry["positions"])).zfill(entry["positions"])
         intended_numbers[entry["q_no"]] = text
+        centers = digit_grid_centers_mm(entry)
         for column, digit in enumerate(text):
             _fill(draws[entry["page"]], manifest,
-                  entry["x_mm"] + int(digit) * entry["digit_pitch_mm"],
-                  entry["y_mm"] + column * entry["position_pitch_mm"], dpi, coverage, darkness)
+                  *centers[(column, int(digit))], dpi, coverage, darkness)
 
     if save_filled_to:
         save_filled_to = Path(save_filled_to)

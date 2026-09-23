@@ -194,7 +194,7 @@ def build_manifest(layout: SheetLayout) -> dict:
             for e in layout.written_entries
         ],
         "numerical_block": [
-            {**asdict(e), "orientation": "horizontal", "answer_type": "unsigned_integer",
+            {**asdict(e), "orientation": "vertical", "answer_type": "unsigned_integer",
              "leading_zeros": "required"}
             for e in layout.numerical_entries
         ],

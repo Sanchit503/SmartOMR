@@ -111,12 +111,13 @@ def _bubble_targets(manifest: dict, include: set[str]) -> Iterable[BubbleTarget]
 
     if "numerical" in include:
         for entry in manifest.get("numerical_block", []):
+            horizontal = entry["orientation"] == "horizontal"
             for (position, digit), (x_mm, y_mm) in digit_grid_centers_mm(entry).items():
                 yield BubbleTarget(
                     entry.get("page", 1), "numerical", str(entry["q_no"]),
                     f"place_{position + 1}", str(digit), x_mm, y_mm,
-                    pitch_x_mm=entry["digit_pitch_mm"],
-                    pitch_y_mm=entry["position_pitch_mm"],
+                    pitch_x_mm=entry["digit_pitch_mm"] if horizontal else entry["position_pitch_mm"],
+                    pitch_y_mm=entry["position_pitch_mm"] if horizontal else entry["digit_pitch_mm"],
                     sample_key=(position, digit),
                 )
 

@@ -41,6 +41,7 @@ from .metrics import (
     WRITTEN_LINE_MM,
     identity_box,
     numerical_slot_width_mm,
+    numerical_grid_offset_x_mm,
 )
 
 # ReportLab measures from the bottom-left; the manifest measures from the
@@ -49,17 +50,6 @@ HAIRLINE_PT = 0.7
 BOX_RULE_PT = 0.9
 
 MIN_FONT_PT = 5.5  # floor for the auto-shrink below
-
-NUMERICAL_PLACE_VALUE_LABELS = (
-    "Ones",
-    "Tens",
-    "Hundreds",
-    "Thousands",
-    "Ten thousands",
-    "Hundred thousands",
-    "Millions",
-    "Ten millions",
-)
 
 INSTRUCTION_LINE_1 = (
     "Fill each bubble completely with a dark pen or pencil. Do not fold or tear the sheet, "
@@ -317,11 +307,10 @@ def _draw_mcq_block(c: canvas.Canvas, layout: SheetLayout, page_no: int, is_firs
     top_y = min(e.y_mm for e in entries)
     c.setFont("Helvetica-Bold", 10)
     suffix = "" if is_first else "  (continued)"
-    marks = _marks(layout.marks_per_mcq)
     c.drawString(
         MARGIN_MM * mm,
         _y(top_y - MCQ_OPTION_HEADER_MM - 4),
-        f"Section A - Multiple Choice  [{marks} mark each]{suffix}",
+        f"Section A - Multiple Choice{suffix}",
     )
 
     # One option-letter header per column, above that column's first row.
@@ -353,31 +342,33 @@ def _draw_numerical_block(c: canvas.Canvas, layout: SheetLayout, page_no: int, i
     c.drawString(MARGIN_MM * mm, _y(top - 8), f"Section {section} - Numerical Answers{suffix}")
     c.setFont("Helvetica", 7.5)
     c.drawString(MARGIN_MM * mm, _y(top - 3),
-                 "Whole numbers only. Fill one bubble in every place-value row; use leading zeros "
-                 "(e.g. 7 as 007 in a 3-digit grid).")
+                 "Whole numbers only. Enter digits left to right, one bubble per column; use leading zeros "
+                 "(e.g. 7 as 007).")
     for entry in entries:
-        left = entry.x_mm - NUMERICAL_GRID_OFFSET_X_MM
+        slot_left = entry.x_mm - numerical_grid_offset_x_mm(entry.positions)
+        # Keep the heading anchored to its grid even when a narrow grid is centered.
+        label_x = entry.x_mm - NUMERICAL_GRID_OFFSET_X_MM
         slot_top = entry.y_mm - NUMERICAL_GRID_OFFSET_Y_MM
-        _draw_fitted(c, left, slot_top + 2,
-                     f"Q{entry.q_no}  [{_marks(entry.max_marks)} marks]",
-                     "Helvetica-Bold", 8, numerical_slot_width_mm(entry.positions))
+        _draw_fitted(
+            c,
+            label_x,
+            slot_top + 2,
+            f"Q{entry.q_no}",
+            "Helvetica-Bold",
+            8,
+            slot_left + numerical_slot_width_mm(entry.positions) - label_x,
+        )
         c.setLineWidth(HAIRLINE_PT)
         c.setFont("Helvetica", 6.5)
         for digit in range(10):
-            x = entry.x_mm + digit * entry.digit_pitch_mm
-            c.drawCentredString(x * mm, _y(entry.y_mm - 5.0) - 2.2, str(digit))
+            y = entry.y_mm + digit * entry.digit_pitch_mm
+            c.drawRightString((entry.x_mm - 5.0) * mm, _y(y) - 2.2, str(digit))
         for position in range(entry.positions):
-            y = entry.y_mm + position * entry.position_pitch_mm
-            c.setFont("Helvetica", 6.5)
-            place_power = entry.positions - position - 1
-            c.drawRightString(
-                (entry.x_mm - BUBBLE_RADIUS_MM - 2.5) * mm,
-                _y(y) - 2.2,
-                NUMERICAL_PLACE_VALUE_LABELS[place_power],
-            )
+            x = entry.x_mm + position * entry.position_pitch_mm
             c.setLineWidth(1)
             for digit in range(10):
-                c.circle((entry.x_mm + digit * entry.digit_pitch_mm) * mm, _y(y),
+                y = entry.y_mm + digit * entry.digit_pitch_mm
+                c.circle(x * mm, _y(y),
                          BUBBLE_RADIUS_MM * mm, stroke=1, fill=0)
 
 
@@ -398,7 +389,7 @@ def _draw_written_block(c: canvas.Canvas, layout: SheetLayout, page_no: int, is_
         c.drawString(
             entry.x_mm * mm,
             _y(entry.y_mm - 2),
-            f"Q{entry.q_no}  [{_marks(entry.max_marks)} marks]  -  answer in {entry.lines} line"
+            f"Q{entry.q_no}  -  answer in a maximum of {entry.lines} line"
             f"{'s' if entry.lines != 1 else ''}",
         )
 
