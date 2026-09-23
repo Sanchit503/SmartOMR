@@ -233,6 +233,16 @@ For a three-digit numerical grid, the student bubbles `007`; the key may contain
 Numerical answers are currently non-negative whole numbers only. Blank grids score zero, while
 incomplete, faint, or multiply marked grids go to review rather than being guessed.
 
+To drop an MCQ or numerical question from scoring, keep its answer-key row and set
+`marks` to `0`, for example `2,DROP,0`. The CSV still requires a nonempty answer;
+`DROP` is a readable placeholder, while the zero marks actually trigger exclusion.
+The parser gives that question zero awarded marks and excludes its weight from the
+effective total. For 15 one-mark numericals with Q2 and Q15 dropped, the total is 13.
+Do not delete those rows, renumber questions, or change the original scan manifest.
+This is exclusion, not full credit for everyone; written-question dropping is not
+implemented by this answer-key mechanism. Regenerate evaluation results after
+changing a key, and review the reduced total before releasing marks.
+
 The parser writes to `data/parsed/<exam_id>/` by default:
 
 ```text
@@ -747,8 +757,10 @@ Each entry in `numerical_questions` is independent:
 | `digits` | 1–8 answer positions. Each position is one vertical column of 0–9 bubbles |
 
 Columns run left to right from the most significant digit to the least significant,
-without place-value headings or duplicate handwriting boxes. Students fill every
-column, including leading zeros: answer `7` uses `007` in a three-digit grid.
+with place-value headings (`Tens`, `Ones` for two digits) but no duplicate handwriting
+boxes. Students fill every column: answer `7` uses `07` in a two-digit grid and `007`
+in a three-digit grid. The printed example names a digit width present on that page;
+one-digit-only pages omit leading-zero guidance.
 Four two-digit numerical questions are packed side by side.
 
 Each entry in `written_questions` is independent:
@@ -761,8 +773,10 @@ Each entry in `written_questions` is independent:
 
 There is no fixed count for either section. The layout engine packs MCQs first, vertical numerical
 grids second, then written-answer boxes, each sized to its own `lines` value.
+Single-type exams print the question-type heading without a section letter.
+Mixed exams print consecutive Section A/B/C headings, including on continuation pages.
 
-New numerical grids have unlabelled digit columns spaced 9 mm apart, with
+New numerical grids have labelled digit columns spaced 9 mm apart, with
 0-9 labels down the left and no redundant handwriting boxes. One-, two-, and
 three-digit questions fit four across; wider questions receive more space. A
 question is never split across pages. All newly printed bubbles are 3.5 mm in

@@ -35,6 +35,8 @@ from .metrics import (
     MCQ_OPTION_PITCH_MM,
     NUMERICAL_GRID_OFFSET_X_MM,
     NUMERICAL_GRID_OFFSET_Y_MM,
+    NUMERICAL_PLACE_LABEL_LINE_MM,
+    NUMERICAL_PLACE_LABEL_OFFSET_Y_MM,
     PAGE_HEIGHT_MM,
     PAGE_WIDTH_MM,
     WRITTEN_HEADER_MM,
@@ -58,6 +60,14 @@ INSTRUCTION_LINE_1 = (
 INSTRUCTION_LINE_2 = (
     "Bubble your program, then write and bubble your roll number in THAT program's grid only. "
     "Write your roll number on every page of this sheet."
+)
+
+
+# Least significant first; long names use two lines within the column width.
+NUMERICAL_PLACE_LABELS = (
+    ("Ones",), ("Tens",), ("Hundreds",), ("Thous.",),
+    ("Ten", "thous."), ("Hundred", "thous."),
+    ("Millions",), ("Ten", "millions"),
 )
 
 
@@ -298,6 +308,19 @@ def _draw_continuation_identity(c: canvas.Canvas, layout: SheetLayout, page_no: 
 # Question blocks
 # ---------------------------------------------------------------------------
 
+def _section_heading(layout: SheetLayout, title: str, is_first: bool) -> str:
+    sections = [
+        name for name, entries in (
+            ("Multiple Choice", layout.mcq_entries),
+            ("Numerical Answers", layout.numerical_entries),
+            ("Written Answers", layout.written_entries),
+        ) if entries
+    ]
+    prefix = f"Section {chr(ord('A') + sections.index(title))} - " if len(sections) > 1 else ""
+    suffix = "" if is_first else "  (continued)"
+    return f"{prefix}{title}{suffix}"
+
+
 def _draw_mcq_block(c: canvas.Canvas, layout: SheetLayout, page_no: int, is_first: bool) -> None:
     entries = [e for e in layout.mcq_entries if e.page == page_no]
     if not entries:
@@ -306,11 +329,10 @@ def _draw_mcq_block(c: canvas.Canvas, layout: SheetLayout, page_no: int, is_firs
 
     top_y = min(e.y_mm for e in entries)
     c.setFont("Helvetica-Bold", 10)
-    suffix = "" if is_first else "  (continued)"
     c.drawString(
         MARGIN_MM * mm,
         _y(top_y - MCQ_OPTION_HEADER_MM - 4),
-        f"Section A - Multiple Choice{suffix}",
+        _section_heading(layout, "Multiple Choice", is_first),
     )
 
     # One option-letter header per column, above that column's first row.
@@ -335,15 +357,14 @@ def _draw_numerical_block(c: canvas.Canvas, layout: SheetLayout, page_no: int, i
     if not entries:
         return
     top = entries[0].y_mm - NUMERICAL_GRID_OFFSET_Y_MM
-    section = "B" if layout.mcq_entries else "A"
-    suffix = "" if is_first else "  (continued)"
     c.setFillColorRGB(0, 0, 0)
     c.setFont("Helvetica-Bold", 10)
-    c.drawString(MARGIN_MM * mm, _y(top - 8), f"Section {section} - Numerical Answers{suffix}")
-    c.setFont("Helvetica", 7.5)
-    c.drawString(MARGIN_MM * mm, _y(top - 3),
-                 "Whole numbers only. Enter digits left to right, one bubble per column; use leading zeros "
-                 "(e.g. 7 as 007).")
+    c.drawString(MARGIN_MM * mm, _y(top - 8), _section_heading(layout, "Numerical Answers", is_first))
+    digits = max(entry.positions for entry in entries)
+    instructions = "Whole numbers only. Fill one bubble per column, left to right."
+    if digits > 1:
+        instructions += f" Use leading zeros (e.g. 7 as {7:0{digits}d} in a {digits}-digit grid)."
+    _draw_fitted(c, MARGIN_MM, top - 3, instructions, "Helvetica", 7.5, PAGE_WIDTH_MM - 2 * MARGIN_MM)
     for entry in entries:
         slot_left = entry.x_mm - numerical_grid_offset_x_mm(entry.positions)
         # Keep the heading anchored to its grid even when a narrow grid is centered.
@@ -365,6 +386,14 @@ def _draw_numerical_block(c: canvas.Canvas, layout: SheetLayout, page_no: int, i
             c.drawRightString((entry.x_mm - 5.0) * mm, _y(y) - 2.2, str(digit))
         for position in range(entry.positions):
             x = entry.x_mm + position * entry.position_pitch_mm
+            labels = NUMERICAL_PLACE_LABELS[entry.positions - position - 1]
+            label_width = max(c.stringWidth(label, "Helvetica", 6) for label in labels)
+            label_size = min(6.0, 6 * (entry.position_pitch_mm - 0.5) * mm / label_width)
+            c.setFont("Helvetica", label_size)
+            for line_no, label in enumerate(labels):
+                label_y = entry.y_mm - NUMERICAL_PLACE_LABEL_OFFSET_Y_MM
+                label_y -= (len(labels) - line_no - 1) * NUMERICAL_PLACE_LABEL_LINE_MM
+                c.drawCentredString(x * mm, _y(label_y), label)
             c.setLineWidth(1)
             for digit in range(10):
                 y = entry.y_mm + digit * entry.digit_pitch_mm
@@ -378,10 +407,9 @@ def _draw_written_block(c: canvas.Canvas, layout: SheetLayout, page_no: int, is_
         return
     c.setFillColorRGB(0, 0, 0)
     c.setFont("Helvetica-Bold", 10)
-    suffix = "" if is_first else "  (continued)"
-    section = "C" if layout.numerical_entries and layout.mcq_entries else "B"
     c.drawString(
-        MARGIN_MM * mm, _y(entries[0].y_mm - WRITTEN_HEADER_MM - 4), f"Section {section} - Written Answers{suffix}"
+        MARGIN_MM * mm, _y(entries[0].y_mm - WRITTEN_HEADER_MM - 4),
+        _section_heading(layout, "Written Answers", is_first),
     )
 
     for entry in entries:

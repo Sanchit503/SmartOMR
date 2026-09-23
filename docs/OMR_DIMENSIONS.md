@@ -1,6 +1,6 @@
 # Current OMR Generator Dimensions
 
-Checked against the local generator on 2026-09-21. This is a measurement
+Checked against the local generator on 2026-09-23. This is a measurement
 reference for the vertical numerical layout and 3.5 mm bubbles, not a
 print-quality certification. New sheets use manifest schema v6.
 
@@ -181,34 +181,36 @@ or y=65.5 on continuation pages. Capacity is 18 rows per column on page 1 and
 | Digit-row centre pitch | 5.2 mm; nominal gap 1.7 mm |
 | Bubble-only column height | 50.3 mm |
 | Digit-column centre pitch | 9 mm; nominal gap 5.5 mm |
-| First bubble-row centre below question allocation top | 8 mm |
+| First bubble-row centre below question allocation top | 12 mm |
 | Digit-label right anchor | 5 mm left of first bubble centre |
-| Place-value labels | Not printed; only the 0-9 row labels remain |
+| Place-value labels | Above each column; least significant (Ones) at the right |
+| Place-value final baseline | 4 mm above first bubble-row centre; extra line 2.6 mm above it |
 | Q-label baseline | Question allocation top + 2 mm |
 | Q-label horizontal anchor | 9 mm left of the first bubble column, for every digit count |
 | Question-row allocation gap | 5 mm |
 | Section-heading/instruction allocation | 12 mm |
 | Supported digit positions | 1..8 per question |
 
-There are no digit handwriting boxes or place-value headings in numerical
-questions. Columns still run left to right from the most significant digit to
-the least significant digit. Students fill every column, including leading zeros.
+There are no digit handwriting boxes in numerical questions. Place-value headings
+run left to right from the most significant digit to Ones. Long headings use two
+lines and abbreviate thousands as `Thous.` to preserve the 9 mm column pitch.
+Students fill every column, including leading zeros; two-digit grids show `7 as 07`.
 Question labels follow the grid's position, so the heading-to-grid offset stays
 constant even when a narrow grid is centred within a wider allocation.
 
 | Positions | Bubble-only footprint | Full question allocation | Questions per row, for equal-width questions |
 | --- | --- | --- | --- |
-| 1 | 3.5 x 50.3 mm | 42 x 58.55 mm | 4 |
-| 2 | 12.5 x 50.3 mm | 42 x 58.55 mm | 4 |
-| 3 | 21.5 x 50.3 mm | 42 x 58.55 mm | 4 |
-| 4 | 30.5 x 50.3 mm | 45 x 58.55 mm | 3 |
-| 5 | 39.5 x 50.3 mm | 54 x 58.55 mm | 3 |
-| 6 | 48.5 x 50.3 mm | 63 x 58.55 mm | 2 |
-| 7 | 57.5 x 50.3 mm | 72 x 58.55 mm | 2 |
-| 8 | 66.5 x 50.3 mm | 81 x 58.55 mm | 2 |
+| 1 | 3.5 x 50.3 mm | 42 x 62.55 mm | 4 |
+| 2 | 12.5 x 50.3 mm | 42 x 62.55 mm | 4 |
+| 3 | 21.5 x 50.3 mm | 42 x 62.55 mm | 4 |
+| 4 | 30.5 x 50.3 mm | 45 x 62.55 mm | 3 |
+| 5 | 39.5 x 50.3 mm | 54 x 62.55 mm | 3 |
+| 6 | 48.5 x 50.3 mm | 63 x 62.55 mm | 2 |
+| 7 | 57.5 x 50.3 mm | 72 x 62.55 mm | 2 |
+| 8 | 66.5 x 50.3 mm | 81 x 62.55 mm | 2 |
 
-Allocation width is `max(42, 9*digits + 9)` mm; height is always 58.55 mm.
-The next row starts 63.55 mm later, including its 5 mm gap. Variable widths are
+Allocation width is `max(42, 9*digits + 9)` mm; height is always 62.55 mm.
+The next row starts 67.55 mm later, including its 5 mm gap. Variable widths are
 packed in question order without splitting a grid across pages. The 12 mm
 section header is additional and repeated after page breaks. These allocations
 are layout regions, not printed rectangular frames.
@@ -243,6 +245,10 @@ A fresh question band can hold a single box of at most 19 lines on page 1 or
 Order is MCQs, then numerical questions, then written answers. Sections use
 remaining space rather than always starting a new page. Individual answer boxes
 and numerical grids are not split across pages.
+
+An exam with one question type prints only its type heading, without `Section A`.
+Mixed exams use consecutive A/B/C letters in question-type order, consistently
+across all pages. Continuation headings retain `(continued)` in either case.
 
 The MCQ-to-next-section cursor gap is 7 mm. Numerical-to-written transition
 adds 7 mm after the numerical section's existing trailing 5 mm row gap. Header
@@ -280,13 +286,15 @@ generated exam's manifest.
 | Numerical instructions | Helvetica 7.5 pt | In the 12 mm section-header allocation |
 | Numerical question label | Helvetica-Bold 8 pt; question number only | 9 mm left of first bubble column; allocation top + 2 mm |
 | Numerical digit labels | Helvetica 6.5 pt | Baseline 2.2 pt below bubble-row centre |
+| Numerical place-value headings | Helvetica up to 6 pt, fitted within each column | Centred; final baseline 4 mm above first bubble centre |
 | Written question label | Helvetica 8 pt; question number and maximum-line guidance, no marks | Baseline 2 mm above answer box |
 
 Written labels read `Q9 - answer in a maximum of 2 lines`, using the configured
 count and singular `line` when that count is one. The box height is unchanged.
 
 The fitted university/title/metadata/instruction strings and numerical question
-labels may shrink to a floor of 5.5 pt. Other fonts are fixed. This floor is not
+labels may shrink to a floor of 5.5 pt. Place-value headings fit their column
+width (at least 5.5 pt for the current labels). Other fonts are fixed. This floor is not
 a guarantee that an arbitrarily long string will fit. Header text reserves the
 measured page-counter width plus 6 mm when a counter is printed. The counter is
 omitted on a one-page exam; page-index bars are still generated.

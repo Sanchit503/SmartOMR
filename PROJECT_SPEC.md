@@ -239,8 +239,10 @@ Straightforward once Module 5/6 give you canonical images and manifest coordinat
 
 For each numerical answer, read one selected `0–9` bubble per place-value column from the vertical
 manifest grid. Columns run left to right from the most significant place to ones,
-without printed place-value headings, with digits 0-9 running downward. Every column must be filled, including leading zeros (`7` is `007` in a
-3-position grid). Compare the reconstructed integer to the numerical answer key. A completely blank grid is an
+with printed place-value headings and digits 0-9 running downward. Every column must be filled,
+including leading zeros (`7` is `07` in a 2-position grid and `007` in a 3-position grid).
+The printed example uses a digit width present on the page. Compare the reconstructed integer
+to the numerical answer key. A completely blank grid is an
 unanswered response worth zero; incomplete, faint, or multiply marked grids require human review.
 
 ---
@@ -382,8 +384,11 @@ new page only when the next row or answer box does not fit. There is exactly one
 
 Numerical questions use at least 42 mm of width and 6 mm between allocations:
 four 2-digit questions across, not five. Wider answers receive wider allocations;
-digit columns are 10 mm apart, with 0-9 labels beside the grid. Place-value headings
-and numerical handwriting boxes stay removed.
+digit columns are 9 mm apart, with 0-9 labels beside the grid and place-value headings
+above the columns. Numerical handwriting boxes stay removed. The question header
+uses 12 mm to fit the question number and up to two lines of place-value text.
+Single-type exams omit section letters; mixed exams use consecutive Section A/B/C
+headings consistently across continuation pages.
 New bubbles are 3.5 mm in diameter (1.75 mm radius); the sampling radius is 1.26 mm.
 Schema v6 records vertical numerical geometry. Continue reading v4/v5 manifests
 using their original orientations and sizes, without rewriting old artifacts.

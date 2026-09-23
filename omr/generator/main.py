@@ -98,7 +98,7 @@ def prompt_for_config() -> ExamConfig:
     exam_type = ask_choice("Exam type", ["quiz", "midsem", "endsem"], "quiz")
     exam_id = ask("Exam ID (used as the filename)", default=f"{course_code}_{exam_type.upper()}")
 
-    print("\n-- Section A: MCQs --")
+    print("\n-- MCQs --")
     num_mcq = ask("How many MCQs?", default="0", cast=int)
     mcq_options = 4
     marks_per_mcq = 1.0

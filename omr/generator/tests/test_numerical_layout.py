@@ -86,24 +86,28 @@ def test_printed_vertical_grids_preflight_and_round_trip(tmp_path, digits):
         assert verification.recovered == 10 + len(digits)
 
 
-def test_grids_drop_place_headers_tighten_columns_and_keep_bubble_size(tmp_path):
-    result = generate_exam(config_for([8, 2, 2, 3]), tmp_path)
+def test_place_headers_fit_columns_without_changing_bubble_size_or_pitch(tmp_path):
+    result = generate_exam(config_for(list(range(1, 9))), tmp_path)
+    labels_by_place = [
+        ["Ones"], ["Tens"], ["Hundreds"], ["Thous."],
+        ["Ten", "thous."], ["Hundred", "thous."], ["Millions"], ["Ten", "millions"],
+    ]
     scale = 72 / 25.4
     with pymupdf.open(result["pdf_path"]) as document:
-        for page in document:
-            text = page.get_text().lower()
-            assert all(label not in text for label in ("ones", "tens", "hundreds", "thousands", "millions"))
         for entry in result["manifest"]["numerical_block"]:
             page = document[entry["page"] - 1]
             x, y, positions = entry["x_mm"], entry["y_mm"], entry["positions"]
-            left = x - numerical_grid_offset_x_mm(positions)
             top = y - NUMERICAL_GRID_OFFSET_Y_MM
-            region = pymupdf.Rect(left * scale, (top + 3) * scale,
-                                  (left + numerical_slot_width_mm(positions)) * scale, (y - 2) * scale)
-            words = page.get_text("words", clip=region)
-            assert not words, "unused column headers should not be printed"
+            for position in range(positions):
+                cx = x + position * entry["position_pitch_mm"]
+                region = pymupdf.Rect((cx - 4.5) * scale, (top + 3) * scale,
+                                      (cx + 4.5) * scale, (y - 2) * scale)
+                words = page.get_text("words", clip=region)
+                assert [word[4] for word in words] == labels_by_place[positions - position - 1]
+                assert all(word[0] > (cx - 4.5) * scale and word[2] < (cx + 4.5) * scale for word in words)
+                assert all(word[3] < (y - 2) * scale for word in words), "header touches a bubble"
             assert entry["position_pitch_mm"] == 9.0
-            assert NUMERICAL_GRID_OFFSET_Y_MM == 8.0
+            assert NUMERICAL_GRID_OFFSET_Y_MM == 12.0
             label_lane = pymupdf.Rect((x - 9) * scale, (y - 2) * scale,
                                      (x - 3) * scale, (y + 9 * entry["digit_pitch_mm"] + 2) * scale)
             assert [word[4] for word in page.get_text("words", clip=label_lane)] == list("0123456789")

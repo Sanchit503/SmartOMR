@@ -170,7 +170,7 @@ def test_student_fill_signal_resists_shifted_empty_bubble_outline(tmp_path):
     assert student_ratio <= max(0.02, 1 / core_pixels)
 
 
-def test_numerical_columns_have_no_place_labels_or_redundant_write_in_boxes(tmp_path):
+def test_numerical_columns_have_place_labels_without_redundant_write_in_boxes(tmp_path):
     result = generate_exam(
         a_config(
             num_mcq=0,
@@ -185,7 +185,7 @@ def test_numerical_columns_have_no_place_labels_or_redundant_write_in_boxes(tmp_
     with pymupdf.open(result["pdf_path"]) as document:
         page = document[0]
         text = page.get_text()
-        assert all(label not in text for label in ("Hundreds", "Tens", "Ones"))
+        assert all(label in text for label in ("Hundreds", "Tens", "Ones"))
         assert "Digit 1" not in text
 
         # Inspect the whole question region, including the space above the grid.

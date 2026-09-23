@@ -11,8 +11,9 @@ from PIL import Image, ImageDraw
 from omr.contracts.geometry import MM_PER_INCH, digit_grid_centers_mm, mm_to_px, px_per_mm
 from omr.generator.config import ExamConfig, NumericalQuestionConfig, WrittenQuestionConfig
 from omr.generator.generate import generate_exam
+from omr.io.csv import load_answer_key
 from omr.models import AnswerKeyEntry
-from omr.workflows.parse import _numerical_payload, parse_scan, parse_scans
+from omr.workflows.parse import _numerical_payload, _validate_numerical_answer_key, parse_scan, parse_scans
 
 DPI = 200
 
@@ -359,6 +360,47 @@ def test_zero_mark_numerical_key_drops_question_without_review(tmp_path: Path):
     assert responses[0]["printed_max_marks"] == 1
     assert responses[0]["max_marks"] == 0
     assert responses[0]["marks_awarded"] == 0
+
+
+def test_fifteen_numericals_with_two_drops_keep_manifest_and_reduce_total(tmp_path: Path):
+    result = generate_exam(
+        ExamConfig(
+            exam_id="TWO_DROPPED_QUESTIONS", course_code="TEST", exam_name="Numerical Quiz",
+            exam_type="quiz", num_mcq=0,
+            numerical_questions=[NumericalQuestionConfig(q_no=q, max_marks=1, digits=2) for q in range(1, 16)],
+        ),
+        tmp_path / "exam",
+    )
+    key_path = tmp_path / "key.csv"
+    key_path.write_text(
+        "q_no,answer,marks\n" + "".join(
+            f"{q},DROP,0\n" if q in {2, 15} else f"{q},7,1\n" for q in range(1, 16)
+        ), encoding="utf-8",
+    )
+    key = load_answer_key(key_path)
+    manifest = result["manifest"]
+    _validate_numerical_answer_key(manifest, key)
+    pages = _render_pages(result["pdf_path"])
+    for entry in manifest["numerical_block"]:
+        draw = ImageDraw.Draw(pages[entry["page"]])
+        centers = digit_grid_centers_mm(entry)
+        # Q2 is multiply marked, Q15 is blank, and the remaining answers are 07.
+        if entry["q_no"] == 15:
+            continue
+        for position, digit in enumerate("07"):
+            _fill_bubble(draw, manifest, *centers[(position, int(digit))])
+        if entry["q_no"] == 2:
+            _fill_bubble(draw, manifest, *centers[(1, 8)])
+    flags = []
+    responses, score, total = _numerical_payload(
+        {page_no: np.asarray(page) for page_no, page in pages.items()}, manifest, DPI, key, flags,
+    )
+    assert score == total == 13
+    assert flags == []
+    assert manifest["exam"]["total_marks"] == 15
+    assert all(entry["max_marks"] == 1 for entry in manifest["numerical_block"])
+    assert {entry["q_no"] for entry in responses if entry["dropped"]} == {2, 15}
+    assert all(entry["marks_awarded"] == 0 for entry in responses if entry["dropped"])
 
 
 def test_missing_numerical_answer_key_row_is_rejected_during_preflight(tmp_path: Path):
