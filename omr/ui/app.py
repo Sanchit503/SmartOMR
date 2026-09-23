@@ -18,7 +18,7 @@ import traceback
 import urllib.parse
 import uuid
 import zipfile
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from email.message import Message
 from email.parser import BytesHeaderParser
@@ -29,13 +29,16 @@ from pathlib import Path
 from typing import Any, BinaryIO
 from xml.etree import ElementTree
 
+import numpy as np
+from PIL import Image
+
 from omr.contracts import load_manifest
 from omr.generator.config import ExamConfig, NumericalQuestionConfig, WrittenQuestionConfig
 from omr.generator.generate import generate_exam
-from omr.io.csv import load_students
-from omr.reader.handwriting import DEFAULT_RESNET_ROLL_MODEL, build_roll_ocr_backend
-from omr.ui import inspection
-from omr.ui.inspection_view import inspection_body
+from omr.io.csv import load_answer_key, load_students
+from omr.models import AlignedPage
+from omr.reader.handwriting import build_roll_ocr_backend, save_roll_number_crop_sets
+from omr.reader.scan import align_scan_page, iter_scan_pages
 from omr.workflows.email import (
     EMAIL_LOG_CSV,
     EMAIL_QUEUE_CSV,
@@ -43,7 +46,14 @@ from omr.workflows.email import (
     prepare_email_release,
     send_email_release,
 )
-from omr.workflows.batch import parse_exam_bundle
+from omr.workflows.batch import (
+    _PageRecord,
+    _mcq_answer_summary,
+    _page_identity,
+    _write_review_reports,
+    _write_student_group,
+    parse_exam_bundle,
+)
 from omr.workflows.review import (
     assign_unmatched_page,
     hold_student,
@@ -51,7 +61,6 @@ from omr.workflows.review import (
     initialize_verification_index,
     load_or_initialize_verified_index,
     reject_student,
-    selected_student_pages,
     verify_student,
 )
 
@@ -62,6 +71,7 @@ DEFAULT_PORT = 8765
 DEFAULT_DATA_DIR = Path("data")
 RUNS_DIR_NAME = "ui_runs"
 RUN_STATE_NAME = "run_state.json"
+ROLL_FEEDBACK_DIR_NAME = "roll_digit_feedback"
 MAX_UPLOAD_BYTES = 2 * 1024 * 1024 * 1024
 UPLOAD_READ_SIZE = 1024 * 1024
 MAX_MULTIPART_HEADER_BYTES = 64 * 1024
@@ -84,11 +94,12 @@ def _safe_id(value: str) -> str:
 
 
 def _read_json(path: Path) -> dict[str, Any]:
-    return inspection.read_json(path)
+    return json.loads(path.read_text(encoding="utf-8"))
 
 
 def _write_json(path: Path, payload: dict[str, Any]) -> None:
-    inspection.write_json_atomic(path, payload)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 
 def _rel(path: Path, base: Path) -> str:
@@ -234,19 +245,99 @@ def _canonicalize_roster(path: Path) -> dict[str, int]:
     return counts
 
 
+def _manifest_objective_questions(manifest: dict) -> list[dict[str, Any]]:
+    questions: list[dict[str, Any]] = []
+    default_mcq_marks = float(manifest.get("exam", {}).get("marks_per_mcq", 1.0))
+    for entry in sorted(manifest.get("mcq_block", []), key=lambda item: int(item["q_no"])):
+        questions.append(
+            {
+                "q_no": int(entry["q_no"]),
+                "kind": "mcq",
+                "marks": default_mcq_marks,
+                "options": list(entry.get("options") or []),
+            }
+        )
+    for entry in sorted(manifest.get("numerical_block", []), key=lambda item: int(item["q_no"])):
+        questions.append(
+            {
+                "q_no": int(entry["q_no"]),
+                "kind": "numerical",
+                "marks": float(entry.get("max_marks", 1.0)),
+                "digits": int(entry.get("positions") or entry.get("digits") or 1),
+            }
+        )
+    return sorted(questions, key=lambda item: int(item["q_no"]))
+
+
+def _write_answer_key_from_form(manifest: dict, fields: dict[str, str], output_path: Path) -> Path | None:
+    if fields.get("answer_key_mode") != "manifest_form":
+        return None
+    questions = _manifest_objective_questions(manifest)
+    if not questions:
+        return None
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with output_path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=["q_no", "answer", "marks"])
+        writer.writeheader()
+        for question in questions:
+            q_no = int(question["q_no"])
+            dropped = fields.get(f"drop_q{q_no}") == "1"
+            answer = (fields.get(f"answer_q{q_no}") or "").strip().upper()
+            marks_text = (fields.get(f"marks_q{q_no}") or "").strip()
+            marks = float(marks_text) if marks_text else float(question["marks"])
+            if dropped:
+                writer.writerow({"q_no": q_no, "answer": "DROPPED", "marks": 0})
+                continue
+            if not answer:
+                raise ValueError(f"answer key is missing Q{q_no}; enter an answer or mark it dropped")
+            if question["kind"] == "mcq" and answer not in set(question.get("options") or []):
+                raise ValueError(f"MCQ Q{q_no} answer must be one of {', '.join(question.get('options') or [])}")
+            if question["kind"] == "numerical" and not re.fullmatch(r"[0-9]+", answer):
+                raise ValueError(f"numerical Q{q_no} answer must be digits only")
+            writer.writerow({"q_no": q_no, "answer": answer, "marks": marks})
+    return output_path
+
+
+def _parse_question_rows(text: str, *, kind: str) -> list[WrittenQuestionConfig] | list[NumericalQuestionConfig]:
+    rows = []
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        parts = [part.strip() for part in re.split(r"[,:\t ]+", line) if part.strip()]
+        if len(parts) != 3:
+            raise ValueError(
+                f"{kind} question row {line!r} must have exactly 3 values: "
+                "q_no marks lines/digits"
+            )
+        q_no = int(parts[0])
+        marks = float(parts[1])
+        count = int(parts[2])
+        if kind == "written":
+            rows.append(WrittenQuestionConfig(q_no=q_no, max_marks=marks, lines=count))
+        else:
+            rows.append(NumericalQuestionConfig(q_no=q_no, max_marks=marks, digits=count))
+    return rows
+
+
 def _asset_url(path: str | Path | None, base: Path | None = None) -> str:
     if not path:
         return ""
-    p = Path(path)
-    if not p.is_absolute() and not p.exists() and base is not None:
-        p = base / p
+    p = _resolve_output_path(path, base) if base is not None else Path(path)
     return "/artifact?path=" + urllib.parse.quote(str(p.resolve()), safe="")
 
 
-def _resolve_artifact_path(path: str | Path, base: Path) -> Path:
-    """Accept both legacy workspace-relative paths and current parse-relative paths."""
-    candidate = Path(path)
-    return candidate if candidate.is_absolute() or candidate.exists() else base / candidate
+def _resolve_output_path(path: str | Path | None, base: Path | None = None) -> Path:
+    if path is None or str(path) == "":
+        return base or Path()
+    p = Path(path)
+    if p.is_absolute() or p.exists():
+        return p
+    if base is not None:
+        candidate = base / p
+        if candidate.exists():
+            return candidate
+    return p
 
 
 def _html_page(title: str, body: str, *, refresh_seconds: int | None = None) -> bytes:
@@ -260,75 +351,109 @@ def _html_page(title: str, body: str, *, refresh_seconds: int | None = None) -> 
   <title>{html.escape(title)} - {APP_TITLE}</title>
   <style>
     :root {{
-      font-family: Arial, Helvetica, sans-serif;
-      color: #172033;
-      background: #f6f7f9;
+      font-family: Inter, "Segoe UI", Arial, Helvetica, sans-serif;
+      color: #111827;
+      background: #f3f5f8;
+      --border: #d7dde8;
+      --soft-border: #e6eaf0;
+      --panel: #ffffff;
+      --muted: #667085;
+      --primary: #1f5fbf;
+      --primary-dark: #184c99;
+      --danger: #b42318;
     }}
-    body {{ margin: 0; }}
+    body {{ margin: 0; font-size: 14px; }}
     header {{
       background: #ffffff;
-      border-bottom: 1px solid #d9dee8;
-      padding: 12px 20px;
+      border-bottom: 1px solid var(--border);
+      padding: 13px 24px;
       display: flex;
-      gap: 18px;
+      gap: 22px;
       align-items: center;
+      position: sticky;
+      top: 0;
+      z-index: 10;
+      box-shadow: 0 1px 2px rgba(16, 24, 40, 0.04);
     }}
-    header a {{ color: #1f5fbf; text-decoration: none; font-weight: 700; }}
-    main {{ max-width: 1320px; margin: 0 auto; padding: 20px; }}
-    h1 {{ font-size: 22px; margin: 0 0 14px; }}
-    h2 {{ font-size: 16px; margin: 22px 0 10px; }}
+    header strong {{ font-size: 16px; letter-spacing: 0; }}
+    header a {{ color: var(--primary); text-decoration: none; font-weight: 700; }}
+    header a:hover {{ text-decoration: underline; }}
+    main {{ max-width: 1480px; margin: 0 auto; padding: 24px; }}
+    h1 {{ font-size: 24px; line-height: 1.2; margin: 0 0 16px; font-weight: 800; }}
+    h2 {{ font-size: 16px; margin: 0 0 12px; font-weight: 800; }}
     p {{ line-height: 1.45; }}
     .band {{
-      background: #fff;
-      border: 1px solid #d9dee8;
-      padding: 14px;
-      margin-bottom: 14px;
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 16px;
+      margin-bottom: 16px;
+      box-shadow: 0 1px 2px rgba(16, 24, 40, 0.03);
     }}
-    .grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 10px; }}
-    .metric {{ background: #fff; border: 1px solid #d9dee8; padding: 10px; }}
-    .metric span {{ display: block; font-size: 12px; color: #667085; margin-bottom: 4px; }}
-    .metric strong {{ display: block; font-size: 18px; }}
-    table {{ width: 100%; border-collapse: collapse; background: #fff; border: 1px solid #d9dee8; }}
-    th, td {{ padding: 8px 9px; border-bottom: 1px solid #edf0f5; text-align: left; vertical-align: top; font-size: 13px; }}
-    th {{ background: #f0f3f8; color: #344054; font-size: 12px; white-space: nowrap; }}
-    tr:hover td {{ background: #fafcff; }}
-    label {{ display: block; font-size: 12px; font-weight: 700; margin: 10px 0 4px; }}
+    .grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 12px; }}
+    .metric {{ background: var(--panel); border: 1px solid var(--border); border-radius: 6px; padding: 12px 14px; min-height: 56px; }}
+    .metric span {{ display: block; font-size: 12px; color: var(--muted); margin-bottom: 6px; }}
+    .metric strong {{ display: block; font-size: 20px; line-height: 1.2; overflow-wrap: anywhere; }}
+    table {{ width: 100%; border-collapse: separate; border-spacing: 0; background: var(--panel); border: 1px solid var(--border); border-radius: 6px; overflow: hidden; }}
+    th, td {{ padding: 10px 12px; border-bottom: 1px solid #edf0f5; text-align: left; vertical-align: top; font-size: 13px; }}
+    th {{ background: #eef2f7; color: #344054; font-size: 12px; white-space: nowrap; font-weight: 800; }}
+    tr:last-child td {{ border-bottom: 0; }}
+    tr:hover td {{ background: #f8fbff; }}
+    label {{ display: block; font-size: 12px; color: #344054; font-weight: 800; margin: 0 0 5px; }}
+    label.inline {{ display: inline-flex; align-items: center; gap: 6px; margin: 0; font-weight: 700; }}
+    label.inline input {{ width: auto; }}
     input, select, textarea {{
       width: 100%;
       box-sizing: border-box;
-      border: 1px solid #cbd2df;
+      border: 1px solid #cbd5e1;
+      border-radius: 5px;
       background: #fff;
-      padding: 8px;
+      padding: 8px 10px;
       font: inherit;
     }}
+    input:focus, select:focus, textarea:focus {{ outline: 2px solid rgba(31, 95, 191, 0.18); border-color: var(--primary); }}
     button, .button {{
       display: inline-block;
-      border: 1px solid #1f5fbf;
-      background: #1f5fbf;
+      border: 1px solid var(--primary);
+      background: var(--primary);
       color: #fff;
-      padding: 8px 12px;
+      padding: 8px 13px;
       font-weight: 700;
       text-decoration: none;
       cursor: pointer;
       border-radius: 4px;
+      line-height: 1.2;
     }}
-    .button.secondary, button.secondary {{ background: #fff; color: #1f5fbf; }}
+    button:hover, .button:hover {{ background: var(--primary-dark); border-color: var(--primary-dark); text-decoration: none; }}
+    .button.secondary, button.secondary {{ background: #fff; color: var(--primary); }}
+    .button.secondary:hover, button.secondary:hover {{ background: #eef5ff; border-color: var(--primary); }}
     .actions {{ display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }}
+    .toolbar {{ justify-content: space-between; }}
     .badge {{ display: inline-block; border-radius: 999px; padding: 2px 8px; font-size: 12px; font-weight: 700; }}
     .ready, .auto, .verified {{ background: #e8f5ee; color: #166534; }}
     .review, .pending, .missing {{ background: #fff7df; color: #8a4b08; }}
     .error, .failed, .rejected {{ background: #feeceb; color: #b42318; }}
     .neutral {{ background: #eef2f7; color: #344054; }}
-    .split {{ display: grid; grid-template-columns: minmax(0, 1fr) minmax(360px, 0.8fr); gap: 16px; align-items: start; }}
+    .split {{ display: grid; grid-template-columns: minmax(0, 1.35fr) minmax(360px, 0.8fr); gap: 16px; align-items: start; }}
+    .student-layout {{ display: grid; grid-template-columns: minmax(0, 1fr) 410px; gap: 16px; align-items: start; }}
+    .side-stack {{ display: flex; flex-direction: column; gap: 14px; }}
+    .side-stack .band {{ margin-bottom: 0; }}
+    .operation-grid {{ display: grid; grid-template-columns: 1fr; gap: 14px; }}
+    .operation {{ border: 1px solid var(--soft-border); border-radius: 6px; padding: 12px; background: #fbfcfe; }}
+    .operation h3 {{ margin: 0 0 10px; font-size: 14px; }}
+    .form-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; align-items: end; }}
+    .form-grid .wide {{ grid-column: 1 / -1; }}
     .pages {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 12px; }}
-    figure {{ margin: 0; border: 1px solid #d9dee8; background: #fff; padding: 8px; }}
-    figcaption {{ font-size: 12px; color: #667085; margin-bottom: 6px; }}
+    figure {{ margin: 0; border: 1px solid var(--border); border-radius: 6px; background: #fff; padding: 8px; }}
+    figcaption {{ font-size: 12px; color: var(--muted); margin-bottom: 6px; }}
     img.sheet {{ width: 100%; height: auto; display: block; background: #fff; }}
     .flags {{ max-width: 520px; overflow-wrap: anywhere; }}
-    .muted {{ color: #667085; }}
+    .muted {{ color: var(--muted); }}
     .mono {{ font-family: Consolas, monospace; }}
-    .empty {{ color: #667085; text-align: center; padding: 20px; }}
-    @media (max-width: 860px) {{ .split {{ grid-template-columns: 1fr; }} }}
+    .empty {{ color: var(--muted); text-align: center; padding: 20px; }}
+    .section-title {{ display: flex; justify-content: space-between; gap: 12px; align-items: center; margin: 20px 0 10px; }}
+    .section-title h2 {{ margin: 0; }}
+    @media (max-width: 1040px) {{ .student-layout, .split {{ grid-template-columns: 1fr; }} }}
   </style>
 </head>
 <body>
@@ -360,14 +485,10 @@ def _badge(value: str | None) -> str:
 def _professor_status(parser_status: str | None, verified_status: str | None = None) -> str:
     if verified_status == "verified":
         return "MANUALLY_CHECKED"
-    if verified_status == "rejected":
-        return "REJECTED"
-    if verified_status == "missing_pages":
-        return "MISSING_PAGES"
-    if verified_status == "needs_review":
+    if verified_status in {"needs_review", "missing_pages", "rejected"}:
         return "NEEDS_REVIEW"
-    if verified_status == "pending_verification" or parser_status == "ready":
-        return "PENDING_VERIFICATION"
+    if parser_status == "ready":
+        return "AUTO_GRADED"
     if parser_status == "needs_review":
         return "NEEDS_REVIEW"
     if parser_status == "error":
@@ -375,19 +496,11 @@ def _professor_status(parser_status: str | None, verified_status: str | None = N
     return str(parser_status or "NEEDS_REVIEW")
 
 
-def _marks_label(details: dict[str, Any], verified: dict[str, Any] | None = None) -> str:
-    if verified and verified.get("manual_pages"):
-        return "Regrading required"
-    if not any(details.get(key) is not None for key in ("mcq_score", "numerical_score")):
-        return "Not graded"
-    if any(details.get(f"{kind}_score") is None and details.get(f"{kind}_total")
-           for kind in ("mcq", "numerical")):
-        return "Grading incomplete"
-    score, total = _score(details)
-    return f"{_fmt_num(score)} / {_fmt_num(total)}"
-
-
-def _score(student: dict[str, Any]) -> tuple[float | None, float | None]:
+def _score(student: dict[str, Any]) -> tuple[float, float]:
+    if student.get("manual_score_override") is not None:
+        return float(student.get("manual_score_override") or 0.0), float(
+            student.get("manual_total_override") if student.get("manual_total_override") is not None else 0.0
+        )
     score = 0.0
     total = 0.0
     for score_key, total_key in (("mcq_score", "mcq_total"), ("numerical_score", "numerical_total")):
@@ -395,11 +508,7 @@ def _score(student: dict[str, Any]) -> tuple[float | None, float | None]:
             score += float(student.get(score_key) or 0.0)
         if student.get(total_key) is not None:
             total += float(student.get(total_key) or 0.0)
-    has_scores = any(student.get(key) is not None for key in ("mcq_score", "numerical_score"))
-    has_totals = any(student.get(key) is not None for key in ("mcq_total", "numerical_total"))
-    incomplete = any(student.get(f"{kind}_score") is None and student.get(f"{kind}_total")
-                     for kind in ("mcq", "numerical"))
-    return score if has_scores and not incomplete else None, total if has_totals else None
+    return score, total
 
 
 def _fmt_num(value: float | int | None) -> str:
@@ -428,7 +537,7 @@ def _load_roster_rows(path: Path | None) -> dict[str, dict[str, str]]:
 
 def _build_ui_roll_ocr_backend() -> tuple[object | None, dict[str, Any]]:
     try:
-        backend = build_roll_ocr_backend("local", resnet_model_path=DEFAULT_RESNET_ROLL_MODEL)
+        backend = build_roll_ocr_backend("local")
     except RuntimeError as exc:
         return None, {
             "enabled": False,
@@ -438,7 +547,6 @@ def _build_ui_roll_ocr_backend() -> tuple[object | None, dict[str, Any]]:
     return backend, {
         "enabled": backend is not None,
         "provider": getattr(backend, "provider", "local") if backend is not None else "none",
-        "resnet_model": str(DEFAULT_RESNET_ROLL_MODEL) if DEFAULT_RESNET_ROLL_MODEL.is_file() else None,
         "warning": None,
     }
 
@@ -449,7 +557,7 @@ def _require_ui_roll_ocr_backend() -> tuple[object, dict[str, Any]]:
         detail = str(state.get("warning") or "local roll OCR could not be initialized")
         raise RuntimeError(
             "Roll-number OCR is required for professor UI processing. "
-            f"{detail} Install Tesseract or set SMARTOMR_TESSERACT_CMD, then start the run again."
+            f"{detail} Ensure data/models/roll_digit_resnet_omr_finetuned.pt is present, then start the run again."
         )
     return backend, state
 
@@ -542,30 +650,13 @@ def _normalize_tabular_upload(path: Path, target_csv: Path) -> Path:
     raise ValueError(f"unsupported tabular upload type: {path.suffix}; use CSV or XLSX")
 
 
-def _parse_question_rows(text: str, kind: str) -> list[WrittenQuestionConfig] | list[NumericalQuestionConfig]:
-    rows = []
-    for raw in text.splitlines():
-        values = [part for part in re.split(r"[,\s]+", raw.strip()) if part]
-        if not values:
-            continue
-        if len(values) != 3:
-            raise ValueError(f"{kind} rows must be: question-number marks lines-or-digits")
-        q_no, marks, size = int(values[0]), float(values[1]), int(values[2])
-        rows.append(
-            WrittenQuestionConfig(q_no=q_no, max_marks=marks, lines=size)
-            if kind == "written"
-            else NumericalQuestionConfig(q_no=q_no, max_marks=marks, digits=size)
-        )
-    return rows
-
-
 def _write_marks_csv(run_dir: Path, parse_dir: Path, index: dict[str, Any]) -> Path:
     reports = run_dir / "reports"
     reports.mkdir(parents=True, exist_ok=True)
     marks_path = reports / "marks.csv"
     rows: list[dict[str, Any]] = []
     for student in index.get("students", []):
-        details_path = _resolve_artifact_path(student["details_path"], parse_dir)
+        details_path = _resolve_output_path(student["details_path"], parse_dir)
         details = _read_json(details_path)
         score, total = _score(details)
         rows.append(
@@ -576,6 +667,8 @@ def _write_marks_csv(run_dir: Path, parse_dir: Path, index: dict[str, Any]) -> P
                 "status": details.get("status") or student.get("status") or "",
                 "marks_obtained": _fmt_num(score),
                 "max_marks": _fmt_num(total),
+                "manual_override": "yes" if details.get("manual_score_override") is not None else "",
+                "manual_note": details.get("manual_score_note") or "",
                 "review_flag_count": len(details.get("review_flags", [])),
                 "review_flags": " | ".join(str(flag) for flag in details.get("review_flags", [])),
             }
@@ -590,6 +683,8 @@ def _write_marks_csv(run_dir: Path, parse_dir: Path, index: dict[str, Any]) -> P
                 "status",
                 "marks_obtained",
                 "max_marks",
+                "manual_override",
+                "manual_note",
                 "review_flag_count",
                 "review_flags",
             ],
@@ -597,6 +692,483 @@ def _write_marks_csv(run_dir: Path, parse_dir: Path, index: dict[str, Any]) -> P
         writer.writeheader()
         writer.writerows(rows)
     return marks_path
+
+
+def _student_index_entry(result: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "roll_no": result["student"]["roll_no"],
+        "status": result["status"],
+        "student_name": result["student"]["name"],
+        "student_email": result["student"].get("email", ""),
+        "sheet_pdf_path": (
+            str(Path(result["details_path"]).parent / result["sheet_pdf_path"])
+            if result.get("sheet_pdf_path")
+            else None
+        ),
+        "mcq_score": result["mcq_score"],
+        "mcq_total": result["mcq_total"],
+        "numerical_responses": result["numerical_responses"],
+        "numerical_score": result["numerical_score"],
+        "numerical_total": result["numerical_total"],
+        "mcq_answers": _mcq_answer_summary(result),
+        "pages": [
+            {
+                "page": page["page_index"],
+                "source_index": page["source_index"],
+                "canonical_image_path": page["canonical_image_path"],
+                "debug_image_path": page["debug_image_path"],
+                "alignment_overlay_path": page["alignment_overlay_path"],
+                "sampling_overlay_path": page["sampling_overlay_path"],
+            }
+            for page in result["pages"]
+        ],
+        "review_flags": result["review_flags"],
+        "details_path": result["details_path"],
+    }
+
+
+def _recalculate_status_counts(index: dict[str, Any]) -> None:
+    students = list(index.get("students", []))
+    reconciliation = index.get("roster_reconciliation") or {}
+    index["status_counts"] = {
+        "ready": sum(1 for student in students if student.get("status") == "ready"),
+        "needs_review": sum(1 for student in students if student.get("status") == "needs_review"),
+        "unmatched_pages": len(index.get("unmatched_pages", [])),
+        "page_errors": len(index.get("page_errors", [])),
+        "roster_missing": int(reconciliation.get("missing_count") or 0),
+    }
+
+
+def _load_student_results_for_report(index: dict[str, Any], parse_dir: Path) -> list[dict[str, Any]]:
+    results: list[dict[str, Any]] = []
+    for student in index.get("students", []):
+        details_path = _resolve_output_path(student.get("details_path"), parse_dir)
+        if details_path.exists():
+            results.append(_read_json(details_path))
+    return results
+
+
+def _replace_verified_student(parse_dir: Path, roll_no: str, result: dict[str, Any]) -> None:
+    verified_path = parse_dir / "verified_index.json"
+    if not verified_path.exists():
+        return
+    verified = _read_json(verified_path)
+    expected_pages = list(range(1, int(verified.get("expected_pages") or 0) + 1))
+    found_pages = sorted(int(page.get("page_index")) for page in result.get("pages", []) if page.get("page_index"))
+    missing_pages = [page for page in expected_pages if page not in found_pages]
+    score, total = _score(result)
+    details_path = Path(str(result.get("details_path") or ""))
+    details_dir = details_path.parent if details_path else parsed_dir
+    sheet_pdf = result.get("sheet_pdf_path")
+    replacement = {
+        "status": "needs_review" if result.get("review_flags") else "pending_verification",
+        "roll_no": roll_no,
+        "program": result.get("student", {}).get("program") or "",
+        "student_name": result.get("student", {}).get("name") or "",
+        "student_email": result.get("student", {}).get("email") or "",
+        "pages": [
+            {
+                "page": page.get("page_index"),
+                "source_index": page.get("source_index"),
+                "canonical_image_path": page.get("canonical_image_path"),
+                "debug_image_path": page.get("debug_image_path"),
+                "alignment_overlay_path": page.get("alignment_overlay_path"),
+                "sampling_overlay_path": page.get("sampling_overlay_path"),
+                "origin": "student_reupload",
+            }
+            for page in result.get("pages", [])
+        ],
+        "manual_pages": [],
+        "pages_found": found_pages,
+        "expected_pages": expected_pages,
+        "missing_pages": missing_pages,
+        "parser_status": result.get("status"),
+        "eligible_for_email": False,
+        "sheet_pdf_path": str(details_dir / sheet_pdf) if sheet_pdf else None,
+        "verified_sheet_pdf_path": None,
+        "details_path": result.get("details_path"),
+        "review_flags": result.get("review_flags", []),
+        "mcq_score": result.get("mcq_score"),
+        "mcq_total": result.get("mcq_total"),
+        "numerical_score": result.get("numerical_score"),
+        "numerical_total": result.get("numerical_total"),
+        "manual_score_override": result.get("manual_score_override"),
+        "manual_total_override": result.get("manual_total_override"),
+        "decision_log": [
+            {
+                "action": "student_reupload",
+                "reviewer": "professor-ui",
+                "note": f"Re-evaluated from an uploaded replacement sheet; current score {_fmt_num(score)} / {_fmt_num(total)}.",
+                "created_at": _now(),
+            }
+        ],
+    }
+    students = list(verified.get("students", []))
+    for index, student in enumerate(students):
+        if str(student.get("roll_no")) == str(roll_no):
+            students[index] = replacement
+            break
+    else:
+        students.append(replacement)
+    verified["students"] = students
+    _write_json(verified_path, verified)
+
+
+def _parse_student_reupload(
+    *,
+    upload_path: Path,
+    roll_no: str,
+    parse_dir: Path,
+    manifest_path: Path,
+    students_path: Path | None,
+    answer_key_path: Path | None,
+    roll_ocr_backend: object | None,
+) -> dict[str, Any]:
+    manifest = load_manifest(manifest_path)
+    students = load_students(students_path) if students_path and students_path.exists() else None
+    default_marks = float(manifest["exam"].get("marks_per_mcq", 1.0))
+    answer_key = load_answer_key(answer_key_path, default_marks=default_marks) if answer_key_path and answer_key_path.exists() else None
+    records: list[_PageRecord] = []
+    source_counter = 0
+    for raw_page in iter_scan_pages(upload_path, 200.0):
+        source_counter += 1
+        identity_dir = parse_dir / "_student_reuploads" / _safe_id(roll_no) / f"source_{source_counter:04d}"
+        aligned = align_scan_page(raw_page, manifest, 200.0, source_index=source_counter)
+        identity_kind, detected_roll, program, confidence, identity_payload, flags = _page_identity(
+            aligned,
+            manifest,
+            200.0,
+            identity_dir,
+            roll_ocr_backend,
+            set(students) if students else None,
+        )
+        if detected_roll and str(detected_roll) != str(roll_no):
+            flags.append(
+                f"replacement upload was forced to roll {roll_no}, but page identity read {detected_roll}; review manually"
+            )
+        records.append(
+            _PageRecord(
+                source_path=upload_path,
+                source_index=source_counter,
+                aligned_page=aligned,
+                identity_kind=identity_kind,
+                roll_no=roll_no,
+                program=program,
+                confidence=confidence,
+                identity_payload=identity_payload,
+                review_flags=flags,
+            )
+        )
+    if not records:
+        raise ValueError("uploaded student sheet had no readable pages")
+    result = _write_student_group(
+        roll_no,
+        records,
+        manifest,
+        parse_dir,
+        students,
+        answer_key,
+        200.0,
+        0.0,
+        True,
+        roll_ocr_backend,
+        None,
+    )
+    result.setdefault("review_flags", []).append("student sheet was re-uploaded and re-evaluated from professor UI")
+    _write_json(Path(result["details_path"]), result)
+    return result
+
+
+def _existing_student_records(
+    *,
+    details: dict[str, Any],
+    parse_dir: Path,
+    roll_no: str,
+    skip_page: int,
+) -> list[_PageRecord]:
+    details_dir = _resolve_output_path(details.get("details_path"), parse_dir).parent
+    program = details.get("student", {}).get("program") or None
+    records: list[_PageRecord] = []
+    for page in details.get("pages", []):
+        page_no = int(page.get("page_index") or page.get("page") or 0)
+        if page_no <= 0 or page_no == skip_page:
+            continue
+        image_path = _resolve_output_path(page.get("canonical_image_path"), details_dir)
+        if not image_path.exists():
+            continue
+        image = np.asarray(Image.open(image_path).convert("L"))
+        records.append(
+            _PageRecord(
+                source_path=image_path,
+                source_index=int(page.get("source_index") or (10000 + page_no)),
+                aligned_page=AlignedPage(
+                    page_index=page_no,
+                    source_index=int(page.get("source_index") or (10000 + page_no)),
+                    image=image,
+                    alignment_confidence=float(page.get("alignment_confidence") or 1.0),
+                    page_mark_confidence=float(page.get("page_mark_confidence") or 1.0),
+                    debug_image=None,
+                ),
+                identity_kind="existing_verified_page",
+                roll_no=roll_no,
+                program=program,
+                confidence="high",
+                identity_payload=None,
+                review_flags=[],
+            )
+        )
+    return records
+
+
+def _parse_student_page_replacement(
+    *,
+    upload_path: Path,
+    roll_no: str,
+    target_page: int,
+    current_details: dict[str, Any],
+    parse_dir: Path,
+    manifest_path: Path,
+    students_path: Path | None,
+    answer_key_path: Path | None,
+    roll_ocr_backend: object | None,
+) -> dict[str, Any]:
+    manifest = load_manifest(manifest_path)
+    if target_page < 1 or target_page > int(manifest.get("num_pages") or 0):
+        raise ValueError(f"page number must be between 1 and {manifest.get('num_pages')}")
+    students = load_students(students_path) if students_path and students_path.exists() else None
+    default_marks = float(manifest["exam"].get("marks_per_mcq", 1.0))
+    answer_key = load_answer_key(answer_key_path, default_marks=default_marks) if answer_key_path and answer_key_path.exists() else None
+
+    replacement_records: list[_PageRecord] = []
+    source_counter = 0
+    for raw_page in iter_scan_pages(upload_path, 200.0):
+        source_counter += 1
+        aligned = align_scan_page(raw_page, manifest, 200.0, source_index=source_counter)
+        identity_dir = parse_dir / "_student_reuploads" / _safe_id(roll_no) / f"replace_page_{target_page}_{source_counter:04d}"
+        identity_kind, detected_roll, program, confidence, identity_payload, flags = _page_identity(
+            aligned,
+            manifest,
+            200.0,
+            identity_dir,
+            roll_ocr_backend,
+            set(students) if students else None,
+        )
+        if detected_roll and str(detected_roll) != str(roll_no):
+            flags.append(
+                f"replacement page was forced to roll {roll_no}, but page identity read {detected_roll}; review manually"
+            )
+        if aligned.page_index != target_page:
+            flags.append(
+                f"uploaded replacement detected as page {aligned.page_index}, but professor selected page {target_page}; "
+                "using it as the selected page"
+            )
+            aligned = replace(aligned, page_index=target_page)
+        replacement_records.append(
+            _PageRecord(
+                source_path=upload_path,
+                source_index=source_counter,
+                aligned_page=aligned,
+                identity_kind=identity_kind,
+                roll_no=roll_no,
+                program=program or current_details.get("student", {}).get("program"),
+                confidence=confidence,
+                identity_payload=identity_payload,
+                review_flags=flags,
+            )
+        )
+
+    if not replacement_records:
+        raise ValueError("uploaded replacement page had no readable pages")
+    selected_replacement = next(
+        (record for record in replacement_records if record.aligned_page.page_index == target_page),
+        replacement_records[0],
+    )
+    records = _existing_student_records(
+        details=current_details,
+        parse_dir=parse_dir,
+        roll_no=roll_no,
+        skip_page=target_page,
+    )
+    records.append(selected_replacement)
+    result = _write_student_group(
+        roll_no,
+        records,
+        manifest,
+        parse_dir,
+        students,
+        answer_key,
+        200.0,
+        0.0,
+        True,
+        roll_ocr_backend,
+        None,
+    )
+    result.setdefault("review_flags", []).append(
+        f"page {target_page} was replaced from professor UI and the student was re-evaluated"
+    )
+    _write_json(Path(result["details_path"]), result)
+    return result
+
+
+def _commit_student_result(
+    *,
+    store: "RunStore",
+    run_id: str,
+    state: dict[str, Any],
+    parse_dir: Path,
+    index_path: Path,
+    roll_no: str,
+    result: dict[str, Any],
+    roll_ocr_state: dict[str, Any],
+) -> None:
+    run_dir = store.run_dir(run_id)
+    index = _read_json(index_path)
+    entry = _student_index_entry(result)
+    students = list(index.get("students", []))
+    for item_index, student in enumerate(students):
+        if str(student.get("roll_no")) == str(roll_no):
+            students[item_index] = entry
+            break
+    else:
+        students.append(entry)
+    index["students"] = students
+    _recalculate_status_counts(index)
+    manifest = load_manifest(Path(str(state["inputs"]["manifest_path"])))
+    report_paths = _write_review_reports(
+        parse_dir,
+        manifest,
+        index,
+        _load_student_results_for_report(index, parse_dir),
+        index.get("unmatched_pages", []),
+        index.get("page_errors", []),
+    )
+    index["reports"] = report_paths
+    index["review_report_csv_path"] = report_paths["csv"]
+    index["review_report_html_path"] = report_paths["html"]
+    _write_json(index_path, index)
+    _replace_verified_student(parse_dir, roll_no, result)
+    marks_csv = _write_marks_csv(run_dir, parse_dir, index)
+    counts = index.get("status_counts", {})
+    store.write_state(
+        run_id,
+        marks_csv_path=str(marks_csv),
+        roll_ocr=roll_ocr_state,
+        summary={
+            **dict(state.get("summary") or {}),
+            "students": len(index.get("students", [])),
+            "ready": counts.get("ready", 0),
+            "needs_review": counts.get("needs_review", 0),
+            "unmatched_pages": counts.get("unmatched_pages", 0),
+            "page_errors": counts.get("page_errors", 0),
+            "roster_missing": counts.get("roster_missing", 0),
+        },
+    )
+
+
+def _digits_for_roll_feedback(roll_no: str, cell_count: int) -> str:
+    digits = "".join(ch for ch in str(roll_no).upper() if ch.isdigit())
+    if len(digits) < cell_count:
+        raise ValueError(f"correct roll {roll_no!r} has only {len(digits)} digit(s), but this field needs {cell_count}")
+    return digits[-cell_count:]
+
+
+def _append_roll_feedback_rows(feedback_dir: Path, rows: list[dict[str, Any]]) -> None:
+    labels_path = feedback_dir / "labels.csv"
+    train_path = feedback_dir / "train.csv"
+    fieldnames = [
+        "image_path",
+        "label",
+        "roll_no",
+        "program",
+        "page_index",
+        "cell_index",
+        "run_id",
+        "old_roll_no",
+        "source_crop_path",
+        "created_at",
+    ]
+    for path in (labels_path, train_path):
+        write_header = not path.exists()
+        with path.open("a", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(handle, fieldnames=fieldnames)
+            if write_header:
+                writer.writeheader()
+            writer.writerows(rows)
+
+
+def _save_roll_correction_feedback(
+    *,
+    data_dir: Path,
+    run_id: str,
+    roll_no: str,
+    details: dict[str, Any],
+    parse_dir: Path,
+    manifest_path: Path,
+    correct_roll_no: str,
+    program: str,
+    page_index: int,
+) -> tuple[int, Path]:
+    manifest = load_manifest(manifest_path)
+    details_dir = _resolve_output_path(details.get("details_path"), parse_dir).parent
+    page = next(
+        (
+            item
+            for item in details.get("pages", [])
+            if int(item.get("page_index") or item.get("page") or 0) == int(page_index)
+        ),
+        None,
+    )
+    if page is None:
+        raise ValueError(f"student has no parsed page {page_index} to save roll feedback from")
+    image_path = _resolve_output_path(page.get("canonical_image_path"), details_dir)
+    if not image_path.exists():
+        raise FileNotFoundError(f"canonical page image not found: {image_path}")
+
+    feedback_dir = data_dir / ROLL_FEEDBACK_DIR_NAME
+    work_dir = feedback_dir / "source_crops" / _safe_id(run_id) / _safe_id(roll_no) / f"p{int(page_index)}"
+    image = np.asarray(Image.open(image_path).convert("L"))
+    _crop_paths, cell_crop_paths = save_roll_number_crop_sets(
+        image,
+        manifest,
+        int(page_index),
+        work_dir,
+        200.0,
+    )
+
+    program = program.upper().strip()
+    cells = [Path(path) for path in cell_crop_paths.get(program, [])]
+    if not cells:
+        available = ", ".join(sorted(cell_crop_paths)) or "none"
+        raise ValueError(f"no roll cell crops found for program {program} on page {page_index}; available: {available}")
+
+    digits = _digits_for_roll_feedback(correct_roll_no, len(cells))
+    images_dir = feedback_dir / "images"
+    images_dir.mkdir(parents=True, exist_ok=True)
+    rows: list[dict[str, Any]] = []
+    created_at = _now()
+    for index, (cell_path, label) in enumerate(zip(cells, digits, strict=True), start=1):
+        target_name = (
+            f"{_safe_id(run_id)}__old_{_safe_id(roll_no)}__correct_{_safe_id(correct_roll_no)}"
+            f"__p{int(page_index)}__c{index}__label_{label}__{uuid.uuid4().hex[:8]}.png"
+        )
+        target_path = images_dir / target_name
+        shutil.copy2(cell_path, target_path)
+        rows.append(
+            {
+                "image_path": _rel(target_path, feedback_dir),
+                "label": label,
+                "roll_no": correct_roll_no,
+                "program": program,
+                "page_index": int(page_index),
+                "cell_index": index,
+                "run_id": run_id,
+                "old_roll_no": roll_no,
+                "source_crop_path": str(cell_path),
+                "created_at": created_at,
+            }
+        )
+    _append_roll_feedback_rows(feedback_dir, rows)
+    return len(rows), feedback_dir
 
 
 @dataclass(frozen=True)
@@ -612,12 +1184,6 @@ class RunStore:
     def __init__(self, config: UiConfig) -> None:
         self.config = config
         self.config.runs_dir.mkdir(parents=True, exist_ok=True)
-        self._state_lock = threading.RLock()
-        self._worker_lock = threading.Lock()
-        self._worker: threading.Thread | None = None
-        for state in self.list_runs():
-            if state.get("status") == "inspecting":
-                self.write_state(state["run_id"], status="inspection_interrupted", stage="Inspection interrupted")
 
     def run_dir(self, run_id: str) -> Path:
         return self.config.runs_dir / _safe_id(run_id)
@@ -629,13 +1195,12 @@ class RunStore:
         return _read_json(self.state_path(run_id))
 
     def write_state(self, run_id: str, **updates: Any) -> dict[str, Any]:
-        with self._state_lock:
-            path = self.state_path(run_id)
-            state = _read_json(path) if path.exists() else {}
-            state.update(updates)
-            state["updated_at"] = _now()
-            _write_json(path, state)
-            return state
+        path = self.state_path(run_id)
+        state = _read_json(path) if path.exists() else {}
+        state.update(updates)
+        state["updated_at"] = _now()
+        _write_json(path, state)
+        return state
 
     def list_runs(self) -> list[dict[str, Any]]:
         runs: list[dict[str, Any]] = []
@@ -648,21 +1213,8 @@ class RunStore:
                     continue
         return runs
 
-    def create_run(self, exam_id: str, files: dict[str, UploadedFile]) -> dict[str, Any]:
-        with self._worker_lock:
-            return self._create_run(exam_id, files)
-
-    def _create_run(self, exam_id: str, files: dict[str, UploadedFile]) -> dict[str, Any]:
-        if self._worker and self._worker.is_alive():
-            raise ValueError("An operation is running. Wait for it to finish before uploading another run.")
-        manifest_upload = files.get("manifest")
-        if not manifest_upload or not manifest_upload.path.is_file():
-            raise ValueError("manifest.json is required")
-        manifest = load_manifest(manifest_upload.path)
-        manifest_exam_id = str(manifest["exam_id"]).strip()
-        if exam_id and exam_id != manifest_exam_id:
-            raise ValueError(f"Exam ID must match the manifest: {manifest_exam_id}")
-        exam_id = exam_id or manifest_exam_id
+    def create_run(self, exam_id: str, files: dict[str, UploadedFile], fields: dict[str, str] | None = None) -> dict[str, Any]:
+        fields = fields or {}
         run_stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         run_id = _safe_id(f"{exam_id}_{run_stamp}_{uuid.uuid4().hex[:6]}")
         run_dir = self.run_dir(run_id)
@@ -674,30 +1226,28 @@ class RunStore:
             if not upload.filename or not upload.path.exists() or upload.path.stat().st_size == 0:
                 saved[field] = None
                 continue
-            target = inputs / _safe_id(field) / _safe_id(Path(upload.filename).name)
-            target.parent.mkdir(parents=True, exist_ok=True)
+            target = inputs / _safe_id(Path(upload.filename).name)
             shutil.copy2(upload.path, target)
             saved[field] = str(target)
 
         manifest_path = Path(str(saved.get("manifest") or ""))
-        if not manifest_path.is_file():
+        if not manifest_path.exists():
             raise ValueError("manifest.json is required")
         scan_path = Path(str(saved.get("scan_pdf") or ""))
-        if not scan_path.is_file():
+        if not scan_path.exists():
             raise ValueError("student OMR PDF/image is required")
 
         manifest = load_manifest(manifest_path)
         manifest_exam_id = str(manifest.get("exam_id") or exam_id).strip()
-        if exam_id and exam_id != manifest_exam_id:
-            raise ValueError(f"Exam ID must match the manifest: {manifest_exam_id}")
         if not exam_id:
             exam_id = manifest_exam_id
-        inspection.create_inventory(run_dir, scan_path, manifest_path)
 
         answer_key_csv = None
         if saved.get("answer_key"):
             answer_key_csv = inputs / "answer_key.csv"
             _normalize_tabular_upload(Path(str(saved["answer_key"])), answer_key_csv)
+        else:
+            answer_key_csv = _write_answer_key_from_form(manifest, fields, inputs / "answer_key.csv")
 
         students_csv = None
         roster_summary = None
@@ -710,8 +1260,8 @@ class RunStore:
             "run_id": run_id,
             "exam_id": exam_id or manifest_exam_id,
             "manifest_exam_id": manifest_exam_id,
-            "status": "inspection_pending",
-            "stage": "Awaiting inspection",
+            "status": "queued",
+            "stage": "Queued",
             "created_at": _now(),
             "updated_at": _now(),
             "inputs": {
@@ -731,55 +1281,9 @@ class RunStore:
         _write_json(self.state_path(run_id), state)
         return state
 
-    def inspection_index(self, run_id: str) -> dict[str, Any]:
-        state = self.read_state(run_id)
-        run_dir = self.run_dir(run_id)
-        with self._state_lock:
-            if not (run_dir / inspection.INDEX_NAME).exists():
-                if self._worker and self._worker.is_alive():
-                    raise ValueError("Wait for the active operation to finish before indexing a legacy run.")
-                inspection.create_inventory(
-                    run_dir, Path(state["inputs"]["scan_path"]), Path(state["inputs"]["manifest_path"]),
-                )
-            return inspection.load_inventory(run_dir)
-
-    def start_run(self, run_id: str, *, evaluate: bool = False) -> None:
-        with self._worker_lock:
-            if self._worker and self._worker.is_alive():
-                raise ValueError("Another operation is running. Wait for it to finish before starting this run.")
-            state = self.read_state(run_id)
-            index = self.inspection_index(run_id)
-            inputs = state["inputs"]
-            if (inspection.fingerprint(Path(inputs["scan_path"])) != index["source_sha256"]
-                    or inspection.fingerprint(Path(inputs["manifest_path"])) != index["manifest_sha256"]):
-                raise ValueError("Run inputs have changed. Create a new run.")
-            if evaluate:
-                if state.get("parse_index_path") or (self.run_dir(run_id) / "parsed").exists():
-                    raise ValueError("This run already has evaluation artifacts. Create a new run to evaluate again; reviews are preserved.")
-                if index["status"] != "completed" or not (index["counts"]["aligned"] + index["counts"]["needs_review"]):
-                    raise ValueError("Complete page inspection with at least one aligned page before evaluation.")
-            target = self._run_batch if evaluate else self._run_inspection
-            self.write_state(run_id, status="queued" if evaluate else "inspecting", stage="Queued")
-            self._worker = threading.Thread(target=target, args=(run_id,), daemon=True)
-            self._worker.start()
-
-    def _run_inspection(self, run_id: str) -> None:
-        state = self.read_state(run_id)
-        try:
-            def progress(index: dict) -> None:
-                self.write_state(run_id, stage=f"Inspecting pages: {index['processed']}/{index['total']}")
-
-            inspection.inspect_pages(
-                self.run_dir(run_id), Path(state["inputs"]["scan_path"]),
-                Path(state["inputs"]["manifest_path"]), progress=progress,
-            )
-            self.write_state(run_id, status="completed" if state.get("parse_index_path") else "inspected",
-                             stage="Inspection complete", error=None)
-        except Exception as exc:
-            index = inspection.load_inventory(self.run_dir(run_id))
-            index.update(status="interrupted", error=f"{type(exc).__name__}: {exc}")
-            inspection.save_inventory(self.run_dir(run_id), index)
-            self.write_state(run_id, status="inspection_interrupted", stage="Inspection interrupted", error=index["error"])
+    def start_run(self, run_id: str) -> None:
+        thread = threading.Thread(target=self._run_batch, args=(run_id,), daemon=True)
+        thread.start()
 
     def _run_batch(self, run_id: str) -> None:
         try:
@@ -813,14 +1317,20 @@ class RunStore:
                 output_root=parsed_root,
                 dpi=200.0,
                 course_id=state["exam_id"],
-                min_group_confidence="medium",
+                min_group_confidence="high",
                 grouping_mode="auto",
                 ocr_backend=roll_ocr_backend,
                 progress_callback=update_progress,
             )
             parse_dir = index_path.parent
             self.write_state(run_id, stage="Preparing review dashboard")
-            initialize_verification_index(parse_dir, force=True)
+            initialize_verification_index(
+                parse_dir,
+                force=True,
+                auto_verify_ready=True,
+                reviewer="professor-ui",
+                note="Auto-graded with zero parser flags; automatically marked checked.",
+            )
             index = _read_json(index_path)
             marks_csv = _write_marks_csv(run_dir, parse_dir, index)
             counts = index.get("status_counts", {})
@@ -883,30 +1393,16 @@ class SmartOmrUiHandler(BaseHTTPRequestHandler):
         try:
             if path == "/":
                 self._page_runs()
-            elif path == "/generate":
-                self._page_generate()
             elif path == "/new":
                 self._page_new()
+            elif path == "/generate":
+                self._page_generate()
             elif path == "/artifact":
                 self._serve_artifact(query)
-            elif path.startswith("/static/"):
-                self._serve_static(path.removeprefix("/static/"))
             elif path.startswith("/runs/"):
                 parts = [part for part in path.split("/") if part]
                 if len(parts) == 2:
                     self._page_run(parts[1])
-                elif len(parts) == 3 and parts[2] == "pages":
-                    state = self.store.read_state(parts[1])
-                    self.store.inspection_index(parts[1])
-                    self._send_html("Source Pages", inspection_body(state))
-                elif len(parts) == 3 and parts[2] == "inspection.json":
-                    self._inspection_json(parts[1])
-                elif len(parts) == 5 and parts[2] == "pages":
-                    image_path = inspection.inspection_asset(self.store.run_dir(parts[1]), int(parts[3]), parts[4])
-                    if image_path and image_path.is_file():
-                        self._send_file(image_path, "application/json" if parts[4] == "report" else "image/png")
-                    else:
-                        self._not_found("Page image is not available")
                 elif len(parts) == 4 and parts[2] == "students":
                     self._page_student(parts[1], urllib.parse.unquote(parts[3]))
                 elif len(parts) == 3 and parts[2] == "review":
@@ -917,10 +1413,6 @@ class SmartOmrUiHandler(BaseHTTPRequestHandler):
                     self._not_found()
             else:
                 self._not_found()
-        except FileNotFoundError:
-            self._not_found()
-        except ValueError as exc:
-            self._bad_request(str(exc))
         except Exception as exc:
             body = f"<h1>UI Error</h1><p>{html.escape(str(exc))}</p><pre>{html.escape(traceback.format_exc())}</pre>"
             self._send_html("Error", body, status=HTTPStatus.INTERNAL_SERVER_ERROR)
@@ -935,11 +1427,16 @@ class SmartOmrUiHandler(BaseHTTPRequestHandler):
                 self._generate_omr()
             elif path.startswith("/runs/"):
                 parts = [part for part in path.split("/") if part]
-                if len(parts) == 3 and parts[2] in {"inspect", "evaluate"}:
-                    self.store.start_run(parts[1], evaluate=parts[2] == "evaluate")
-                    self._redirect(f"/runs/{parts[1]}/pages")
-                elif len(parts) == 5 and parts[2] == "students" and parts[4] in {"verify", "hold", "reject"}:
+                if len(parts) == 5 and parts[2] == "students" and parts[4] in {"verify", "hold", "reject"}:
                     self._student_decision(parts[1], urllib.parse.unquote(parts[3]), parts[4])
+                elif len(parts) == 5 and parts[2] == "students" and parts[4] == "marks":
+                    self._update_student_marks(parts[1], urllib.parse.unquote(parts[3]))
+                elif len(parts) == 5 and parts[2] == "students" and parts[4] == "correct-roll":
+                    self._correct_student_roll_feedback(parts[1], urllib.parse.unquote(parts[3]))
+                elif len(parts) == 5 and parts[2] == "students" and parts[4] == "reupload":
+                    self._reupload_student_sheet(parts[1], urllib.parse.unquote(parts[3]))
+                elif len(parts) == 5 and parts[2] == "students" and parts[4] == "replace-page":
+                    self._replace_student_page(parts[1], urllib.parse.unquote(parts[3]))
                 elif len(parts) == 5 and parts[2] == "unmatched" and parts[4] in {"assign", "ignore"}:
                     self._unmatched_decision(parts[1], int(parts[3]), parts[4])
                 elif len(parts) == 4 and parts[2] == "email" and parts[3] == "prepare":
@@ -963,57 +1460,11 @@ class SmartOmrUiHandler(BaseHTTPRequestHandler):
                 staging_dir=staging_dir,
             )
             exam_id = str(fields.get("exam_id") or "").strip()
-            state = self.store.create_run(exam_id, files)
+            state = self.store.create_run(exam_id, files, fields)
         finally:
             shutil.rmtree(staging_dir, ignore_errors=True)
-        try:
-            self.store.start_run(state["run_id"])
-        except ValueError as exc:
-            self.store.write_state(state["run_id"], stage=str(exc))
-        self._redirect(f"/runs/{state['run_id']}/pages")
-
-    def _send_file(self, path: Path, content_type: str) -> None:
-        self.send_response(HTTPStatus.OK.value)
-        self.send_header("Content-Type", content_type)
-        self.send_header("Content-Length", str(path.stat().st_size))
-        self.send_header("Cache-Control", "no-store")
-        self.send_header("X-Content-Type-Options", "nosniff")
-        self.end_headers()
-        with path.open("rb") as handle:
-            shutil.copyfileobj(handle, self.wfile)
-
-    def _serve_static(self, relative: str) -> None:
-        root = Path(__file__).parent / "static"
-        path = (root / relative).resolve()
-        if not path.is_relative_to(root.resolve()) or not path.is_file():
-            self._not_found()
-            return
-        self._send_file(path, mimetypes.guess_type(str(path))[0] or "application/octet-stream")
-
-    def _inspection_json(self, run_id: str) -> None:
-        state = self.store.read_state(run_id)
-        index = self.store.inspection_index(run_id)
-        index["run_status"] = state["status"]
-        index["stage"] = state.get("stage")
-        index["run_error"] = state.get("error")
-        index["evaluated"] = bool(state.get("parse_index_path"))
-        index["can_evaluate"] = (
-            not index["evaluated"] and state["status"] not in {"queued", "running", "inspecting"}
-            and index["status"] == "completed"
-            and bool(index["counts"]["aligned"] + index["counts"]["needs_review"])
-            and not (self.store.run_dir(run_id) / "parsed").exists()
-        )
-        index["can_inspect"] = (
-            state["status"] not in {"queued", "running", "inspecting"}
-            and (index["status"] != "completed" or bool(index["counts"]["failed"]))
-        )
-        payload = json.dumps(index).encode("utf-8")
-        self.send_response(HTTPStatus.OK.value)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Cache-Control", "no-store")
-        self.send_header("Content-Length", str(len(payload)))
-        self.end_headers()
-        self.wfile.write(payload)
+        self.store.start_run(state["run_id"])
+        self._redirect(f"/runs/{state['run_id']}")
 
     def _student_decision(self, run_id: str, roll_no: str, action: str) -> None:
         state = self.store.read_state(run_id)
@@ -1026,6 +1477,7 @@ class SmartOmrUiHandler(BaseHTTPRequestHandler):
                 roll_no,
                 reviewer="professor-ui",
                 note=note or "Marked manually checked from UI.",
+                allow_missing=True,
             )
         elif action == "hold":
             hold_student(
@@ -1041,6 +1493,341 @@ class SmartOmrUiHandler(BaseHTTPRequestHandler):
                 reviewer="professor-ui",
                 reason=note or "Rejected from professor UI.",
             )
+        self._redirect(f"/runs/{run_id}/students/{urllib.parse.quote(roll_no)}")
+
+    def _update_student_marks(self, run_id: str, roll_no: str) -> None:
+        state = self.store.read_state(run_id)
+        parse_dir = Path(str(state.get("parse_dir") or ""))
+        run_dir = self.store.run_dir(run_id)
+        index_path = Path(str(state.get("parse_index_path") or ""))
+        form = self._urlencoded_form()
+        score_text = (form.get("marks_obtained") or "").strip()
+        total_text = (form.get("max_marks") or "").strip()
+        note = (form.get("note") or "").strip()
+        if score_text == "":
+            raise ValueError("marks obtained is required")
+        score = float(score_text)
+        total = float(total_text) if total_text else None
+
+        index = _read_json(index_path)
+        student_index = next(
+            (student for student in index.get("students", []) if str(student.get("roll_no")) == str(roll_no)),
+            None,
+        )
+        if student_index is None:
+            raise ValueError(f"student {roll_no} not found")
+        details_path = _resolve_output_path(student_index["details_path"], parse_dir)
+        details = _read_json(details_path)
+        _old_score, old_total = _score(details)
+        if total is None:
+            total = old_total
+        details["manual_score_override"] = score
+        details["manual_total_override"] = total
+        details["manual_score_note"] = note
+        details.setdefault("decision_log", []).append(
+            {
+                "action": "edit_marks",
+                "reviewer": "professor-ui",
+                "note": note or f"Marks edited to {_fmt_num(score)} / {_fmt_num(total)}.",
+                "created_at": _now(),
+            }
+        )
+        _write_json(details_path, details)
+
+        student_index["mcq_score"] = score
+        student_index["mcq_total"] = total
+        student_index["numerical_score"] = 0.0
+        student_index["numerical_total"] = 0.0
+        student_index["manual_score_override"] = score
+        student_index["manual_total_override"] = total
+        _write_json(index_path, index)
+
+        verified_path = parse_dir / "verified_index.json"
+        if verified_path.exists():
+            verified_index = _read_json(verified_path)
+            verified_student = next(
+                (student for student in verified_index.get("students", []) if str(student.get("roll_no")) == str(roll_no)),
+                None,
+            )
+            if verified_student is not None:
+                verified_student["mcq_score"] = score
+                verified_student["mcq_total"] = total
+                verified_student["numerical_score"] = 0.0
+                verified_student["numerical_total"] = 0.0
+                verified_student["manual_score_override"] = score
+                verified_student["manual_total_override"] = total
+                verified_student.setdefault("decision_log", []).append(
+                    {
+                        "action": "edit_marks",
+                        "reviewer": "professor-ui",
+                        "note": note or f"Marks edited to {_fmt_num(score)} / {_fmt_num(total)}.",
+                        "created_at": _now(),
+                    }
+                )
+                _write_json(verified_path, verified_index)
+
+        marks_csv = _write_marks_csv(run_dir, parse_dir, index)
+        self.store.write_state(run_id, marks_csv_path=str(marks_csv))
+        self._redirect(f"/runs/{run_id}/students/{urllib.parse.quote(roll_no)}")
+
+    def _correct_student_roll_feedback(self, run_id: str, roll_no: str) -> None:
+        state = self.store.read_state(run_id)
+        parse_dir = Path(str(state.get("parse_dir") or ""))
+        index_path = Path(str(state.get("parse_index_path") or ""))
+        form = self._urlencoded_form()
+        correct_roll = (form.get("correct_roll_no") or "").strip().upper()
+        program = (form.get("program") or "").strip().upper()
+        page_text = (form.get("page_index") or "1").strip()
+        note = (form.get("note") or "").strip()
+        if not correct_roll:
+            raise ValueError("correct roll number is required")
+        if program not in {"BTECH", "MTECH", "PHD"}:
+            raise ValueError("program must be BTECH, MTECH, or PHD")
+        page_index = int(page_text)
+
+        state2, parse_dir, details, verified = self._student_details(run_id, roll_no)
+        details_path = _resolve_output_path(details.get("details_path"), parse_dir)
+        count, feedback_dir = _save_roll_correction_feedback(
+            data_dir=self.store.config.data_dir,
+            run_id=run_id,
+            roll_no=roll_no,
+            details=details,
+            parse_dir=parse_dir,
+            manifest_path=Path(str(state2["inputs"]["manifest_path"])),
+            correct_roll_no=correct_roll,
+            program=program,
+            page_index=page_index,
+        )
+
+        event = {
+            "action": "correct_roll_feedback",
+            "reviewer": "professor-ui",
+            "old_roll_no": roll_no,
+            "correct_roll_no": correct_roll,
+            "program": program,
+            "page_index": page_index,
+            "saved_digit_crops": count,
+            "feedback_dir": str(feedback_dir),
+            "note": note or "Saved corrected roll digit crops for future fine-tuning.",
+            "created_at": _now(),
+        }
+        details.setdefault("decision_log", []).append(event)
+        details.setdefault("roll_correction_feedback", []).append(event)
+        details.setdefault("review_flags", []).append(
+            f"roll mapping feedback saved: displayed roll {roll_no}, corrected roll {correct_roll}, page {page_index}"
+        )
+        _write_json(details_path, details)
+
+        if index_path.exists():
+            index = _read_json(index_path)
+            student_index = next(
+                (student for student in index.get("students", []) if str(student.get("roll_no")) == str(roll_no)),
+                None,
+            )
+            if student_index is not None:
+                student_index["review_flags"] = list(details.get("review_flags", []))
+                _write_json(index_path, index)
+        verified_path = parse_dir / "verified_index.json"
+        if verified_path.exists():
+            verified_index = _read_json(verified_path)
+            verified_student = next(
+                (student for student in verified_index.get("students", []) if str(student.get("roll_no")) == str(roll_no)),
+                None,
+            )
+            if verified_student is not None:
+                verified_student.setdefault("decision_log", []).append(event)
+                verified_student.setdefault("review_flags", []).append(
+                    f"roll mapping feedback saved: displayed roll {roll_no}, corrected roll {correct_roll}, page {page_index}"
+                )
+                if verified_student.get("status") == "verified":
+                    verified_student["status"] = "needs_review"
+                    verified_student["eligible_for_email"] = False
+                _write_json(verified_path, verified_index)
+
+        self._redirect(f"/runs/{run_id}/students/{urllib.parse.quote(roll_no)}")
+
+    def _reupload_student_sheet(self, run_id: str, roll_no: str) -> None:
+        state = self.store.read_state(run_id)
+        parse_dir = Path(str(state.get("parse_dir") or ""))
+        index_path = Path(str(state.get("parse_index_path") or ""))
+        run_dir = self.store.run_dir(run_id)
+        if not parse_dir.exists() or not index_path.exists():
+            raise ValueError("run is not parsed yet")
+
+        staging_dir = run_dir / "_upload_staging" / uuid.uuid4().hex
+        try:
+            fields, files = parse_multipart_upload(
+                self.rfile,
+                content_type=self.headers.get("content-type", ""),
+                content_length=int(self.headers.get("content-length", 0)),
+                staging_dir=staging_dir,
+            )
+            upload = files.get("student_sheet")
+            if upload is None or not upload.path.exists() or upload.path.stat().st_size == 0:
+                raise ValueError("student PDF/image upload is required")
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            saved_dir = run_dir / "student_reuploads" / _safe_id(roll_no) / timestamp
+            saved_dir.mkdir(parents=True, exist_ok=True)
+            saved_upload = saved_dir / _safe_id(upload.filename or upload.path.name)
+            shutil.copy2(upload.path, saved_upload)
+            note = (fields.get("note") or "").strip()
+        finally:
+            shutil.rmtree(staging_dir, ignore_errors=True)
+
+        student_dir = parse_dir / "students" / _safe_id(roll_no)
+        backup_dir = run_dir / "student_reupload_backups" / _safe_id(roll_no) / timestamp
+        if student_dir.exists():
+            backup_dir.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copytree(student_dir, backup_dir)
+
+        try:
+            shutil.rmtree(student_dir, ignore_errors=True)
+            roll_ocr_backend, roll_ocr_state = _build_ui_roll_ocr_backend()
+            result = _parse_student_reupload(
+                upload_path=saved_upload,
+                roll_no=roll_no,
+                parse_dir=parse_dir,
+                manifest_path=Path(str(state["inputs"]["manifest_path"])),
+                students_path=Path(str(state["inputs"]["students_path"])) if state["inputs"].get("students_path") else None,
+                answer_key_path=Path(str(state["inputs"]["answer_key_path"])) if state["inputs"].get("answer_key_path") else None,
+                roll_ocr_backend=roll_ocr_backend,
+            )
+            result.setdefault("decision_log", []).append(
+                {
+                    "action": "student_reupload",
+                    "reviewer": "professor-ui",
+                    "note": note or f"Uploaded replacement sheet {saved_upload.name} and re-evaluated only this student.",
+                    "created_at": _now(),
+                }
+            )
+            _write_json(Path(result["details_path"]), result)
+
+            index = _read_json(index_path)
+            entry = _student_index_entry(result)
+            students = list(index.get("students", []))
+            for item_index, student in enumerate(students):
+                if str(student.get("roll_no")) == str(roll_no):
+                    students[item_index] = entry
+                    break
+            else:
+                students.append(entry)
+            index["students"] = students
+            _recalculate_status_counts(index)
+            manifest = load_manifest(Path(str(state["inputs"]["manifest_path"])))
+            report_paths = _write_review_reports(
+                parse_dir,
+                manifest,
+                index,
+                _load_student_results_for_report(index, parse_dir),
+                index.get("unmatched_pages", []),
+                index.get("page_errors", []),
+            )
+            index["reports"] = report_paths
+            index["review_report_csv_path"] = report_paths["csv"]
+            index["review_report_html_path"] = report_paths["html"]
+            _write_json(index_path, index)
+            _replace_verified_student(parse_dir, roll_no, result)
+            marks_csv = _write_marks_csv(run_dir, parse_dir, index)
+            counts = index.get("status_counts", {})
+            self.store.write_state(
+                run_id,
+                marks_csv_path=str(marks_csv),
+                roll_ocr=roll_ocr_state,
+                summary={
+                    **dict(state.get("summary") or {}),
+                    "students": len(index.get("students", [])),
+                    "ready": counts.get("ready", 0),
+                    "needs_review": counts.get("needs_review", 0),
+                    "unmatched_pages": counts.get("unmatched_pages", 0),
+                    "page_errors": counts.get("page_errors", 0),
+                    "roster_missing": counts.get("roster_missing", 0),
+                },
+            )
+        except Exception:
+            if backup_dir.exists():
+                shutil.rmtree(student_dir, ignore_errors=True)
+                shutil.copytree(backup_dir, student_dir)
+            raise
+
+        self._redirect(f"/runs/{run_id}/students/{urllib.parse.quote(roll_no)}")
+
+    def _replace_student_page(self, run_id: str, roll_no: str) -> None:
+        state = self.store.read_state(run_id)
+        parse_dir = Path(str(state.get("parse_dir") or ""))
+        index_path = Path(str(state.get("parse_index_path") or ""))
+        run_dir = self.store.run_dir(run_id)
+        if not parse_dir.exists() or not index_path.exists():
+            raise ValueError("run is not parsed yet")
+        _state, _parse_dir, current_details, _verified = self._student_details(run_id, roll_no)
+
+        staging_dir = run_dir / "_upload_staging" / uuid.uuid4().hex
+        try:
+            fields, files = parse_multipart_upload(
+                self.rfile,
+                content_type=self.headers.get("content-type", ""),
+                content_length=int(self.headers.get("content-length", 0)),
+                staging_dir=staging_dir,
+            )
+            upload = files.get("student_page")
+            if upload is None or not upload.path.exists() or upload.path.stat().st_size == 0:
+                raise ValueError("replacement page PDF/image upload is required")
+            page_text = (fields.get("page_index") or "").strip()
+            if not page_text:
+                raise ValueError("page number is required")
+            target_page = int(page_text)
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            saved_dir = run_dir / "student_page_replacements" / _safe_id(roll_no) / timestamp
+            saved_dir.mkdir(parents=True, exist_ok=True)
+            saved_upload = saved_dir / _safe_id(upload.filename or upload.path.name)
+            shutil.copy2(upload.path, saved_upload)
+            note = (fields.get("note") or "").strip()
+        finally:
+            shutil.rmtree(staging_dir, ignore_errors=True)
+
+        student_dir = parse_dir / "students" / _safe_id(roll_no)
+        backup_dir = run_dir / "student_reupload_backups" / _safe_id(roll_no) / timestamp
+        if student_dir.exists():
+            backup_dir.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copytree(student_dir, backup_dir)
+
+        try:
+            roll_ocr_backend, roll_ocr_state = _build_ui_roll_ocr_backend()
+            result = _parse_student_page_replacement(
+                upload_path=saved_upload,
+                roll_no=roll_no,
+                target_page=target_page,
+                current_details=current_details,
+                parse_dir=parse_dir,
+                manifest_path=Path(str(state["inputs"]["manifest_path"])),
+                students_path=Path(str(state["inputs"]["students_path"])) if state["inputs"].get("students_path") else None,
+                answer_key_path=Path(str(state["inputs"]["answer_key_path"])) if state["inputs"].get("answer_key_path") else None,
+                roll_ocr_backend=roll_ocr_backend,
+            )
+            result.setdefault("decision_log", []).append(
+                {
+                    "action": "replace_page",
+                    "reviewer": "professor-ui",
+                    "note": note or f"Replaced page {target_page} with {saved_upload.name} and re-evaluated this student.",
+                    "created_at": _now(),
+                }
+            )
+            _write_json(Path(result["details_path"]), result)
+            _commit_student_result(
+                store=self.store,
+                run_id=run_id,
+                state=state,
+                parse_dir=parse_dir,
+                index_path=index_path,
+                roll_no=roll_no,
+                result=result,
+                roll_ocr_state=roll_ocr_state,
+            )
+        except Exception:
+            if backup_dir.exists():
+                shutil.rmtree(student_dir, ignore_errors=True)
+                shutil.copytree(backup_dir, student_dir)
+            raise
+
         self._redirect(f"/runs/{run_id}/students/{urllib.parse.quote(roll_no)}")
 
     def _unmatched_decision(self, run_id: str, source_index: int, action: str) -> None:
@@ -1115,6 +1902,8 @@ class SmartOmrUiHandler(BaseHTTPRequestHandler):
         only_roll = (form.get("only_roll") or "").strip() or None
         test_recipient = (form.get("test_recipient") or "").strip() or None
         password = form.get("password") or ""
+        if test_recipient and limit is None and only_roll is None:
+            limit = 1
         if not dry_run and not password:
             raise ValueError("SMTP password/app password is required for real sending")
         rows, log_path = send_email_release(
@@ -1169,13 +1958,16 @@ class SmartOmrUiHandler(BaseHTTPRequestHandler):
             )
         table = """
         <table>
-          <thead><tr><th>Exam</th><th>Status</th><th>Students</th><th>Parser Ready</th><th>Needs Review</th><th>Created</th></tr></thead>
+          <thead><tr><th>Exam</th><th>Status</th><th>Students</th><th>Ready</th><th>Needs Review</th><th>Created</th></tr></thead>
           <tbody>{}</tbody>
         </table>
         """.format("".join(rows) or '<tr><td colspan="6" class="empty">No runs yet</td></tr>')
         body = f"""
         <h1>Exam Runs</h1>
-        <div class="actions"><a class="button" href="/generate">Generate OMR</a><a class="button secondary" href="/new">Check Copies</a></div>
+        <div class="actions">
+          <a class="button" href="/generate">Generate OMR</a>
+          <a class="button secondary" href="/new">Check Copies</a>
+        </div>
         <h2>Recent Runs</h2>
         {table}
         """
@@ -1186,25 +1978,52 @@ class SmartOmrUiHandler(BaseHTTPRequestHandler):
         <h1>Generate OMR</h1>
         <form method="post" action="/generate" class="band">
           <div class="grid">
-            <div><label>Exam ID</label><input name="exam_id" required placeholder="CSE557_QUIZ1_2026"></div>
-            <div><label>Course Code</label><input name="course_code" required placeholder="CSE557"></div>
-            <div><label>Exam Name</label><input name="exam_name" required placeholder="Quiz 1"></div>
-            <div><label>Exam Type</label><select name="exam_type"><option value="quiz">Quiz</option><option value="midsem">Midsem</option><option value="endsem">Endsem</option></select></div>
+            <div><label>Exam ID</label><input name="exam_id" placeholder="CSE557_QUIZ1_2026" required></div>
+            <div><label>University</label><input name="university_name" value="IIIT Delhi"></div>
+            <div><label>Course Code</label><input name="course_code" placeholder="CSE557" required></div>
+            <div><label>Exam Name</label><input name="exam_name" placeholder="Quiz 1" required></div>
+            <div>
+              <label>Exam Type</label>
+              <select name="exam_type"><option value="quiz">Quiz</option><option value="midsem">Midsem</option><option value="endsem">Endsem</option></select>
+            </div>
           </div>
-          <h2>Answer Sections</h2>
-          <p class="muted">Add sections in the order they should print. One section has no label; multiple sections print as Section A, Section B, and so on.</p>
-          <div class="actions"><button type="button" class="secondary" data-add="mcq">Add Multiple Choice</button><button type="button" class="secondary" data-add="numerical">Add Numerical</button><button type="button" class="secondary" data-add="written">Add Written</button></div>
-          <input type="hidden" id="section-order" name="section_order">
-          <div id="sections"></div>
-          <p id="no-sections" class="muted">Add at least one answer section.</p>
-          <button type="submit">Generate PDF and Manifest</button>
+          <div class="section-builder">
+            <div class="section-builder-head">
+              <div><h2>Answer Sections</h2><p class="muted">Add sections in the same order they should appear on the OMR.</p></div>
+              <div class="actions"><select id="section-kind"><option value="mcq">Multiple choice</option><option value="numerical">Numerical bubbles</option><option value="written">Written answers</option></select><button type="button" id="add-section" class="secondary">Add Section</button></div>
+            </div>
+            <input id="section-order" type="hidden" name="section_order">
+            <div id="sections" class="section-list"></div>
+            <p id="section-empty" class="muted">No answer sections yet. Choose a type and click Add Section.</p>
+          </div>
+          <p class="muted">If the sheet has only one answer section, it will print without “Section A”. Section A/B/C appears only when more than one answer section exists.</p>
+          <p class="muted">One section prints without a section label. Two or more print as Section A, Section B, and so on.</p>
+          <button type="submit">Generate PDF And Manifest</button>
         </form>
+        <style>
+          .section-builder { margin-top:20px; border-top:1px solid var(--border); padding-top:16px; }
+          .section-builder-head { display:flex; gap:16px; justify-content:space-between; align-items:end; flex-wrap:wrap; }
+          .section-builder-head h2, .section-builder-head p { margin:0; }
+          .section-builder-head select { width:190px; }
+          .section-list { display:grid; gap:12px; margin-top:14px; }
+          .section-card { border:1px solid var(--border); border-left:4px solid var(--primary); padding:14px; background:#fff; }
+          .section-card-head { display:flex; justify-content:space-between; align-items:center; margin-bottom:12px; }
+          .section-card-head strong { font-size:15px; }
+          .section-card textarea { min-height:90px; }
+          .remove-section { border:0; background:transparent; color:var(--danger); font:inherit; font-weight:700; cursor:pointer; padding:3px; }
+        </style>
         <script>
-        (() => { const box=document.getElementById('sections'), order=document.getElementById('section-order'), blank=document.getElementById('no-sections');
+        (() => {
+          const kinds=document.getElementById('section-kind'), add=document.getElementById('add-section'), list=document.getElementById('sections'), order=document.getElementById('section-order'), empty=document.getElementById('section-empty');
           const labels={mcq:'Multiple Choice',numerical:'Numerical Answers',written:'Written Answers'};
-          const fields={mcq:'<div class="grid"><div><label>Questions</label><input name="num_mcq" type="number" min="1" value="14" required></div><div><label>Options</label><input name="mcq_options" type="number" min="2" max="6" value="4" required></div><div><label>Marks each</label><input name="marks_per_mcq" type="number" min="0.01" step="0.01" value="1" required></div></div>',numerical:'<label>Questions</label><textarea name="numerical_questions" required placeholder="One per line: question-number marks digits&#10;15 1 3"></textarea>',written:'<label>Questions</label><textarea name="written_questions" required placeholder="One per line: question-number marks lines&#10;16 5 8"></textarea>'};
-          function refresh(){const cards=[...box.children];order.value=cards.map(x=>x.dataset.kind).join(',');blank.hidden=cards.length>0;document.querySelectorAll('[data-add]').forEach(b=>b.disabled=!!box.querySelector(`[data-kind="${b.dataset.add}"]`));}
-          document.querySelectorAll('[data-add]').forEach(button=>button.onclick=()=>{const kind=button.dataset.add;if(box.querySelector(`[data-kind="${kind}"]`))return;const card=document.createElement('section');card.dataset.kind=kind;card.className='band';card.innerHTML=`<div class="actions" style="justify-content:space-between"><strong>${labels[kind]}</strong><button type="button" class="secondary">Remove</button></div>${fields[kind]}`;card.querySelector('button').onclick=()=>{card.remove();refresh();};box.append(card);refresh();});refresh();
+          const content={
+            mcq:'<div class="grid"><div><label>Number of Questions</label><input name="num_mcq" type="number" min="1" value="14" required></div><div><label>Options Per Question</label><input name="mcq_options" type="number" min="2" max="6" value="4" required></div><div><label>Marks Per Question</label><input name="marks_per_mcq" type="number" min="0.01" step="0.01" value="1" required></div></div>',
+            numerical:'<label>Questions</label><textarea name="numerical_questions" placeholder="One per line: question-number marks digits&#10;15 1 3" required></textarea><p class="muted">Example: 15 1 3 creates Q15 with a three-digit bubble grid.</p>',
+            written:'<label>Questions</label><textarea name="written_questions" placeholder="One per line: question-number marks lines&#10;16 5 8" required></textarea><p class="muted">Example: 16 5 8 creates Q16 with an eight-line answer box.</p>'
+          };
+          function update(){const cards=[...list.querySelectorAll('[data-kind]')];order.value=cards.map(c=>c.dataset.kind).join(',');empty.hidden=cards.length>0;[...kinds.options].forEach(o=>o.disabled=cards.some(c=>c.dataset.kind===o.value));}
+          add.addEventListener('click',()=>{const kind=kinds.value;if(list.querySelector(`[data-kind="${kind}"]`))return;const card=document.createElement('section');card.className='section-card';card.dataset.kind=kind;card.innerHTML=`<div class="section-card-head"><strong>${labels[kind]}</strong><button type="button" class="remove-section">Remove</button></div>${content[kind]}`;card.querySelector('.remove-section').addEventListener('click',()=>{card.remove();update();});list.append(card);update();});
+          update();
         })();
         </script>
         """
@@ -1212,31 +2031,51 @@ class SmartOmrUiHandler(BaseHTTPRequestHandler):
 
     def _generate_omr(self) -> None:
         form = self._urlencoded_form()
-        exam_id = _safe_id(form.get("exam_id") or "")
-        order = [kind for kind in (form.get("section_order") or "").split(",") if kind]
+        exam_id = _safe_id((form.get("exam_id") or "").strip())
+        if not exam_id:
+            raise ValueError("exam id is required")
+        written_questions = _parse_question_rows(form.get("written_questions") or "", kind="written")
+        numerical_questions = _parse_question_rows(form.get("numerical_questions") or "", kind="numerical")
+        section_order = [item.strip() for item in (form.get("section_order") or "").split(",") if item.strip()]
         config = ExamConfig(
             exam_id=exam_id,
+            university_name=(form.get("university_name") or "IIIT Delhi").strip() or "IIIT Delhi",
             course_code=(form.get("course_code") or "").strip(),
             exam_name=(form.get("exam_name") or "").strip(),
             exam_type=(form.get("exam_type") or "quiz").strip(),
-            num_mcq=int(form.get("num_mcq") or 0),
-            mcq_options=int(form.get("mcq_options") or 4),
-            marks_per_mcq=float(form.get("marks_per_mcq") or 1),
-            numerical_questions=_parse_question_rows(form.get("numerical_questions") or "", "numerical"),
-            written_questions=_parse_question_rows(form.get("written_questions") or "", "written"),
-            section_order=order,
+            num_mcq=int(form.get("num_mcq") or "0"),
+            mcq_options=int(form.get("mcq_options") or "4"),
+            marks_per_mcq=float(form.get("marks_per_mcq") or "1"),
+            written_questions=written_questions,
+            numerical_questions=numerical_questions,
+            section_order=section_order,
         )
-        output_dir = self.store.config.data_dir / "generated_omr" / f"{exam_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_dir = self.store.config.data_dir / "generated_omr" / f"{exam_id}_{stamp}"
         result = generate_exam(config, output_dir)
-        self._send_html("OMR Generated", f'''<h1>OMR Generated</h1><div class="actions band"><a class="button" href="{_asset_url(result['pdf_path'])}">Download OMR PDF</a><a class="button secondary" href="{_asset_url(result['manifest_path'])}">Download Manifest JSON</a><a class="button secondary" href="/new">Check Copies</a></div><p class="muted">{html.escape(str(output_dir))}</p>''')
+        body = f"""
+        <h1>OMR Generated</h1>
+        <div class="actions band">
+          <a class="button" href="{_asset_url(result['pdf_path'])}">Download OMR PDF</a>
+          <a class="button secondary" href="{_asset_url(result['manifest_path'])}">Download Manifest JSON</a>
+          <a class="button secondary" href="/new">Check Copies</a>
+        </div>
+        <div class="grid">
+          <div class="metric"><span>Exam ID</span><strong>{html.escape(exam_id)}</strong></div>
+          <div class="metric"><span>Pages</span><strong>{html.escape(str(result['manifest'].get('num_pages')))}</strong></div>
+          <div class="metric"><span>Total Marks</span><strong>{html.escape(str(result['manifest'].get('exam', {}).get('total_marks')))}</strong></div>
+        </div>
+        <p class="muted">Generated files are stored in {html.escape(str(output_dir))}.</p>
+        """
+        self._send_html("OMR Generated", body)
 
     def _page_new(self) -> None:
         body = """
-        <h1>New Scan Inspection</h1>
+        <h1>Check Copies</h1>
         <form method="post" action="/runs" enctype="multipart/form-data" class="band">
           <div class="grid">
             <div>
-              <label>Exam ID (optional; from manifest)</label>
+              <label>Exam ID</label>
               <input name="exam_id" placeholder="CSE557_QUIZ1_2026">
             </div>
             <div>
@@ -1245,27 +2084,90 @@ class SmartOmrUiHandler(BaseHTTPRequestHandler):
             </div>
             <div>
               <label>Manifest JSON</label>
-              <input type="file" name="manifest" required accept=".json">
+              <input id="manifest-file" type="file" name="manifest" required accept=".json">
             </div>
             <div>
-              <label>Answer key Excel / CSV (optional)</label>
+              <label>Answer key Excel / CSV fallback</label>
               <input type="file" name="answer_key" accept=".csv,.xlsx">
             </div>
             <div>
-              <label>Master student list Excel / CSV (optional)</label>
+              <label>Master student list Excel / CSV</label>
               <input type="file" name="master_list" accept=".csv,.xlsx">
             </div>
           </div>
-          <button type="submit">Inspect Pages</button>
+          <section class="band" style="margin-top:16px">
+            <h2>Answer Key</h2>
+            <input type="hidden" name="answer_key_mode" value="manifest_form">
+            <p class="muted">Choose the manifest above and the objective questions will appear here. Mark a question dropped when it should not count in the total.</p>
+            <div id="answer-key-summary" class="muted">Waiting for manifest.json...</div>
+            <div id="answer-key-table"></div>
+          </section>
+          <p class="muted">Uploaded answer key CSV/XLSX takes priority over the table above. Master list columns: roll_no, name, email, program. First-page written roll OCR cross-check runs automatically when local Tesseract is available.</p>
+          <button type="submit">Start Evaluation</button>
         </form>
+        <script>
+        const manifestInput = document.getElementById("manifest-file");
+        const summary = document.getElementById("answer-key-summary");
+        const target = document.getElementById("answer-key-table");
+
+        function esc(value) {
+          return String(value ?? "").replace(/[&<>"']/g, ch => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[ch]));
+        }
+
+        function objectiveQuestions(manifest) {
+          const questions = [];
+          const mcqMarks = Number(manifest.exam?.marks_per_mcq ?? 1);
+          for (const entry of manifest.mcq_block || []) {
+            questions.push({ q_no: Number(entry.q_no), kind: "MCQ", marks: mcqMarks, options: entry.options || [] });
+          }
+          for (const entry of manifest.numerical_block || []) {
+            questions.push({ q_no: Number(entry.q_no), kind: "Numerical", marks: Number(entry.max_marks ?? 1), digits: Number(entry.positions ?? 1) });
+          }
+          return questions.sort((a, b) => a.q_no - b.q_no);
+        }
+
+        function renderAnswerKey(manifest) {
+          const questions = objectiveQuestions(manifest);
+          const written = manifest.written_block || [];
+          summary.textContent = `${questions.length} objective question(s), ${written.length} written question(s). Written questions stay for manual/professor review.`;
+          if (!questions.length) {
+            target.innerHTML = '<p class="empty">No objective questions found in this manifest.</p>';
+            return;
+          }
+          const rows = questions.map(q => {
+            const answerControl = q.kind === "MCQ"
+              ? `<select name="answer_q${q.q_no}"><option value="">Select</option>${q.options.map(opt => `<option value="${esc(opt)}">${esc(opt)}</option>`).join("")}</select>`
+              : `<input name="answer_q${q.q_no}" pattern="[0-9]+" inputmode="numeric" placeholder="${"0".repeat(Math.max(1, q.digits || 1))}">`;
+            return `<tr>
+              <td>Q${q.q_no}</td>
+              <td>${esc(q.kind)}</td>
+              <td>${answerControl}</td>
+              <td><input name="marks_q${q.q_no}" type="number" step="0.01" min="0" value="${esc(q.marks)}"></td>
+              <td><label class="inline"><input name="drop_q${q.q_no}" type="checkbox" value="1"> Dropped</label></td>
+            </tr>`;
+          }).join("");
+          target.innerHTML = `<table>
+            <thead><tr><th>Question</th><th>Type</th><th>Correct Answer</th><th>Marks</th><th>Drop</th></tr></thead>
+            <tbody>${rows}</tbody>
+          </table>`;
+        }
+
+        manifestInput?.addEventListener("change", async () => {
+          const file = manifestInput.files?.[0];
+          if (!file) return;
+          try {
+            renderAnswerKey(JSON.parse(await file.text()));
+          } catch (error) {
+            summary.textContent = `Could not read manifest: ${error}`;
+            target.innerHTML = "";
+          }
+        });
+        </script>
         """
         self._send_html("New Run", body)
 
     def _page_run(self, run_id: str) -> None:
         state = self.store.read_state(run_id)
-        if state.get("status") in {"inspection_pending", "inspecting", "inspected", "inspection_interrupted"}:
-            self._redirect(f"/runs/{run_id}/pages")
-            return
         refresh = 3 if state.get("status") in {"queued", "running"} else None
         summary = state.get("summary") or {}
         roster_summary = state.get("roster_summary") or {}
@@ -1280,14 +2182,13 @@ class SmartOmrUiHandler(BaseHTTPRequestHandler):
             ("Stage", html.escape(str(state.get("stage") or ""))),
             ("Students", html.escape(str(summary.get("students", "")))),
             ("Roster", html.escape(str(roster_summary.get("total", "not uploaded")))),
-            ("Parser Ready", html.escape(str(summary.get("ready", "")))),
+            ("Ready", html.escape(str(summary.get("ready", "")))),
             ("Needs Review", html.escape(str(summary.get("needs_review", "")))),
             ("Unmatched", html.escape(str(summary.get("unmatched_pages", "")))),
             ("Missing Sheets", html.escape(str(summary.get("roster_missing", "")))),
             ("Roll OCR", html.escape(roll_ocr_label)),
         ]
         metric_html = "".join(f'<div class="metric"><span>{label}</span><strong>{value}</strong></div>' for label, value in metrics)
-        metric_html = f'<a href="/runs/{html.escape(run_id)}/pages">Inspect source pages</a>' + metric_html
         roll_ocr_warning = ""
         if roll_ocr.get("warning"):
             roll_ocr_warning = f'<div class="band review"><strong>Roll OCR warning:</strong> {html.escape(str(roll_ocr["warning"]))}</div>'
@@ -1302,17 +2203,17 @@ class SmartOmrUiHandler(BaseHTTPRequestHandler):
 
         parse_dir = Path(str(state["parse_dir"]))
         index = _read_json(Path(str(state["parse_index_path"])))
-        verified_by_roll: dict[str, dict] = {}
+        verified_by_roll: dict[str, str] = {}
         verified_path = parse_dir / "verified_index.json"
         if verified_path.exists():
             verified_index = _read_json(verified_path)
             verified_by_roll = {
-                str(student.get("roll_no")): student
+                str(student.get("roll_no")): str(student.get("status"))
                 for student in verified_index.get("students", [])
             }
         rows = []
         for student in index.get("students", []):
-            details = _read_json(_resolve_artifact_path(student["details_path"], parse_dir))
+            details = _read_json(_resolve_output_path(student["details_path"], parse_dir))
             score, total = _score(details)
             roll = str(details.get("student", {}).get("roll_no") or student.get("roll_no") or "")
             name = str(details.get("student", {}).get("name") or student.get("student_name") or "")
@@ -1323,8 +2224,8 @@ class SmartOmrUiHandler(BaseHTTPRequestHandler):
                 f"<td><a href=\"/runs/{html.escape(run_id)}/students/{urllib.parse.quote(roll)}\">{html.escape(roll)}</a></td>"
                 f"<td>{html.escape(name)}</td>"
                 f"<td>{html.escape(email)}</td>"
-                f"<td>{_marks_label(details, verified_by_roll.get(roll))}</td>"
-                f"<td>{_badge(_professor_status(details.get('status'), verified_by_roll.get(roll, {}).get('status')))}</td>"
+                f"<td>{_fmt_num(score)} / {_fmt_num(total)}</td>"
+                f"<td>{_badge(_professor_status(details.get('status'), verified_by_roll.get(roll)))}</td>"
                 f"<td>{len(flags)}</td>"
                 f"<td class=\"flags\">{html.escape(' | '.join(str(flag) for flag in flags[:3]))}</td>"
                 "</tr>"
@@ -1336,12 +2237,12 @@ class SmartOmrUiHandler(BaseHTTPRequestHandler):
         <div class="grid">{metric_html}</div>
         {roll_ocr_warning}
         <div class="actions band">
-          <a class="button" href="{marks_link}">Original Parser Marks CSV</a>
+          <a class="button" href="{marks_link}">Download Marks CSV</a>
           <a class="button secondary" href="{review_link}">Review Cases</a>
           <a class="button secondary" href="/runs/{html.escape(run_id)}/email">Email Release</a>
           <a class="button secondary" href="{_asset_url(parse_dir / 'review_report.html')}">Open Raw Review Report</a>
         </div>
-        <h2>Students</h2>
+        <div class="section-title"><h2>Students</h2></div>
         <table>
           <thead><tr><th>Roll No</th><th>Name</th><th>Email</th><th>Marks</th><th>Status</th><th>Flags</th><th>Review Notes</th></tr></thead>
           <tbody>{''.join(rows) or '<tr><td colspan="7" class="empty">No students detected</td></tr>'}</tbody>
@@ -1359,9 +2260,7 @@ class SmartOmrUiHandler(BaseHTTPRequestHandler):
         )
         if student_index is None:
             raise ValueError(f"student {roll_no} not found")
-        details_path = _resolve_artifact_path(student_index["details_path"], parse_dir)
-        details = _read_json(details_path)
-        details["details_path"] = str(details_path.resolve())
+        details = _read_json(_resolve_output_path(student_index["details_path"], parse_dir))
         verified = None
         verified_path = parse_dir / "verified_index.json"
         if verified_path.exists():
@@ -1378,24 +2277,11 @@ class SmartOmrUiHandler(BaseHTTPRequestHandler):
         score, total = _score(details)
         status = verified.get("status") if verified else details.get("status")
         display_status = _professor_status(details.get("status"), status if verified else None)
-        details_dir = Path(details["details_path"]).parent
-        current_pages = selected_student_pages(verified) if verified else details.get("pages", [])
-        selection_changed = bool(verified and verified.get("manual_pages"))
-        pdf_path = (verified or {}).get("verified_sheet_pdf_path") if status == "verified" else None
-        pdf_base = parse_dir
-        pdf_label = "Open Verified PDF"
-        if not pdf_path and not selection_changed:
-            pdf_path = details.get("sheet_pdf_path")
-            pdf_base = details_dir
-            pdf_label = "Open Original Parser PDF"
-        pdf_link = (
-            f'<a class="button secondary" href="{_asset_url(pdf_path, pdf_base)}">{pdf_label}</a>'
-            if pdf_path else '<span class="muted">Current PDF pending verification</span>'
-        )
+        details_dir = _resolve_output_path(details.get("details_path"), parse_dir).parent
         pages = []
-        for page in current_pages:
-            page_no = page.get("page", page.get("page_index"))
-            page_base = parse_dir if verified else details_dir
+        for page in details.get("pages", []):
+            page_no = page.get("page_index")
+            page_base = details_dir
             for label, key in (
                 ("Aligned Page", "canonical_image_path"),
                 ("Alignment Overlay", "alignment_overlay_path"),
@@ -1404,7 +2290,7 @@ class SmartOmrUiHandler(BaseHTTPRequestHandler):
                 if page.get(key):
                     pages.append(
                         f"""<figure>
-                          <figcaption>{html.escape(label)} {html.escape(str(page_no))} | Source {html.escape(str(page.get('source_index')))}</figcaption>
+                          <figcaption>{html.escape(label)} {html.escape(str(page_no))}</figcaption>
                           <a href="{_asset_url(page[key], page_base)}" target="_blank"><img class="sheet" src="{_asset_url(page[key], page_base)}" alt="{html.escape(label)}"></a>
                         </figure>"""
                     )
@@ -1446,14 +2332,17 @@ class SmartOmrUiHandler(BaseHTTPRequestHandler):
                 "</tr>"
             )
         flags = details.get("review_flags", [])
-        if selection_changed:
-            answer_rows = ['<tr><td colspan="8">Regrading required: page selection changed after parsing.</td></tr>']
         missing_pages = list((verified or {}).get("missing_pages", []))
+        missing_note = (
+            f'<span class="muted">Missing page(s) {html.escape(", ".join(str(page) for page in missing_pages))}; '
+            "manual check will keep this warning.</span>"
+            if missing_pages
+            else ""
+        )
         verify_action = (
             f'<form method="post" action="/runs/{html.escape(run_id)}/students/{urllib.parse.quote(roll_no)}/verify">'
             '<button type="submit">Mark Manually Checked</button></form>'
-            if not missing_pages
-            else '<span class="muted">Assign every missing page before verification.</span>'
+            f"{missing_note}"
         )
         decision_actions = f"""
         {verify_action}
@@ -1465,34 +2354,88 @@ class SmartOmrUiHandler(BaseHTTPRequestHandler):
         <div class="grid">
           <div class="metric"><span>Name</span><strong>{html.escape(str(student.get('name') or ''))}</strong></div>
           <div class="metric"><span>Email</span><strong>{html.escape(str(student.get('email') or ''))}</strong></div>
-          <div class="metric"><span>Marks</span><strong>{_marks_label(details, verified)}</strong></div>
+          <div class="metric"><span>Marks</span><strong>{_fmt_num(score)} / {_fmt_num(total)}</strong></div>
           <div class="metric"><span>Status</span><strong>{_badge(display_status)}</strong></div>
         </div>
-        <div class="actions band">
-          {decision_actions}
-          <a class="button secondary" href="/runs/{html.escape(run_id)}">Back to Exam</a>
-          {pdf_link}
-          <a class="button secondary" href="/runs/{html.escape(run_id)}/pages">Source Pages</a>
+        <div class="actions band toolbar">
+          <div class="actions">{decision_actions}</div>
+          <div class="actions">
+            <a class="button secondary" href="/runs/{html.escape(run_id)}">Back to Exam</a>
+            <a class="button secondary" href="{_asset_url(details.get('sheet_pdf_path'), details_dir)}">Open Student PDF</a>
+          </div>
         </div>
-        <div class="split">
+        <div class="student-layout">
           <section>
-            <h2>Full Sheet Images</h2>
+            <div class="section-title"><h2>Full Sheet Images</h2></div>
             <div class="pages">{''.join(pages) or '<p class="empty">No page images found</p>'}</div>
+            <div class="section-title"><h2>Answers And Marks</h2></div>
+            <table>
+              <thead><tr><th>Question</th><th>Type</th><th>Student Answer</th><th>Correct Answer</th><th>Marks</th><th>Status</th><th>Confidence</th><th>Notes</th></tr></thead>
+              <tbody>{''.join(answer_rows) or '<tr><td colspan="8" class="empty">No objective answers found</td></tr>'}</tbody>
+            </table>
           </section>
-          <aside>
-            <h2>{'Original Parser Flags' if selection_changed else 'Review Flags'}</h2>
-            <div class="band">{'<br>'.join(html.escape(str(flag)) for flag in flags) if flags else '<span class="muted">No review flags.</span>'}</div>
-            <h2>Source Pages</h2>
-            <table><thead><tr><th>Source</th><th>Page</th><th>Selection</th></tr></thead><tbody>
-            {''.join(f"<tr><td>{html.escape(str(src.get('source_index')))}</td><td>{html.escape(str(src.get('page', src.get('page_index'))))}</td><td>{html.escape(str(src.get('origin', 'parser')))}</td></tr>" for src in current_pages)}
-            </tbody></table>
+          <aside class="side-stack">
+            <section class="band">
+              <h2>Review Flags</h2>
+              <div>{'<br>'.join(html.escape(str(flag)) for flag in flags) if flags else '<span class="muted">No review flags.</span>'}</div>
+            </section>
+            <section class="band">
+              <h2>Review Operations</h2>
+              <div class="operation-grid">
+                <div class="operation">
+                  <h3>Edit Marks</h3>
+                  <form method="post" action="/runs/{html.escape(run_id)}/students/{urllib.parse.quote(roll_no)}/marks">
+                    <div class="form-grid">
+                      <div><label>Marks Obtained</label><input name="marks_obtained" type="number" step="0.01" value="{html.escape(_fmt_num(score))}" required></div>
+                      <div><label>Max Marks</label><input name="max_marks" type="number" step="0.01" value="{html.escape(_fmt_num(total))}"></div>
+                      <div class="wide"><label>Note</label><input name="note" placeholder="Reason for mark edit"></div>
+                    </div>
+                    <p><button type="submit">Save Marks And CSV</button></p>
+                  </form>
+                </div>
+                <div class="operation">
+                  <h3>Correct Roll Mapping</h3>
+                  <form method="post" action="/runs/{html.escape(run_id)}/students/{urllib.parse.quote(roll_no)}/correct-roll">
+                    <div class="form-grid">
+                      <div><label>Correct Roll No</label><input name="correct_roll_no" placeholder="2023118" required></div>
+                      <div><label>Program</label><select name="program"><option value="BTECH">BTECH</option><option value="MTECH">MTECH</option><option value="PHD">PHD</option></select></div>
+                      <div><label>Page</label><input name="page_index" type="number" min="1" value="1" required></div>
+                      <div class="wide"><label>Note</label><input name="note" placeholder="Model read wrong roll"></div>
+                    </div>
+                    <p><button type="submit">Save Training Feedback</button></p>
+                  </form>
+                </div>
+                <div class="operation">
+                  <h3>Replace One Page</h3>
+                  <form method="post" enctype="multipart/form-data" action="/runs/{html.escape(run_id)}/students/{urllib.parse.quote(roll_no)}/replace-page">
+                    <div class="form-grid">
+                      <div><label>Page</label><input name="page_index" type="number" min="1" value="1" required></div>
+                      <div class="wide"><label>Correct Page PDF / Image</label><input name="student_page" type="file" accept=".pdf,.png,.jpg,.jpeg,.tif,.tiff" required></div>
+                      <div class="wide"><label>Note</label><input name="note" placeholder="Replacing this page only"></div>
+                    </div>
+                    <p><button type="submit">Replace Page</button></p>
+                  </form>
+                </div>
+                <div class="operation">
+                  <h3>Replace Full Student Sheet</h3>
+                  <form method="post" enctype="multipart/form-data" action="/runs/{html.escape(run_id)}/students/{urllib.parse.quote(roll_no)}/reupload">
+                    <div class="form-grid">
+                      <div class="wide"><label>Correct Student PDF / Image</label><input name="student_sheet" type="file" accept=".pdf,.png,.jpg,.jpeg,.tif,.tiff" required></div>
+                      <div class="wide"><label>Note</label><input name="note" placeholder="Why this replacement is being uploaded"></div>
+                    </div>
+                    <p><button type="submit">Upload And Re-evaluate</button></p>
+                  </form>
+                </div>
+              </div>
+            </section>
+            <section class="band">
+              <h2>Source Pages</h2>
+              <table><thead><tr><th>Source</th><th>Page</th><th>Used</th></tr></thead><tbody>
+              {''.join(f"<tr><td>{html.escape(str(src.get('source_index')))}</td><td>{html.escape(str(src.get('page_index')))}</td><td>{html.escape(str(src.get('used')))}</td></tr>" for src in details.get('source_pages', []))}
+              </tbody></table>
+            </section>
           </aside>
         </div>
-        <h2>Answers And Marks</h2>
-        <table>
-          <thead><tr><th>Question</th><th>Type</th><th>Student Answer</th><th>Correct Answer</th><th>Marks</th><th>Status</th><th>Confidence</th><th>Notes</th></tr></thead>
-          <tbody>{''.join(answer_rows) or '<tr><td colspan="8" class="empty">No objective answers found</td></tr>'}</tbody>
-        </table>
         """
         self._send_html("Student Detail", body)
 
@@ -1586,16 +2529,16 @@ class SmartOmrUiHandler(BaseHTTPRequestHandler):
         <h1>Review Cases</h1>
         <div class="actions band"><a class="button secondary" href="/runs/{html.escape(run_id)}">Back to Exam</a></div>
         <datalist id="student-rolls">{roll_options}</datalist>
-        <h2>Students Needing Review</h2>
+        <div class="section-title"><h2>Students Needing Review</h2></div>
         <table><thead><tr><th>Roll No</th><th>Marks</th><th>Status</th><th>Missing Pages</th><th>Flags</th><th>Parser Notes</th><th>Latest Decision</th></tr></thead>
         <tbody>{''.join(rows) or '<tr><td colspan="7" class="empty">No student review cases</td></tr>'}</tbody></table>
-        <h2>Unmatched Pages</h2>
+        <div class="section-title"><h2>Unmatched Pages</h2></div>
         <table><thead><tr><th>Source Index</th><th>Detected Page</th><th>Status</th><th>Flags</th><th>Details</th><th>Resolution</th></tr></thead>
         <tbody>{''.join(unmatched_rows) or '<tr><td colspan="6" class="empty">No unmatched pages</td></tr>'}</tbody></table>
-        <h2>Unreadable Pages</h2>
+        <div class="section-title"><h2>Unreadable Pages</h2></div>
         <table><thead><tr><th>Source Index</th><th>Status</th><th>Error</th><th>Notes</th><th>Details</th></tr></thead>
         <tbody>{''.join(page_error_rows) or '<tr><td colspan="5" class="empty">No unreadable pages</td></tr>'}</tbody></table>
-        <h2>Roster Students Without A Detected Sheet</h2>
+        <div class="section-title"><h2>Roster Students Without A Detected Sheet</h2></div>
         <table><thead><tr><th>Roll No</th><th>Name</th><th>Email</th><th>Program</th></tr></thead>
         <tbody>{''.join(missing_roster_rows) or '<tr><td colspan="4" class="empty">Every roster student has a detected sheet</td></tr>'}</tbody></table>
         """
@@ -1697,7 +2640,7 @@ class SmartOmrUiHandler(BaseHTTPRequestHandler):
             </div>
             <section class="band">
               <h2>Send From UI</h2>
-              <p class="muted">Start with Dry Run, then use Test Recipient to redirect one complete test to course staff. Students are contacted only by a confirmed real send.</p>
+              <p class="muted">For testing, enter Test Recipient and optionally Only Roll No. The selected student's complete email is redirected to the test address; without a roll or limit, only one queued email is sent as a test.</p>
               <form method="post" action="/runs/{html.escape(run_id)}/email/send">
                 <div class="grid">
                   <div>
@@ -1740,10 +2683,10 @@ class SmartOmrUiHandler(BaseHTTPRequestHandler):
                   </div>
                   <div>
                     <label>Limit</label>
-                    <input name="limit" placeholder="optional batch limit">
+                    <input name="limit" placeholder="optional; test defaults to 1">
                   </div>
                   <div>
-                    <label>Test Recipient</label>
+                    <label>Test Recipient Override</label>
                     <input name="test_recipient" placeholder="professor@iiitd.ac.in">
                   </div>
                   <div>
@@ -1751,8 +2694,8 @@ class SmartOmrUiHandler(BaseHTTPRequestHandler):
                     <input name="confirm_count" type="number" min="1" placeholder="required for real student send">
                   </div>
                   <div>
-                    <label>Only Roll No</label>
-                    <input name="only_roll" placeholder="optional">
+                    <label>Only Roll No / Test This Student</label>
+                    <input name="only_roll" placeholder="optional roll number">
                   </div>
                   <div>
                     <label>Delay Between Emails (seconds)</label>
@@ -1763,7 +2706,7 @@ class SmartOmrUiHandler(BaseHTTPRequestHandler):
               </form>
               <p class="muted">Latest: {html.escape(json.dumps(last_send) if last_send else 'No send run yet')}</p>
             </section>
-            <h2>Queued Students</h2>
+            <div class="section-title"><h2>Queued Students</h2></div>
             <table>
               <thead><tr><th>Roll No</th><th>Name</th><th>Email</th><th>Release Type</th><th>Marks</th><th>Preview</th></tr></thead>
               <tbody>{rows or '<tr><td colspan="6" class="empty">No queued emails</td></tr>'}</tbody>
@@ -1782,9 +2725,9 @@ class SmartOmrUiHandler(BaseHTTPRequestHandler):
             self._not_found("missing artifact path")
             return
         path = Path(value).resolve()
-        allowed_roots = [self.store.config.data_dir.resolve()]
+        allowed_roots = [Path.cwd().resolve(), (Path.cwd() / "data").resolve()]
         if not any(path == root or root in path.parents for root in allowed_roots):
-            self._not_found("artifact path is outside the configured data directory")
+            self._not_found("artifact path is outside SmartOMR workspace")
             return
         if not path.exists() or not path.is_file():
             self._not_found(f"artifact not found: {path}")
@@ -1804,7 +2747,7 @@ def run_server(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT, data_dir: Pat
     config = UiConfig(data_dir=data_dir)
     SmartOmrUiHandler.store = RunStore(config)
     server = ThreadingHTTPServer((host, port), SmartOmrUiHandler)
-    print(f"SmartOMR UI running at http://{host}:{port}")
+    print(f"SmartOMR Professor UI running at http://{host}:{port}")
     print("Press Ctrl+C to stop.")
     server.serve_forever()
 
