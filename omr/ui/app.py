@@ -238,9 +238,15 @@ def _asset_url(path: str | Path | None, base: Path | None = None) -> str:
     if not path:
         return ""
     p = Path(path)
-    if not p.is_absolute() and base is not None:
+    if not p.is_absolute() and not p.exists() and base is not None:
         p = base / p
     return "/artifact?path=" + urllib.parse.quote(str(p.resolve()), safe="")
+
+
+def _resolve_artifact_path(path: str | Path, base: Path) -> Path:
+    """Accept both legacy workspace-relative paths and current parse-relative paths."""
+    candidate = Path(path)
+    return candidate if candidate.is_absolute() or candidate.exists() else base / candidate
 
 
 def _html_page(title: str, body: str, *, refresh_seconds: int | None = None) -> bytes:
@@ -559,7 +565,7 @@ def _write_marks_csv(run_dir: Path, parse_dir: Path, index: dict[str, Any]) -> P
     marks_path = reports / "marks.csv"
     rows: list[dict[str, Any]] = []
     for student in index.get("students", []):
-        details_path = parse_dir / student["details_path"]
+        details_path = _resolve_artifact_path(student["details_path"], parse_dir)
         details = _read_json(details_path)
         score, total = _score(details)
         rows.append(
@@ -1306,7 +1312,7 @@ class SmartOmrUiHandler(BaseHTTPRequestHandler):
             }
         rows = []
         for student in index.get("students", []):
-            details = _read_json(parse_dir / student["details_path"])
+            details = _read_json(_resolve_artifact_path(student["details_path"], parse_dir))
             score, total = _score(details)
             roll = str(details.get("student", {}).get("roll_no") or student.get("roll_no") or "")
             name = str(details.get("student", {}).get("name") or student.get("student_name") or "")
@@ -1353,8 +1359,9 @@ class SmartOmrUiHandler(BaseHTTPRequestHandler):
         )
         if student_index is None:
             raise ValueError(f"student {roll_no} not found")
-        details = _read_json(parse_dir / student_index["details_path"])
-        details["details_path"] = str((parse_dir / student_index["details_path"]).resolve())
+        details_path = _resolve_artifact_path(student_index["details_path"], parse_dir)
+        details = _read_json(details_path)
+        details["details_path"] = str(details_path.resolve())
         verified = None
         verified_path = parse_dir / "verified_index.json"
         if verified_path.exists():
