@@ -1640,7 +1640,6 @@ def main(argv: list[str] | None = None) -> int:
         answer_key_path = _resolve_answer_key_path(args.exam_id, args.data_dir, args.answer_key)
         ocr_backend = build_roll_ocr_backend(
             args.handwritten_roll_ocr,
-            tesseract_cmd=args.tesseract_cmd,
             digit_model_path=args.digit_model,
         )
         written_ocr_backend = build_written_ocr_backend(

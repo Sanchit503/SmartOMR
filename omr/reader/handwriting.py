@@ -308,18 +308,19 @@ class LocalTesseractRollOcr:
 def build_roll_ocr_backend(
     provider: str | None = None,
     *,
-    tesseract_cmd: str | None = None,
     digit_model_path: str | Path | None = None,
     resnet_model_path: str | Path | None = None,
 ) -> RollOcrBackend | None:
     selected = (provider or "none").strip().lower()
     if selected in {"", "none", "off", "disabled"}:
         return None
-    if selected in {"local", "tesseract", "local-tesseract", "local_tesseract"}:
+    if selected == "local":
         backends: list[RollOcrBackend] = []
         warnings: list[str] = []
-        resnet_path = resnet_model_path or os.environ.get("SMARTOMR_ROLL_RESNET_MODEL") or DEFAULT_RESNET_ROLL_MODEL
-        if Path(resnet_path).is_file():
+        resnet_path = resnet_model_path or os.environ.get("SMARTOMR_ROLL_RESNET_MODEL")
+        if resnet_path is None and digit_model_path is None:
+            resnet_path = DEFAULT_RESNET_ROLL_MODEL
+        if resnet_path and Path(resnet_path).is_file():
             try:
                 backends.append(LocalResnetRollOcr(resnet_path))
             except RuntimeError as exc:
@@ -327,12 +328,11 @@ def build_roll_ocr_backend(
         model_path = digit_model_path or os.environ.get("SMARTOMR_DIGIT_MODEL")
         if model_path:
             backends.append(LocalDigitModelRollOcr(model_path))
-        try:
-            backends.append(LocalTesseractRollOcr(tesseract_cmd=tesseract_cmd))
-        except RuntimeError as exc:
-            warnings.append(str(exc))
-            if not backends:
-                raise
+        if not backends:
+            raise RuntimeError(
+                "No local roll digit model is available. Train or provide the fine-tuned ResNet checkpoint. "
+                "Tesseract is intentionally disabled for roll-number matching."
+            )
         if len(backends) == 1:
             return backends[0]
         return LocalEnsembleRollOcr(backends, warnings=warnings)

@@ -441,9 +441,8 @@ If you need to inspect crops before verification is complete, use `--include-unv
 but those rows are for debugging only and should not become final marks.
 
 Continuation-page handwritten roll reading is local-first. With no OCR provider, the system saves
-the roll crop and sends the page to review. With `--handwritten-roll-ocr local`, it uses offline
-tools only: a trained local digit model when `--digit-model` is supplied, and local Tesseract as
-fallback evidence when installed. No API key is needed:
+the roll crop and sends the page to review. With `--handwritten-roll-ocr local`, it uses only a
+trained local digit model. Tesseract is intentionally not used for roll-number matching.
 
 ```bash
 python -m omr.workflows.batch \
