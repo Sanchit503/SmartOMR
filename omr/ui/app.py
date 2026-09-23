@@ -33,7 +33,7 @@ from omr.contracts import load_manifest
 from omr.generator.config import ExamConfig, NumericalQuestionConfig, WrittenQuestionConfig
 from omr.generator.generate import generate_exam
 from omr.io.csv import load_students
-from omr.reader.handwriting import build_roll_ocr_backend
+from omr.reader.handwriting import DEFAULT_RESNET_ROLL_MODEL, build_roll_ocr_backend
 from omr.ui import inspection
 from omr.ui.inspection_view import inspection_body
 from omr.workflows.email import (
@@ -422,7 +422,7 @@ def _load_roster_rows(path: Path | None) -> dict[str, dict[str, str]]:
 
 def _build_ui_roll_ocr_backend() -> tuple[object | None, dict[str, Any]]:
     try:
-        backend = build_roll_ocr_backend("local")
+        backend = build_roll_ocr_backend("local", resnet_model_path=DEFAULT_RESNET_ROLL_MODEL)
     except RuntimeError as exc:
         return None, {
             "enabled": False,
@@ -432,6 +432,7 @@ def _build_ui_roll_ocr_backend() -> tuple[object | None, dict[str, Any]]:
     return backend, {
         "enabled": backend is not None,
         "provider": getattr(backend, "provider", "local") if backend is not None else "none",
+        "resnet_model": str(DEFAULT_RESNET_ROLL_MODEL) if DEFAULT_RESNET_ROLL_MODEL.is_file() else None,
         "warning": None,
     }
 

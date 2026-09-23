@@ -23,6 +23,9 @@ from omr.grading.mcq import DEFAULT_AMBIGUOUS_FLOOR, DEFAULT_FILL_THRESHOLD, DEF
 from omr.models import HandwrittenRollRead
 
 
+DEFAULT_RESNET_ROLL_MODEL = Path("data/models/roll_digit_resnet_omr_finetuned.pt")
+
+
 @dataclass(frozen=True)
 class RollOcrResult:
     text: str
@@ -85,6 +88,58 @@ class LocalDigitModelRollOcr:
             confidence=prediction.confidence,
             raw={"provider": self.provider, "prediction": prediction.to_json()},
         )
+
+
+class LocalResnetRollOcr:
+    """Roll digit OCR backed by the project's fine-tuned handwritten-cell ResNet."""
+
+    provider = "local_resnet_roll_digit"
+
+    def __init__(self, model_path: str | Path) -> None:
+        try:
+            import torch
+            from omr.datasets.train_roll_digit_resnet import LABELS, SmallRollDigitResNet
+        except ImportError as exc:
+            raise RuntimeError("PyTorch is required to use the fine-tuned roll digit model") from exc
+        self.model_path = Path(model_path)
+        if not self.model_path.is_file():
+            raise FileNotFoundError(f"fine-tuned roll digit model not found: {self.model_path}")
+        payload = torch.load(self.model_path, map_location="cpu")
+        state = payload.get("model_state", payload) if isinstance(payload, dict) else payload
+        self.model = SmallRollDigitResNet(num_classes=len(LABELS))
+        self.model.load_state_dict(state)
+        self.model.eval()
+        self.torch = torch
+        self.labels = LABELS
+
+    def read_roll(self, crop_path: Path, program: str | None = None, valid_rolls: set[str] | None = None) -> RollOcrResult:
+        expected_digits = _expected_digit_count(program)
+        if expected_digits is None:
+            return RollOcrResult("", confidence=0.0, raw={"reason": "program_required_for_resnet"})
+        image = Image.open(crop_path).convert("L")
+        reads = [self.read_digit_image(cell) for cell in _segment_digit_cells(image, expected_digits)]
+        digits = "".join(_first_digit(read.text) or "?" for read in reads)
+        confidence = min((float(read.confidence or 0.0) for read in reads), default=0.0) if "?" not in digits else 0.0
+        return RollOcrResult(
+            _format_roll_digits(program, digits),
+            confidence=confidence,
+            raw={"provider": self.provider, "model_path": str(self.model_path), "cells": [_ocr_result_payload(read) for read in reads]},
+        )
+
+    def read_digit(self, crop_path: Path) -> RollOcrResult:
+        return self.read_digit_image(Image.open(crop_path).convert("L"))
+
+    def read_digit_image(self, image: Image.Image) -> RollOcrResult:
+        image = ImageOps.autocontrast(image)
+        image = ImageOps.pad(image, (64, 64), color=255)
+        array = np.asarray(image, dtype=np.float32) / 255.0
+        tensor = self.torch.from_numpy((1.0 - array - 0.15) / 0.35).unsqueeze(0).unsqueeze(0)
+        with self.torch.no_grad():
+            probabilities = self.torch.softmax(self.model(tensor), dim=1)[0]
+        confidence, index = self.torch.max(probabilities, dim=0)
+        label = self.labels[int(index.item())]
+        digit = "" if label == "blank" else label
+        return RollOcrResult(digit, confidence=float(confidence.item()), raw={"provider": self.provider, "label": label})
 
 
 class LocalEnsembleRollOcr:
@@ -255,6 +310,7 @@ def build_roll_ocr_backend(
     *,
     tesseract_cmd: str | None = None,
     digit_model_path: str | Path | None = None,
+    resnet_model_path: str | Path | None = None,
 ) -> RollOcrBackend | None:
     selected = (provider or "none").strip().lower()
     if selected in {"", "none", "off", "disabled"}:
@@ -262,6 +318,12 @@ def build_roll_ocr_backend(
     if selected in {"local", "tesseract", "local-tesseract", "local_tesseract"}:
         backends: list[RollOcrBackend] = []
         warnings: list[str] = []
+        resnet_path = resnet_model_path or os.environ.get("SMARTOMR_ROLL_RESNET_MODEL") or DEFAULT_RESNET_ROLL_MODEL
+        if Path(resnet_path).is_file():
+            try:
+                backends.append(LocalResnetRollOcr(resnet_path))
+            except RuntimeError as exc:
+                warnings.append(str(exc))
         model_path = digit_model_path or os.environ.get("SMARTOMR_DIGIT_MODEL")
         if model_path:
             backends.append(LocalDigitModelRollOcr(model_path))
