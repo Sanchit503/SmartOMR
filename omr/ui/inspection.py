@@ -207,6 +207,91 @@ def inspect_pages(
     return index
 
 
+def assign_page_index(
+    run_dir: Path,
+    scan_path: Path,
+    manifest_path: Path,
+    *,
+    source_index: int,
+    page_index: int,
+) -> dict:
+    """Realign one source page while using a human-confirmed template slot.
+
+    Corner and orientation evidence are still mandatory. Only the ambiguous
+    page-index bars are overridden, and the page remains explicitly reviewable.
+    """
+    index = load_inventory(run_dir)
+    if (
+        fingerprint(scan_path) != index["source_sha256"]
+        or fingerprint(manifest_path) != index["manifest_sha256"]
+    ):
+        raise ValueError("Run inputs have changed. Create a new run.")
+    if not 1 <= source_index <= len(index["pages"]):
+        raise ValueError("Source page is outside this scan")
+    if not 1 <= page_index <= int(index["template_pages"]):
+        raise ValueError(f"Sheet page must be between 1 and {index['template_pages']}")
+
+    manifest = load_manifest(manifest_path)
+    page_dir = run_dir / "inspection" / f"source_{source_index:04d}" / uuid.uuid4().hex[:8]
+    page_dir.mkdir(parents=True, exist_ok=True)
+    raw = _render_page(scan_path, source_index, index["dpi"])
+    original_path = page_dir / "original.png"
+    Image.fromarray(raw).save(original_path)
+    aligned = align_scan_page(
+        raw,
+        manifest,
+        index["dpi"],
+        source_index=source_index,
+        forced_page_index=page_index,
+    )
+    quality = assess_alignment_quality(aligned.image, manifest, page_index, index["dpi"])
+    aligned_path = page_dir / "aligned.png"
+    Image.fromarray(aligned.image).save(aligned_path)
+    overlay_path = save_alignment_overlay(
+        aligned.image,
+        manifest,
+        page_index,
+        index["dpi"],
+        page_dir / "overlay.png",
+    )
+    report_path = page_dir / "quality.json"
+    quality_payload = quality.to_dict()
+    quality_payload.setdefault("review_flags", []).append(
+        f"template page manually assigned as page {page_index}"
+    )
+    write_json_atomic(report_path, quality_payload)
+    quality_summary = {
+        "status": "needs_review",
+        "score": quality.score,
+        "warnings": quality.warnings,
+        "review_flags": list(quality.review_flags)
+        + [f"template page manually assigned as page {page_index}"],
+        "metrics": {
+            key: {"status": quality.metrics.get(key, {}).get("status")}
+            for key in ("geometry_quality", "local_quality", "image_quality")
+        },
+    }
+    record = index["pages"][source_index - 1]
+    record.update(
+        status="needs_review",
+        page_index=page_index,
+        original=original_path.relative_to(run_dir).as_posix(),
+        aligned=aligned_path.relative_to(run_dir).as_posix(),
+        overlay=overlay_path.relative_to(run_dir).as_posix(),
+        report=report_path.relative_to(run_dir).as_posix(),
+        error=None,
+        alignment_confidence=aligned.alignment_confidence,
+        page_mark_confidence=aligned.page_mark_confidence,
+        quality=quality_summary,
+        page_index_source="manual",
+    )
+    index["status"] = "completed" if all(
+        page["status"] in TERMINAL_STATES for page in index["pages"]
+    ) else index["status"]
+    save_inventory(run_dir, index)
+    return record
+
+
 def inspection_asset(run_dir: Path, source_index: int, kind: str) -> Path | None:
     if kind not in {"original", "aligned", "overlay", "report"}:
         raise ValueError("Unknown page image type")

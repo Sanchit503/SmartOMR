@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 from pathlib import Path
 
@@ -9,6 +10,14 @@ from omr.datasets.train_roll_digit_resnet import TrainConfig, pretrain_kaggle, t
 
 
 DEFAULT_SEEDS = (557, 558, 559, 560, 561, 562, 563)
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def train_ensemble(
@@ -72,9 +81,10 @@ def train_ensemble(
             {
                 "member": index,
                 "seed": seed,
-                "kaggle_pretrained_path": str(kaggle_model),
-                "model_path": str(model_path),
-                "metrics_path": str(model_path.with_suffix(".metrics.json")),
+                "kaggle_pretrained_path": kaggle_model.name,
+                "model_path": model_path.name,
+                "metrics_path": model_path.with_suffix(".metrics.json").name,
+                "checkpoint_sha256": _sha256(model_path),
                 "best_val_accuracy": metrics["best_val_accuracy"],
             }
         )
@@ -88,6 +98,8 @@ def train_ensemble(
                 "kaggle_train_csv": str(kaggle_train_csv),
                 "kaggle_epochs": kaggle_epochs,
                 "kaggle_limit": kaggle_limit,
+                "image_size": 64,
+                "cell_padding_mm": 1.5,
                 "member_count": len(models),
                 "members": models,
                 "aggregation": "validation-weighted probability average",

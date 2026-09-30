@@ -39,6 +39,8 @@ from omr.io.csv import load_answer_key, load_students
 from omr.models import AlignedPage
 from omr.reader.handwriting import build_roll_ocr_backend, save_roll_number_crop_sets
 from omr.reader.scan import align_scan_page, iter_scan_pages
+from omr.ui import inspection
+from omr.ui.inspection_view import inspection_body
 from omr.workflows.email import (
     EMAIL_LOG_CSV,
     EMAIL_QUEUE_CSV,
@@ -61,6 +63,7 @@ from omr.workflows.review import (
     initialize_verification_index,
     load_or_initialize_verified_index,
     reject_student,
+    selected_student_pages,
     verify_student,
 )
 
@@ -98,8 +101,7 @@ def _read_json(path: Path) -> dict[str, Any]:
 
 
 def _write_json(path: Path, payload: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    inspection.write_json_atomic(path, payload)
 
 
 def _rel(path: Path, base: Path) -> str:
@@ -485,10 +487,14 @@ def _badge(value: str | None) -> str:
 def _professor_status(parser_status: str | None, verified_status: str | None = None) -> str:
     if verified_status == "verified":
         return "MANUALLY_CHECKED"
-    if verified_status in {"needs_review", "missing_pages", "rejected"}:
+    if verified_status == "rejected":
+        return "REJECTED"
+    if verified_status == "missing_pages":
+        return "MISSING_PAGES"
+    if verified_status == "needs_review":
         return "NEEDS_REVIEW"
-    if parser_status == "ready":
-        return "AUTO_GRADED"
+    if verified_status == "pending_verification" or parser_status == "ready":
+        return "PENDING_VERIFICATION"
     if parser_status == "needs_review":
         return "NEEDS_REVIEW"
     if parser_status == "error":
@@ -496,7 +502,7 @@ def _professor_status(parser_status: str | None, verified_status: str | None = N
     return str(parser_status or "NEEDS_REVIEW")
 
 
-def _score(student: dict[str, Any]) -> tuple[float, float]:
+def _score(student: dict[str, Any]) -> tuple[float | None, float | None]:
     if student.get("manual_score_override") is not None:
         return float(student.get("manual_score_override") or 0.0), float(
             student.get("manual_total_override") if student.get("manual_total_override") is not None else 0.0
@@ -508,7 +514,27 @@ def _score(student: dict[str, Any]) -> tuple[float, float]:
             score += float(student.get(score_key) or 0.0)
         if student.get(total_key) is not None:
             total += float(student.get(total_key) or 0.0)
-    return score, total
+    has_scores = any(student.get(key) is not None for key in ("mcq_score", "numerical_score"))
+    has_totals = any(student.get(key) is not None for key in ("mcq_total", "numerical_total"))
+    incomplete = any(
+        student.get(f"{kind}_score") is None and student.get(f"{kind}_total")
+        for kind in ("mcq", "numerical")
+    )
+    return score if has_scores and not incomplete else None, total if has_totals else None
+
+
+def _marks_label(details: dict[str, Any], verified: dict[str, Any] | None = None) -> str:
+    if verified and verified.get("manual_pages"):
+        return "Regrading required"
+    if not any(details.get(key) is not None for key in ("mcq_score", "numerical_score")):
+        return "Not graded"
+    if any(
+        details.get(f"{kind}_score") is None and details.get(f"{kind}_total")
+        for kind in ("mcq", "numerical")
+    ):
+        return "Grading incomplete"
+    score, total = _score(details)
+    return f"{_fmt_num(score)} / {_fmt_num(total)}"
 
 
 def _fmt_num(value: float | int | None) -> str:
@@ -565,6 +591,34 @@ def _require_ui_roll_ocr_backend() -> tuple[object, dict[str, Any]]:
             f"{detail} Ensure the roll-digit ensemble manifest and its fine-tuned checkpoints are present, then start the run again."
         )
     return backend, state
+
+
+def _load_inspected_pages(run_dir: Path) -> tuple[dict[int, AlignedPage], dict[int, str]]:
+    """Load the exact alignment artifacts approved by source-page inspection."""
+    index = inspection.load_inventory(run_dir)
+    pages: dict[int, AlignedPage] = {}
+    errors: dict[int, str] = {}
+    for record in index.get("pages", []):
+        source_index = int(record["source_index"])
+        aligned_value = record.get("aligned")
+        page_index = record.get("page_index")
+        if not aligned_value or page_index is None:
+            errors[source_index] = str(record.get("error") or "page did not pass alignment inspection")
+            continue
+        aligned_path = (run_dir / str(aligned_value)).resolve()
+        if not aligned_path.is_relative_to((run_dir / "inspection").resolve()) or not aligned_path.is_file():
+            errors[source_index] = "inspected aligned image is missing or outside this run"
+            continue
+        image = Image.open(aligned_path).convert("L").copy()
+        pages[source_index] = AlignedPage(
+            page_index=int(page_index),
+            source_index=source_index,
+            image=image,
+            alignment_confidence=float(record.get("alignment_confidence") or 0.0),
+            page_mark_confidence=float(record.get("page_mark_confidence") or 0.0),
+            debug_image=image.copy(),
+        )
+    return pages, errors
 
 
 def _xlsx_shared_strings(zf: zipfile.ZipFile) -> list[str]:
@@ -1189,6 +1243,16 @@ class RunStore:
     def __init__(self, config: UiConfig) -> None:
         self.config = config
         self.config.runs_dir.mkdir(parents=True, exist_ok=True)
+        self._state_lock = threading.RLock()
+        self._worker_lock = threading.Lock()
+        self._worker: threading.Thread | None = None
+        for state in self.list_runs():
+            if state.get("status") == "inspecting":
+                self.write_state(
+                    state["run_id"],
+                    status="inspection_interrupted",
+                    stage="Inspection interrupted",
+                )
 
     def run_dir(self, run_id: str) -> Path:
         return self.config.runs_dir / _safe_id(run_id)
@@ -1200,12 +1264,13 @@ class RunStore:
         return _read_json(self.state_path(run_id))
 
     def write_state(self, run_id: str, **updates: Any) -> dict[str, Any]:
-        path = self.state_path(run_id)
-        state = _read_json(path) if path.exists() else {}
-        state.update(updates)
-        state["updated_at"] = _now()
-        _write_json(path, state)
-        return state
+        with self._state_lock:
+            path = self.state_path(run_id)
+            state = _read_json(path) if path.exists() else {}
+            state.update(updates)
+            state["updated_at"] = _now()
+            _write_json(path, state)
+            return state
 
     def list_runs(self) -> list[dict[str, Any]]:
         runs: list[dict[str, Any]] = []
@@ -1218,8 +1283,32 @@ class RunStore:
                     continue
         return runs
 
-    def create_run(self, exam_id: str, files: dict[str, UploadedFile], fields: dict[str, str] | None = None) -> dict[str, Any]:
+    def create_run(
+        self,
+        exam_id: str,
+        files: dict[str, UploadedFile],
+        fields: dict[str, str] | None = None,
+    ) -> dict[str, Any]:
+        with self._worker_lock:
+            return self._create_run(exam_id, files, fields)
+
+    def _create_run(
+        self,
+        exam_id: str,
+        files: dict[str, UploadedFile],
+        fields: dict[str, str] | None = None,
+    ) -> dict[str, Any]:
         fields = fields or {}
+        if self._worker and self._worker.is_alive():
+            raise ValueError("An operation is running. Wait for it to finish before uploading another run.")
+        manifest_upload = files.get("manifest")
+        if not manifest_upload or not manifest_upload.path.is_file():
+            raise ValueError("manifest.json is required")
+        manifest = load_manifest(manifest_upload.path)
+        manifest_exam_id = str(manifest["exam_id"]).strip()
+        if exam_id and exam_id != manifest_exam_id:
+            raise ValueError(f"Exam ID must match the manifest: {manifest_exam_id}")
+        exam_id = exam_id or manifest_exam_id
         run_stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         run_id = _safe_id(f"{exam_id}_{run_stamp}_{uuid.uuid4().hex[:6]}")
         run_dir = self.run_dir(run_id)
@@ -1231,26 +1320,23 @@ class RunStore:
             if not upload.filename or not upload.path.exists() or upload.path.stat().st_size == 0:
                 saved[field] = None
                 continue
-            target = inputs / _safe_id(Path(upload.filename).name)
+            target = inputs / _safe_id(field) / _safe_id(Path(upload.filename).name)
+            target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(upload.path, target)
             saved[field] = str(target)
 
         manifest_path = Path(str(saved.get("manifest") or ""))
-        if not manifest_path.exists():
+        if not manifest_path.is_file():
             raise ValueError("manifest.json is required")
-        folder_value = (fields.get("scan_folder_path") or "").strip().strip('"')
-        folder_path = Path(folder_value) if folder_value else None
-        if folder_path and folder_path.is_dir():
-            scan_path = folder_path
-        else:
-            scan_path = Path(str(saved.get("scan_pdf") or ""))
-        if not scan_path.exists():
-            raise ValueError("upload one scanned OMR PDF/image or provide a valid roll-named PDF/image folder path")
+        scan_path = Path(str(saved.get("scan_pdf") or ""))
+        if not scan_path.is_file():
+            raise ValueError("student OMR PDF/image is required")
 
         manifest = load_manifest(manifest_path)
         manifest_exam_id = str(manifest.get("exam_id") or exam_id).strip()
-        if not exam_id:
-            exam_id = manifest_exam_id
+        if exam_id and exam_id != manifest_exam_id:
+            raise ValueError(f"Exam ID must match the manifest: {manifest_exam_id}")
+        inspection.create_inventory(run_dir, scan_path, manifest_path)
 
         grouping_only = fields.get("grouping_only") == "1"
         answer_key_csv = None
@@ -1271,14 +1357,13 @@ class RunStore:
             "run_id": run_id,
             "exam_id": exam_id or manifest_exam_id,
             "manifest_exam_id": manifest_exam_id,
-            "status": "queued",
-            "stage": "Queued",
+            "status": "inspection_pending",
+            "stage": "Awaiting inspection",
             "created_at": _now(),
             "updated_at": _now(),
             "inputs": {
                 "manifest_path": str(manifest_path),
                 "scan_path": str(scan_path),
-                "filename_roll_mode": bool(folder_path and folder_path.is_dir()),
                 "grouping_only": grouping_only,
                 "answer_key_path": str(answer_key_csv) if answer_key_csv else None,
                 "students_path": str(students_csv) if students_csv else None,
@@ -1294,9 +1379,109 @@ class RunStore:
         _write_json(self.state_path(run_id), state)
         return state
 
-    def start_run(self, run_id: str) -> None:
-        thread = threading.Thread(target=self._run_batch, args=(run_id,), daemon=True)
-        thread.start()
+    def inspection_index(self, run_id: str) -> dict[str, Any]:
+        state = self.read_state(run_id)
+        run_dir = self.run_dir(run_id)
+        with self._state_lock:
+            if not (run_dir / inspection.INDEX_NAME).exists():
+                if self._worker and self._worker.is_alive():
+                    raise ValueError("Wait for the active operation to finish before indexing a legacy run.")
+                inspection.create_inventory(
+                    run_dir,
+                    Path(state["inputs"]["scan_path"]),
+                    Path(state["inputs"]["manifest_path"]),
+                )
+            return inspection.load_inventory(run_dir)
+
+    def start_run(self, run_id: str, *, evaluate: bool = False) -> None:
+        with self._worker_lock:
+            if self._worker and self._worker.is_alive():
+                raise ValueError("Another operation is running. Wait for it to finish before starting this run.")
+            state = self.read_state(run_id)
+            index = self.inspection_index(run_id)
+            inputs = state["inputs"]
+            if (
+                inspection.fingerprint(Path(inputs["scan_path"])) != index["source_sha256"]
+                or inspection.fingerprint(Path(inputs["manifest_path"])) != index["manifest_sha256"]
+            ):
+                raise ValueError("Run inputs have changed. Create a new run.")
+            if evaluate:
+                if state.get("parse_index_path") or (self.run_dir(run_id) / "parsed").exists():
+                    raise ValueError(
+                        "This run already has evaluation artifacts. Create a new run to evaluate again; "
+                        "reviews are preserved."
+                    )
+                if index["status"] != "completed" or not (
+                    index["counts"]["aligned"] + index["counts"]["needs_review"]
+                ):
+                    raise ValueError("Complete page inspection with at least one aligned page before evaluation.")
+            target = self._run_batch if evaluate else self._run_inspection
+            self.write_state(
+                run_id,
+                status="queued" if evaluate else "inspecting",
+                stage="Queued",
+            )
+            self._worker = threading.Thread(target=target, args=(run_id,), daemon=True)
+            self._worker.start()
+
+    def assign_inspection_page(self, run_id: str, source_index: int, page_index: int) -> dict[str, Any]:
+        """Apply a human-confirmed template page number before evaluation."""
+        with self._worker_lock:
+            if self._worker and self._worker.is_alive():
+                raise ValueError("Wait for the active operation to finish before correcting a page.")
+            state = self.read_state(run_id)
+            run_dir = self.run_dir(run_id)
+            if state.get("parse_index_path") or (run_dir / "parsed").exists():
+                raise ValueError("Page numbers cannot be changed after evaluation. Create a new run instead.")
+            inputs = state["inputs"]
+            with self._state_lock:
+                record = inspection.assign_page_index(
+                    run_dir,
+                    Path(inputs["scan_path"]),
+                    Path(inputs["manifest_path"]),
+                    source_index=source_index,
+                    page_index=page_index,
+                )
+                index = inspection.load_inventory(run_dir)
+                self.write_state(
+                    run_id,
+                    status="inspected" if index["status"] == "completed" else "inspection_interrupted",
+                    stage=f"Source page {source_index} assigned as sheet page {page_index}",
+                    error=None,
+                )
+                return record
+
+    def _run_inspection(self, run_id: str) -> None:
+        state = self.read_state(run_id)
+        try:
+            def progress(index: dict[str, Any]) -> None:
+                self.write_state(
+                    run_id,
+                    stage=f"Inspecting pages: {index['processed']}/{index['total']}",
+                )
+
+            inspection.inspect_pages(
+                self.run_dir(run_id),
+                Path(state["inputs"]["scan_path"]),
+                Path(state["inputs"]["manifest_path"]),
+                progress=progress,
+            )
+            self.write_state(
+                run_id,
+                status="completed" if state.get("parse_index_path") else "inspected",
+                stage="Inspection complete",
+                error=None,
+            )
+        except Exception as exc:
+            index = inspection.load_inventory(self.run_dir(run_id))
+            index.update(status="interrupted", error=f"{type(exc).__name__}: {exc}")
+            inspection.save_inventory(self.run_dir(run_id), index)
+            self.write_state(
+                run_id,
+                status="inspection_interrupted",
+                stage="Inspection interrupted",
+                error=index["error"],
+            )
 
     def _run_batch(self, run_id: str) -> None:
         try:
@@ -1307,7 +1492,8 @@ class RunStore:
             self.write_state(run_id, stage="Preparing roll OCR cross-check")
             roll_ocr_backend, roll_ocr_state = _require_ui_roll_ocr_backend()
             self.write_state(run_id, roll_ocr=roll_ocr_state)
-            self.write_state(run_id, stage="Rendering PDF and aligning pages")
+            self.write_state(run_id, stage="Loading inspected aligned pages")
+            prealigned_pages, prealignment_errors = _load_inspected_pages(run_dir)
 
             def update_progress(progress: dict[str, Any]) -> None:
                 phase = str(progress.get("phase") or "")
@@ -1315,7 +1501,7 @@ class RunStore:
                 total = int(progress.get("total") or 0)
                 errors = int(progress.get("errors") or 0)
                 if phase == "reading_pages":
-                    stage = f"Reading and aligning page {processed}/{total}" if total else f"Reading page {processed}"
+                    stage = f"Reading inspected page {processed}/{total}" if total else f"Reading page {processed}"
                 else:
                     stage = f"Writing student bundle {processed}/{total}" if total else "Writing student bundles"
                 if errors:
@@ -1334,16 +1520,12 @@ class RunStore:
                 grouping_mode="auto",
                 ocr_backend=roll_ocr_backend,
                 progress_callback=update_progress,
+                prealigned_pages=prealigned_pages,
+                prealignment_errors=prealignment_errors,
             )
             parse_dir = index_path.parent
             self.write_state(run_id, stage="Preparing review dashboard")
-            initialize_verification_index(
-                parse_dir,
-                force=True,
-                auto_verify_ready=True,
-                reviewer="professor-ui",
-                note="Auto-graded with zero parser flags; automatically marked checked.",
-            )
+            initialize_verification_index(parse_dir, force=True)
             index = _read_json(index_path)
             marks_csv = _write_marks_csv(run_dir, parse_dir, index)
             counts = index.get("status_counts", {})
@@ -1412,10 +1594,31 @@ class SmartOmrUiHandler(BaseHTTPRequestHandler):
                 self._page_generate()
             elif path == "/artifact":
                 self._serve_artifact(query)
+            elif path.startswith("/static/"):
+                self._serve_static(path.removeprefix("/static/"))
             elif path.startswith("/runs/"):
                 parts = [part for part in path.split("/") if part]
                 if len(parts) == 2:
                     self._page_run(parts[1])
+                elif len(parts) == 3 and parts[2] == "pages":
+                    state = self.store.read_state(parts[1])
+                    self.store.inspection_index(parts[1])
+                    self._send_html("Source Pages", inspection_body(state))
+                elif len(parts) == 3 and parts[2] == "inspection.json":
+                    self._inspection_json(parts[1])
+                elif len(parts) == 5 and parts[2] == "pages":
+                    image_path = inspection.inspection_asset(
+                        self.store.run_dir(parts[1]),
+                        int(parts[3]),
+                        parts[4],
+                    )
+                    if image_path and image_path.is_file():
+                        self._send_file(
+                            image_path,
+                            "application/json" if parts[4] == "report" else "image/png",
+                        )
+                    else:
+                        self._not_found("Page image is not available")
                 elif len(parts) == 4 and parts[2] == "students":
                     self._page_student(parts[1], urllib.parse.unquote(parts[3]))
                 elif len(parts) == 3 and parts[2] == "review":
@@ -1426,6 +1629,10 @@ class SmartOmrUiHandler(BaseHTTPRequestHandler):
                     self._not_found()
             else:
                 self._not_found()
+        except FileNotFoundError:
+            self._not_found()
+        except ValueError as exc:
+            self._bad_request(str(exc))
         except Exception as exc:
             body = f"<h1>UI Error</h1><p>{html.escape(str(exc))}</p><pre>{html.escape(traceback.format_exc())}</pre>"
             self._send_html("Error", body, status=HTTPStatus.INTERNAL_SERVER_ERROR)
@@ -1440,7 +1647,12 @@ class SmartOmrUiHandler(BaseHTTPRequestHandler):
                 self._generate_omr()
             elif path.startswith("/runs/"):
                 parts = [part for part in path.split("/") if part]
-                if len(parts) == 5 and parts[2] == "students" and parts[4] in {"verify", "hold", "reject"}:
+                if len(parts) == 3 and parts[2] in {"inspect", "evaluate"}:
+                    self.store.start_run(parts[1], evaluate=parts[2] == "evaluate")
+                    self._redirect(f"/runs/{parts[1]}/pages")
+                elif len(parts) == 5 and parts[2] == "pages" and parts[4] == "page-index":
+                    self._assign_page_index(parts[1], int(parts[3]))
+                elif len(parts) == 5 and parts[2] == "students" and parts[4] in {"verify", "hold", "reject"}:
                     self._student_decision(parts[1], urllib.parse.unquote(parts[3]), parts[4])
                 elif len(parts) == 5 and parts[2] == "students" and parts[4] == "marks":
                     self._update_student_marks(parts[1], urllib.parse.unquote(parts[3]))
@@ -1476,8 +1688,63 @@ class SmartOmrUiHandler(BaseHTTPRequestHandler):
             state = self.store.create_run(exam_id, files, fields)
         finally:
             shutil.rmtree(staging_dir, ignore_errors=True)
-        self.store.start_run(state["run_id"])
-        self._redirect(f"/runs/{state['run_id']}")
+        self._redirect(f"/runs/{state['run_id']}/pages")
+
+    def _send_file(self, path: Path, content_type: str) -> None:
+        self.send_response(HTTPStatus.OK.value)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(path.stat().st_size))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.end_headers()
+        with path.open("rb") as handle:
+            shutil.copyfileobj(handle, self.wfile)
+
+    def _serve_static(self, relative: str) -> None:
+        root = Path(__file__).parent / "static"
+        path = (root / relative).resolve()
+        if not path.is_relative_to(root.resolve()) or not path.is_file():
+            self._not_found()
+            return
+        self._send_file(path, mimetypes.guess_type(str(path))[0] or "application/octet-stream")
+
+    def _inspection_json(self, run_id: str) -> None:
+        state = self.store.read_state(run_id)
+        index = self.store.inspection_index(run_id)
+        index["run_status"] = state["status"]
+        index["stage"] = state.get("stage")
+        index["run_error"] = state.get("error")
+        index["evaluated"] = bool(state.get("parse_index_path"))
+        index["can_evaluate"] = (
+            not index["evaluated"]
+            and state["status"] not in {"queued", "running", "inspecting"}
+            and index["status"] == "completed"
+            and bool(index["counts"]["aligned"] + index["counts"]["needs_review"])
+            and not (self.store.run_dir(run_id) / "parsed").exists()
+        )
+        index["can_inspect"] = (
+            state["status"] not in {"queued", "running", "inspecting"}
+            and (index["status"] != "completed" or bool(index["counts"]["failed"]))
+        )
+        payload = json.dumps(index).encode("utf-8")
+        self.send_response(HTTPStatus.OK.value)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def _assign_page_index(self, run_id: str, source_index: int) -> None:
+        form = self._urlencoded_form()
+        raw_page_index = (form.get("page_index") or "").strip()
+        if not raw_page_index:
+            raise ValueError("Sheet page number is required")
+        try:
+            page_index = int(raw_page_index)
+        except ValueError as exc:
+            raise ValueError("Sheet page number must be a whole number") from exc
+        self.store.assign_inspection_page(run_id, source_index, page_index)
+        self._redirect(f"/runs/{run_id}/pages?page={source_index}")
 
     def _student_decision(self, run_id: str, roll_no: str, action: str) -> None:
         state = self.store.read_state(run_id)
@@ -2093,11 +2360,7 @@ class SmartOmrUiHandler(BaseHTTPRequestHandler):
             </div>
             <div>
               <label>Scanned filled OMR PDF / image</label>
-              <input type="file" name="scan_pdf" accept=".pdf,.png,.jpg,.jpeg,.tif,.tiff">
-            </div>
-            <div>
-              <label>Roll-named PDF/image folder on this computer</label>
-              <input name="scan_folder_path" placeholder="C:\\IIIT Delhi\\BTP\\SmartOMR\\data\\manual_uploads\\CSE557_QUIZ1_2026\\student_pdfs">
+              <input type="file" name="scan_pdf" required accept=".pdf,.png,.jpg,.jpeg,.tif,.tiff">
             </div>
             <div>
               <label>Manifest JSON</label>
@@ -2123,8 +2386,8 @@ class SmartOmrUiHandler(BaseHTTPRequestHandler):
             <div id="answer-key-summary" class="muted">Waiting for manifest.json...</div>
             <div id="answer-key-table"></div>
           </section>
-          <p class="muted">Upload one bundle PDF/image, or enter a folder containing roll-named PDF/image files. Folder mode groups sheets by filename. Uploaded answer key CSV/XLSX takes priority over the table above.</p>
-          <button type="submit">Start Evaluation</button>
+          <p class="muted">Upload the complete scanner PDF or one image. Every source page is inventoried and inspected before OCR or grouping starts. Uploaded answer key CSV/XLSX takes priority over the table above.</p>
+          <button type="submit">Create Inspection</button>
         </form>
         <script>
         const manifestInput = document.getElementById("manifest-file");
@@ -2200,6 +2463,14 @@ class SmartOmrUiHandler(BaseHTTPRequestHandler):
 
     def _page_run(self, run_id: str) -> None:
         state = self.store.read_state(run_id)
+        if state.get("status") in {
+            "inspection_pending",
+            "inspecting",
+            "inspected",
+            "inspection_interrupted",
+        }:
+            self._redirect(f"/runs/{run_id}/pages")
+            return
         refresh = 3 if state.get("status") in {"queued", "running"} else None
         summary = state.get("summary") or {}
         roster_summary = state.get("roster_summary") or {}
@@ -2235,12 +2506,12 @@ class SmartOmrUiHandler(BaseHTTPRequestHandler):
 
         parse_dir = Path(str(state["parse_dir"]))
         index = _read_json(Path(str(state["parse_index_path"])))
-        verified_by_roll: dict[str, str] = {}
+        verified_by_roll: dict[str, dict[str, Any]] = {}
         verified_path = parse_dir / "verified_index.json"
         if verified_path.exists():
             verified_index = _read_json(verified_path)
             verified_by_roll = {
-                str(student.get("roll_no")): str(student.get("status"))
+                str(student.get("roll_no")): student
                 for student in verified_index.get("students", [])
             }
         rows = []
@@ -2256,8 +2527,8 @@ class SmartOmrUiHandler(BaseHTTPRequestHandler):
                 f"<td><a href=\"/runs/{html.escape(run_id)}/students/{urllib.parse.quote(roll)}\">{html.escape(roll)}</a></td>"
                 f"<td>{html.escape(name)}</td>"
                 f"<td>{html.escape(email)}</td>"
-                f"<td>{_fmt_num(score)} / {_fmt_num(total)}</td>"
-                f"<td>{_badge(_professor_status(details.get('status'), verified_by_roll.get(roll)))}</td>"
+                f"<td>{_marks_label(details, verified_by_roll.get(roll))}</td>"
+                f"<td>{_badge(_professor_status(details.get('status'), verified_by_roll.get(roll, {}).get('status')))}</td>"
                 f"<td>{len(flags)}</td>"
                 f"<td class=\"flags\">{html.escape(' | '.join(str(flag) for flag in flags[:3]))}</td>"
                 "</tr>"
@@ -2269,6 +2540,7 @@ class SmartOmrUiHandler(BaseHTTPRequestHandler):
         <div class="grid">{metric_html}</div>
         {roll_ocr_warning}
         <div class="actions band">
+          <a class="button secondary" href="/runs/{html.escape(run_id)}/pages">Inspect Source Pages</a>
           <a class="button" href="{marks_link}">Download Marks CSV</a>
           <a class="button secondary" href="{review_link}">Review Cases</a>
           <a class="button secondary" href="/runs/{html.escape(run_id)}/email">Email Release</a>
@@ -2310,10 +2582,12 @@ class SmartOmrUiHandler(BaseHTTPRequestHandler):
         status = verified.get("status") if verified else details.get("status")
         display_status = _professor_status(details.get("status"), status if verified else None)
         details_dir = _resolve_output_path(details.get("details_path"), parse_dir).parent
+        selection_changed = bool(verified and verified.get("manual_pages"))
+        current_pages = selected_student_pages(verified) if verified else list(details.get("pages", []))
         pages = []
-        for page in details.get("pages", []):
-            page_no = page.get("page_index")
-            page_base = details_dir
+        for page in current_pages:
+            page_no = page.get("page", page.get("page_index"))
+            page_base = parse_dir if verified else details_dir
             for label, key in (
                 ("Aligned Page", "canonical_image_path"),
                 ("Alignment Overlay", "alignment_overlay_path"),
@@ -2381,19 +2655,39 @@ class SmartOmrUiHandler(BaseHTTPRequestHandler):
         <form method="post" action="/runs/{html.escape(run_id)}/students/{urllib.parse.quote(roll_no)}/hold"><button class="secondary" type="submit">Keep Needs Review</button></form>
         <form method="post" action="/runs/{html.escape(run_id)}/students/{urllib.parse.quote(roll_no)}/reject"><button class="secondary" type="submit">Reject Grouping</button></form>
         """
+        if verified and verified.get("status") == "verified" and verified.get("verified_sheet_pdf_path"):
+            pdf_link = (
+                f'<a class="button secondary" href="{_asset_url(verified["verified_sheet_pdf_path"], parse_dir)}">'
+                "Open Verified PDF</a>"
+            )
+        elif selection_changed:
+            pdf_link = '<span class="muted">Current PDF pending verification</span>'
+        else:
+            pdf_link = (
+                f'<a class="button secondary" href="{_asset_url(details.get("sheet_pdf_path"), details_dir)}">'
+                "Open Student PDF</a>"
+            )
+        source_rows = "".join(
+            "<tr>"
+            f"<td>Source {html.escape(str(page.get('source_index') or ''))}</td>"
+            f"<td>{html.escape(str(page.get('page', page.get('page_index')) or ''))}</td>"
+            f"<td>{html.escape(str(page.get('origin') or 'parser'))}</td>"
+            "</tr>"
+            for page in current_pages
+        )
         body = f"""
         <h1>Student {html.escape(str(student.get('roll_no') or roll_no))}</h1>
         <div class="grid">
           <div class="metric"><span>Name</span><strong>{html.escape(str(student.get('name') or ''))}</strong></div>
           <div class="metric"><span>Email</span><strong>{html.escape(str(student.get('email') or ''))}</strong></div>
-          <div class="metric"><span>Marks</span><strong>{_fmt_num(score)} / {_fmt_num(total)}</strong></div>
+          <div class="metric"><span>Marks</span><strong>{_marks_label(details, verified)}</strong></div>
           <div class="metric"><span>Status</span><strong>{_badge(display_status)}</strong></div>
         </div>
         <div class="actions band toolbar">
           <div class="actions">{decision_actions}</div>
           <div class="actions">
             <a class="button secondary" href="/runs/{html.escape(run_id)}">Back to Exam</a>
-            <a class="button secondary" href="{_asset_url(details.get('sheet_pdf_path'), details_dir)}">Open Student PDF</a>
+            {pdf_link}
           </div>
         </div>
         <div class="student-layout">
@@ -2410,6 +2704,11 @@ class SmartOmrUiHandler(BaseHTTPRequestHandler):
             <section class="band">
               <h2>Review Flags</h2>
               <div>{'<br>'.join(html.escape(str(flag)) for flag in flags) if flags else '<span class="muted">No review flags.</span>'}</div>
+            </section>
+            <section class="band">
+              <h2>Current Source Pages</h2>
+              <table><thead><tr><th>Source</th><th>Sheet Page</th><th>Selection</th></tr></thead>
+              <tbody>{source_rows or '<tr><td colspan="3">No selected pages</td></tr>'}</tbody></table>
             </section>
             <section class="band">
               <h2>Review Operations</h2>
@@ -2757,7 +3056,7 @@ class SmartOmrUiHandler(BaseHTTPRequestHandler):
             self._not_found("missing artifact path")
             return
         path = Path(value).resolve()
-        allowed_roots = [Path.cwd().resolve(), (Path.cwd() / "data").resolve()]
+        allowed_roots = [self.store.config.data_dir.resolve()]
         if not any(path == root or root in path.parents for root in allowed_roots):
             self._not_found("artifact path is outside SmartOMR workspace")
             return

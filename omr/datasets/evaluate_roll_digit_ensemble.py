@@ -57,7 +57,8 @@ def _selective_accuracy(rows: list[dict[str, object]]) -> list[dict[str, float |
             accepted = [
                 row
                 for row in rows
-                if float(row["top_probability"]) >= min_probability and float(row["probability_margin"]) >= min_margin
+                if float(row["decision_confidence"]) >= min_probability
+                and float(row["probability_margin"]) >= min_margin
             ]
             correct = sum(row["expected"] == row["predicted"] for row in accepted)
             report.append(
@@ -125,6 +126,7 @@ def evaluate(
                 "expected": expected,
                 "predicted": predicted,
                 "correct": expected == predicted,
+                "decision_confidence": float(prediction.confidence or 0.0),
                 "top_probability": _safe_float(raw.get("top_probability")) or float(prediction.confidence or 0.0),
                 "runner_up_probability": _safe_float(raw.get("runner_up_probability")) or 0.0,
                 "probability_margin": _safe_float(raw.get("probability_margin")) or 0.0,

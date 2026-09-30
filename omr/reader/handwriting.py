@@ -181,7 +181,14 @@ class LocalResnetProbabilityEnsembleRollOcr:
             if not isinstance(member, dict):
                 raise ValueError(f"invalid member in ensemble manifest: {self.manifest_path}")
             model_path = _resolve_ensemble_model_path(self.manifest_path, member.get("model_path"))
+            actual_hash = _file_sha256(model_path)
+            expected_hash = str(member.get("checkpoint_sha256") or "")
+            if expected_hash and actual_hash != expected_hash:
+                raise ValueError(f"roll-digit checkpoint hash mismatch: {model_path}")
             payload = torch.load(model_path, map_location="cpu")
+            checkpoint_labels = payload.get("labels") if isinstance(payload, dict) else None
+            if checkpoint_labels is not None and list(checkpoint_labels) != list(LABELS):
+                raise ValueError(f"roll-digit checkpoint labels do not match runtime labels: {model_path}")
             state = payload.get("model_state", payload) if isinstance(payload, dict) else payload
             model = SmallRollDigitResNet(num_classes=len(LABELS))
             model.load_state_dict(state)
@@ -196,7 +203,7 @@ class LocalResnetProbabilityEnsembleRollOcr:
                     "seed": member.get("seed"),
                     "best_val_accuracy": accuracy,
                     "checkpoint_path": str(model_path),
-                    "checkpoint_sha256": _file_sha256(model_path),
+                    "checkpoint_sha256": actual_hash,
                 }
             )
         if not any(weights):
@@ -600,7 +607,7 @@ def save_roll_number_crop_sets(
     output_dir: str | Path,
     dpi: float,
     padding_mm: float = 1.5,
-    cell_padding_mm: float = 0.5,
+    cell_padding_mm: float = 1.5,
 ) -> tuple[dict[str, str], dict[str, list[str]]]:
     """Save whole roll strips and exact per-cell crops from manifest geometry."""
     output_dir = Path(output_dir)
@@ -733,7 +740,7 @@ def _read_write_in_roll_number(
         crop_path = Path(crop_paths[program])
         cell_result = _read_roll_from_cells(ocr_backend, [Path(path) for path in cell_crop_paths.get(program, [])], program)
         cell_normalized = normalize_handwritten_roll_text(cell_result.text, program=program)
-        trusted_cells = bool(cell_normalized) and (valid_rolls is None or cell_normalized in valid_rolls)
+        trusted_cells = bool(cell_normalized)
         if getattr(ocr_backend, "fast_cell_first", False) and trusted_cells:
             strip_result = RollOcrResult(
                 "",
@@ -771,25 +778,6 @@ def _read_write_in_roll_number(
             review_flags=review_flags,
         )
 
-    if valid_rolls is not None:
-        roster_candidates = [candidate for candidate in candidates if normalize_handwritten_roll_text(candidate[1]) in valid_rolls]
-        if roster_candidates:
-            candidates = roster_candidates
-        else:
-            review_flags.append("handwritten roll OCR produced no roll number present in the roster")
-            return HandwrittenRollRead(
-                page_index=page_index,
-                program=selected_program,
-                roll_no=None,
-                confidence="low",
-                provider=provider,
-                raw_text=_joined_raw_text(ocr_results),
-                crop_paths=crop_paths,
-                cell_crop_paths=cell_crop_paths,
-                ocr_results=ocr_results,
-                review_flags=review_flags,
-            )
-
     unique_rolls = sorted({roll for _program, roll, _confidence, _text, _source in candidates})
     if len(unique_rolls) > 1:
         review_flags.append(f"handwritten roll OCR produced conflicting candidates: {', '.join(unique_rolls)}")
@@ -816,6 +804,9 @@ def _read_write_in_roll_number(
         )
 
     confidence = _roll_confidence(confidence_value, review_flags)
+    if valid_rolls is not None and roll_no not in valid_rolls:
+        review_flags.append(f"handwritten roll OCR read {roll_no}, which is not present in the roster")
+        confidence = "low"
     if source == "strip":
         confidence = "medium" if confidence == "high" else confidence
         review_flags.append("handwritten roll was read from whole-strip OCR without full cell confirmation")
@@ -874,7 +865,9 @@ def _read_roll_from_cells(
     if "?" in digits:
         return RollOcrResult(digits, confidence=0.0, raw={"cells": cell_payloads})
     text = _format_roll_digits(program, digits)
-    confidence = float(np.median(confidences)) if confidences else 0.62
+    # One wrong digit changes the entire student identity. Roll confidence is
+    # bounded by the weakest cell instead of being hidden by the median.
+    confidence = min(confidences) if confidences else 0.0
     return RollOcrResult(text, confidence=confidence, raw={"cells": cell_payloads})
 
 

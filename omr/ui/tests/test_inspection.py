@@ -8,6 +8,7 @@ import threading
 import time
 from types import SimpleNamespace
 import urllib.error
+import urllib.parse
 import urllib.request
 
 import numpy as np
@@ -59,6 +60,16 @@ def server(store):
 
 def get(url):
     with urllib.request.urlopen(url, timeout=10) as response:
+        return response.read(), response.headers
+
+
+def post(url, fields):
+    request = urllib.request.Request(
+        url,
+        data=urllib.parse.urlencode(fields).encode("utf-8"),
+        method="POST",
+    )
+    with urllib.request.urlopen(request, timeout=10) as response:
         return response.read(), response.headers
 
 
@@ -257,6 +268,43 @@ def test_http_inventory_assets_and_error_routes(tmp_path, generated, monkeypatch
         with pytest.raises(urllib.error.HTTPError) as error:
             get(url + "/static/../app.py")
         assert error.value.code == 404
+
+
+def test_manual_page_index_assignment_realigns_and_is_audited(tmp_path, generated, monkeypatch):
+    store = RunStore(UiConfig(tmp_path / "data"))
+    state = create(store, generated)
+    fake_pipeline(monkeypatch)
+    forced_calls = []
+
+    def align(image, manifest, dpi, source_index, forced_page_index=None):
+        forced_calls.append((source_index, forced_page_index))
+        selected = forced_page_index or 1
+        return SimpleNamespace(
+            image=image,
+            page_index=selected,
+            alignment_confidence=.91,
+            page_mark_confidence=.22,
+        )
+
+    monkeypatch.setattr(inspection, "align_scan_page", align)
+    with server(store) as url:
+        base = f"{url}/runs/{state['run_id']}"
+        body, _ = post(base + "/pages/1/page-index", {"page_index": "2"})
+        assert b"Correct sheet page" in body
+
+    assert forced_calls == [(1, 2)]
+    index = store.inspection_index(state["run_id"])
+    record = index["pages"][0]
+    assert record["status"] == "needs_review"
+    assert record["page_index"] == 2
+    assert record["page_index_source"] == "manual"
+    assert "manually assigned as page 2" in " ".join(record["quality"]["review_flags"])
+    report = inspection.read_json(store.run_dir(state["run_id"]) / record["report"])
+    assert "manually assigned as page 2" in " ".join(report["review_flags"])
+
+    (store.run_dir(state["run_id"]) / "parsed").mkdir()
+    with pytest.raises(ValueError, match="cannot be changed after evaluation"):
+        store.assign_inspection_page(state["run_id"], 1, 1)
 
 
 def test_student_view_uses_current_manual_selection_and_verified_pdf(tmp_path):

@@ -103,7 +103,14 @@ def ink_density(gray: np.ndarray, cx_px: int, cy_px: int, radius_px: int) -> flo
     return float((255.0 - pixels.astype(np.float32)).mean()) / 255.0
 
 
-def enhanced_student_mark_fill_ratio(gray: np.ndarray, cx_px: int, cy_px: int, radius_px: int) -> float:
+def enhanced_student_mark_fill_ratio(
+    gray: np.ndarray,
+    cx_px: int,
+    cy_px: int,
+    radius_px: int,
+    *,
+    enhanced_gray: np.ndarray | None = None,
+) -> float:
     """Faint-pencil retry ratio using darkness relative to nearby paper.
 
     A faint mark may be grey rather than black, so a fixed intensity cutoff
@@ -111,9 +118,7 @@ def enhanced_student_mark_fill_ratio(gray: np.ndarray, cx_px: int, cy_px: int, r
     contrast amount. The core-and-full rule remains in place to reject the
     printed bubble outline. This is a review-only recovery signal.
     """
-    from omr.reader.enhancement import enhance_faint_ink
-
-    enhanced = enhance_faint_ink(gray)
+    enhanced = enhance_faint_marks_page(gray) if enhanced_gray is None else enhanced_gray
     h, w = enhanced.shape[:2]
     outer = max(radius_px + 2, round(radius_px * 1.8))
     x0, x1 = max(0, cx_px - outer), min(w, cx_px + outer + 1)
@@ -134,3 +139,10 @@ def enhanced_student_mark_fill_ratio(gray: np.ndarray, cx_px: int, cy_px: int, r
     full = float((full_pixels < threshold).sum()) / full_pixels.size
     core = float((core_pixels < threshold).sum()) / core_pixels.size
     return min(full, core)
+
+
+def enhance_faint_marks_page(gray: np.ndarray) -> np.ndarray:
+    """Create one reusable faint-mark diagnostic image for an aligned page."""
+    from omr.reader.enhancement import enhance_faint_ink
+
+    return enhance_faint_ink(gray)

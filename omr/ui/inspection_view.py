@@ -96,6 +96,15 @@ def inspection_body(state: dict) -> str:
           </dl>
           <h3>Observations</h3>
           <ul id="observations" class="observations"><li>Inspection pending</li></ul>
+          <form id="page-index-form" class="page-index-form" method="post" hidden>
+            <h3>Correct sheet page</h3>
+            <p>Use this only after visually checking the page. Corner and orientation alignment will run again.</p>
+            <div>
+              <label for="manual-page-index">Sheet page</label>
+              <input id="manual-page-index" name="page_index" type="number" min="1" required>
+              <button class="secondary" type="submit">Apply</button>
+            </div>
+          </form>
           <a id="quality-report" class="quiet-command" target="_blank" rel="noopener" hidden>{_icon('file-text')}Quality report</a>
           <div class="source-metadata"><h3>Source record</h3><dl class="evidence-list"><div><dt>File</dt><dd id="file-name">-</dd></div><div><dt>Resolution</dt><dd id="render-dpi">-</dd></div></dl><details><summary>Input fingerprints</summary><label>Scan SHA-256</label><code id="source-hash"></code><label>Manifest SHA-256</label><code id="manifest-hash"></code></details></div>
         </aside>

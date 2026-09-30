@@ -93,6 +93,9 @@ def _record(source_index: int, page_index: int, roll_no: str, confidence: str) -
 
 def test_exact_cross_page_roll_pair_is_recovered_only_with_roster_match():
     page_one = _record(11, 1, "2023011", "medium")
+    page_one.identity_payload = {
+        "write_in_roll_read": {"roll_no": "2023011", "confidence": "medium"}
+    }
     page_two = _record(47, 2, "2023011", "medium")
 
     grouped, unmatched = _reconcile_exact_cross_page_roll_pairs(
@@ -116,6 +119,106 @@ def test_exact_cross_page_roll_pair_is_recovered_only_with_roster_match():
         valid_rolls={"2023999"},
     )
     assert {record.source_index for record in unmatched} == {11, 47}
+
+
+def test_exact_cross_page_recovery_supports_all_unique_continuation_slots():
+    page_one = _record(11, 1, "2023011", "medium")
+    page_one.identity_payload = {
+        "write_in_roll_read": {"roll_no": "2023011", "confidence": "medium"}
+    }
+    page_two = _record(47, 2, "2023011", "medium")
+    page_three = _record(9, 3, "2023011", "medium")
+
+    grouped, unmatched = _reconcile_exact_cross_page_roll_pairs(
+        [page_two, page_one, page_three],
+        {},
+        [page_two, page_one, page_three],
+        page_one_index=1,
+        valid_rolls={"2023011"},
+    )
+
+    assert unmatched == []
+    assert {
+        (record.source_index, record.aligned_page.page_index)
+        for record in grouped["2023011"]
+    } == {(11, 1), (47, 2), (9, 3)}
+
+
+def test_exact_cross_page_recovery_refuses_duplicate_continuation_claims():
+    page_one = _record(11, 1, "2023011", "medium")
+    page_one.identity_payload = {
+        "write_in_roll_read": {"roll_no": "2023011", "confidence": "medium"}
+    }
+    first_page_two = _record(47, 2, "2023011", "medium")
+    second_page_two = _record(48, 2, "2023011", "medium")
+
+    grouped, unmatched = _reconcile_exact_cross_page_roll_pairs(
+        [page_one, first_page_two, second_page_two],
+        {},
+        [page_one, first_page_two, second_page_two],
+        page_one_index=1,
+        valid_rolls={"2023011"},
+    )
+
+    assert grouped == {}
+    assert {record.source_index for record in unmatched} == {11, 47, 48}
+
+
+def test_identity_grouping_refuses_continuation_program_mismatch():
+    page_one = _record(11, 1, "2023011", "high")
+    page_one.identity_payload = {
+        "write_in_roll_read": {"roll_no": "2023011", "confidence": "high"}
+    }
+    page_two = _record(47, 2, "2023011", "high")
+    page_two.program = "MTECH"
+
+    grouped, unmatched = _group_records_by_identity(
+        [page_two, page_one],
+        "high",
+        valid_rolls={"2023011"},
+    )
+
+    assert [record.source_index for record in grouped["2023011"]] == [11]
+    assert unmatched == [page_two]
+    assert any("does not match" in flag for flag in page_two.review_flags)
+
+
+def test_batch_consumes_inspected_alignment_without_realigning(tmp_path: Path, monkeypatch):
+    result = generate_exam(
+        ExamConfig(
+            exam_id="PREALIGNED_TEST",
+            course_code="CSE202",
+            exam_name="Quiz",
+            exam_type="quiz",
+            num_mcq=1,
+        ),
+        tmp_path / "exam",
+    )
+    page = _render_pages(result["pdf_path"])[1]
+    inspected = AlignedPage(
+        page_index=1,
+        source_index=1,
+        image=page,
+        alignment_confidence=0.91,
+        page_mark_confidence=0.87,
+    )
+
+    monkeypatch.setattr(
+        "omr.workflows.batch.align_scan_page",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("must not realign")),
+    )
+    _students, index_path = parse_exam_bundle(
+        result["pdf_path"],
+        result["manifest_path"],
+        output_root=tmp_path / "parsed",
+        dpi=DPI,
+        prealigned_pages={1: inspected},
+        prealignment_errors={},
+    )
+
+    index = json.loads(index_path.read_text(encoding="utf-8"))
+    assert index["status_counts"]["page_errors"] == 0
+    assert index["status_counts"]["unmatched_pages"] == 1
 
 
 def test_clear_inferred_program_roll_creates_reviewable_page_one_group():

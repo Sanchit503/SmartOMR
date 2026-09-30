@@ -293,6 +293,7 @@ def _group_records_by_identity(
     unmatched: list[_PageRecord] = []
 
     verified_anchor_rolls: set[str] = set()
+    verified_anchor_programs: dict[str, str | None] = {}
     ordered = sorted(records, key=lambda item: item.source_index)
     for record in ordered:
         if record.aligned_page.page_index != page_one_index:
@@ -304,6 +305,7 @@ def _group_records_by_identity(
             grouped.setdefault(record.roll_no, []).append(record)
             if _page_one_write_in_matches_bubbles(record):
                 verified_anchor_rolls.add(record.roll_no)
+                verified_anchor_programs[record.roll_no] = record.program
         else:
             unmatched.append(record)
 
@@ -320,6 +322,14 @@ def _group_records_by_identity(
             )
             unmatched.append(record)
             continue
+        anchor_program = verified_anchor_programs.get(record.roll_no)
+        if not anchor_program or record.program != anchor_program:
+            record.review_flags.append(
+                f"continuation page program {record.program or 'unreadable'} does not match "
+                f"the verified page-1 program {anchor_program or 'unreadable'}"
+            )
+            unmatched.append(record)
+            continue
         grouped.setdefault(record.roll_no, []).append(record)
     return grouped, unmatched
 
@@ -332,7 +342,13 @@ def _reconcile_exact_cross_page_roll_pairs(
     page_one_index: int,
     valid_rolls: set[str] | None,
 ) -> tuple[dict[str, list[_PageRecord]], list[_PageRecord]]:
-    """Recover pages only from exact independent roll evidence, never source order."""
+    """Recover medium-confidence continuations from independently verified anchors.
+
+    This is deliberately a second-chance path for pages that missed the configured
+    grouping threshold.  It must not manufacture an anchor from one OCR channel or
+    resolve duplicate claims.  Page 1 therefore needs exact bubble/write-in
+    agreement, and every recovered continuation slot must be unique for that roll.
+    """
     page_one_by_source = {
         record.source_index: record
         for record in records
@@ -346,6 +362,13 @@ def _reconcile_exact_cross_page_roll_pairs(
         page_one_by_roll[record.roll_no] = record
 
     unmatched_by_source = {record.source_index: record for record in unmatched}
+    continuation_slot_counts: dict[tuple[str, int], int] = {}
+    for record in unmatched:
+        if record.aligned_page.page_index == page_one_index or not record.roll_no:
+            continue
+        slot = (record.roll_no, record.aligned_page.page_index)
+        continuation_slot_counts[slot] = continuation_slot_counts.get(slot, 0) + 1
+
     recovered_sources: set[int] = set()
     for continuation in sorted(unmatched, key=lambda item: item.source_index):
         if continuation.aligned_page.page_index == page_one_index or not continuation.roll_no:
@@ -354,11 +377,17 @@ def _reconcile_exact_cross_page_roll_pairs(
         if (
             anchor is None
             or not anchor.roll_no
+            or anchor.identity_kind != "bubbled"
+            or not _page_one_write_in_matches_bubbles(anchor)
             or not _strong_enough(anchor.confidence, "medium")
             or not _strong_enough(continuation.confidence, "medium")
             or page_one_roll_counts.get(anchor.roll_no) != 1
             or (valid_rolls is not None and anchor.roll_no not in valid_rolls)
-            or anchor.source_index in recovered_sources
+            or continuation_slot_counts.get(
+                (continuation.roll_no, continuation.aligned_page.page_index)
+            ) != 1
+            or not anchor.program
+            or continuation.program != anchor.program
             or continuation.source_index in recovered_sources
         ):
             continue
@@ -1476,6 +1505,8 @@ def parse_exam_bundle(
     grouping_mode: str = "auto",
     written_ocr_backend: WrittenOcrBackend | None = None,
     progress_callback: Callable[[dict[str, Any]], None] | None = None,
+    prealigned_pages: dict[int, AlignedPage] | None = None,
+    prealignment_errors: dict[int, str] | None = None,
 ) -> tuple[list[dict[str, Any]], Path]:
     if min_group_confidence not in CONFIDENCE_RANK:
         raise ValueError(f"unknown minimum group confidence: {min_group_confidence}")
@@ -1497,53 +1528,57 @@ def parse_exam_bundle(
     page_errors: list[dict[str, Any]] = []
 
     scan_files = _scan_files(Path(scans_path))
-    total_source_pages = _scan_page_count(scan_files)
-    source_counter = 0
-    for scan_path in scan_files:
-        for raw_page in iter_scan_pages(scan_path, dpi):
-            source_counter += 1
-            identity_dir = root / "_page_identity" / f"source_{source_counter:04d}"
-            identity_dir.mkdir(parents=True, exist_ok=True)
-            try:
-                aligned = _load_aligned_page(identity_dir)
+    prealignment_errors = prealignment_errors or {}
+    if prealigned_pages is not None:
+        source_indices = set(prealigned_pages) | set(prealignment_errors)
+        if not source_indices:
+            raise ValueError("the inspected page inventory is empty")
+        total_source_pages = max(source_indices)
+        expected_indices = set(range(1, total_source_pages + 1))
+        if source_indices != expected_indices:
+            missing = sorted(expected_indices - source_indices)
+            raise ValueError(f"the inspected page inventory is incomplete; missing source page(s): {missing}")
+        source_pages = (
+            (scan_files[0], source_index, None)
+            for source_index in range(1, total_source_pages + 1)
+        )
+    else:
+        total_source_pages = _scan_page_count(scan_files)
+
+        def raw_source_pages():
+            source_index = 0
+            for scan_path in scan_files:
+                for raw_page in iter_scan_pages(scan_path, dpi):
+                    source_index += 1
+                    yield scan_path, source_index, raw_page
+
+        source_pages = raw_source_pages()
+
+    for scan_path, source_counter, raw_page in source_pages:
+        identity_dir = root / "_page_identity" / f"source_{source_counter:04d}"
+        identity_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            if prealigned_pages is not None:
+                if source_counter in prealignment_errors:
+                    raise ValueError(prealignment_errors[source_counter])
+                aligned = prealigned_pages.get(source_counter)
                 if aligned is None:
-                    aligned = align_scan_page(raw_page, manifest, dpi, source_index=source_counter)
-                    _save_aligned_page(aligned, identity_dir)
+                    raise ValueError("inspection produced no aligned image for this source page")
+            else:
+                assert raw_page is not None
+                aligned = align_scan_page(raw_page, manifest, dpi, source_index=source_counter)
+            _save_aligned_page(aligned, identity_dir)
 
-                identity_kind, roll_no, program, confidence, identity_payload, flags = _page_identity(
-
-                    aligned,
-                    manifest,
-                    dpi,
-                    identity_dir,
-                    ocr_backend,
-                    valid_rolls,
-                )
-            except Exception as exc:
-                page_errors.append(_write_page_error(root, scan_path, source_counter, exc))
-                if progress_callback is not None:
-                    progress_callback(
-                        {
-                            "phase": "reading_pages",
-                            "processed": source_counter,
-                            "total": total_source_pages,
-                            "errors": len(page_errors),
-                        }
-                    )
-                continue
-
-            record = _PageRecord(
-                source_path=scan_path,
-                source_index=source_counter,
-                aligned_page=aligned,
-                identity_kind=identity_kind,
-                roll_no=roll_no,
-                program=program,
-                confidence=confidence,
-                identity_payload=identity_payload,
-                review_flags=flags,
+            identity_kind, roll_no, program, confidence, identity_payload, flags = _page_identity(
+                aligned,
+                manifest,
+                dpi,
+                identity_dir,
+                ocr_backend,
+                valid_rolls,
             )
-            page_records_for_bundle.append(record)
+        except Exception as exc:
+            page_errors.append(_write_page_error(root, scan_path, source_counter, exc))
             if progress_callback is not None:
                 progress_callback(
                     {
@@ -1553,6 +1588,29 @@ def parse_exam_bundle(
                         "errors": len(page_errors),
                     }
                 )
+            continue
+
+        record = _PageRecord(
+            source_path=scan_path,
+            source_index=source_counter,
+            aligned_page=aligned,
+            identity_kind=identity_kind,
+            roll_no=roll_no,
+            program=program,
+            confidence=confidence,
+            identity_payload=identity_payload,
+            review_flags=flags,
+        )
+        page_records_for_bundle.append(record)
+        if progress_callback is not None:
+            progress_callback(
+                {
+                    "phase": "reading_pages",
+                    "processed": source_counter,
+                    "total": total_source_pages,
+                    "errors": len(page_errors),
+                }
+            )
 
     applied_grouping_mode = "identity" if grouping_mode == "auto" else grouping_mode
     identity_grouped, identity_unmatched = _group_records_by_identity(

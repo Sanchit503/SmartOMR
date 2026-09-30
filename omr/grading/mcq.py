@@ -30,7 +30,12 @@ import numpy as np
 
 from ..contracts.geometry import mm_to_px, px_per_mm
 from ..local_registration import fit_candidate_local_transform, fit_ordered_local_transform
-from .bubbles import enhanced_student_mark_fill_ratio, ink_density, student_mark_fill_ratio
+from .bubbles import (
+    enhance_faint_marks_page,
+    enhanced_student_mark_fill_ratio,
+    ink_density,
+    student_mark_fill_ratio,
+)
 
 # Above this, a bubble counts as deliberately filled.
 DEFAULT_FILL_THRESHOLD = 0.5
@@ -463,6 +468,7 @@ def read_mcq_responses(
         for page, entries in entries_by_page.items()
         if page in gray_by_page
     }
+    enhanced_by_page: dict[int, np.ndarray] = {}
 
     for entry in manifest["mcq_block"]:
         page = entry.get("page", 1)
@@ -483,9 +489,18 @@ def read_mcq_responses(
         # contrast image never changes a grade by itself: uniform scan haze
         # can otherwise look exactly like a faint filled bubble.
         if max(ratios.values(), default=0.0) < fill_threshold:
+            if page not in enhanced_by_page:
+                enhanced_by_page[page] = enhance_faint_marks_page(image)
+            enhanced_image = enhanced_by_page[page]
             for opt in entry["options"]:
                 cx, cy = calibrated_centers[(entry["q_no"], opt)]
-                enhanced[opt] = enhanced_student_mark_fill_ratio(image, cx, cy, radius_px)
+                enhanced[opt] = enhanced_student_mark_fill_ratio(
+                    image,
+                    cx,
+                    cy,
+                    radius_px,
+                    enhanced_gray=enhanced_image,
+                )
 
         outcome, selected, confidence, needs_review, reason = _assess(
             ratios, inks, fill_threshold, ambiguous_floor, min_margin, ink_floor

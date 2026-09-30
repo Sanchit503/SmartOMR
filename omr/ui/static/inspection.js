@@ -80,7 +80,8 @@
     text("page-status", names[page.status]);
     byId("page-status").className = `state-label ${page.status}`;
     text("source-number", `${selected} / ${inventory.total}`);
-    text("template-number", page.page_index ? `${page.page_index} / ${inventory.template_pages}` : "Not detected");
+    const pageIndexLabel = page.page_index ? `${page.page_index} / ${inventory.template_pages}` : "Not detected";
+    text("template-number", page.page_index_source === "manual" ? `${pageIndexLabel} (manual)` : pageIndexLabel);
     text("alignment-score", score(page.alignment_confidence));
     text("page-code-score", score(page.page_mark_confidence));
     text("quality-score", score(quality.score));
@@ -97,6 +98,15 @@
     }));
     byId("quality-report").hidden = !page.report;
     if (page.report) byId("quality-report").href = `${base}/pages/${selected}/report`;
+    const pageIndexForm = byId("page-index-form");
+    const pageIndexInput = byId("manual-page-index");
+    pageIndexForm.action = `${base}/pages/${selected}/page-index`;
+    pageIndexForm.hidden = inventory.evaluated || ["queued", "running", "inspecting"].includes(inventory.run_status);
+    pageIndexInput.max = inventory.template_pages;
+    if (pageIndexForm.dataset.source !== String(selected)) {
+      pageIndexForm.dataset.source = String(selected);
+      pageIndexInput.value = page.page_index || "";
+    }
     for (const button of root.querySelectorAll("[data-view]")) {
       button.disabled = !page[button.dataset.view];
       button.setAttribute("aria-pressed", String(button.dataset.view === view));

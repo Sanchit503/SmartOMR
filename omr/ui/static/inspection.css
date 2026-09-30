@@ -86,6 +86,13 @@ main:has(#inspection) { max-width: none; padding: 0; }
 .evidence-panel h3 { font-size: 12px; font-weight: 600; margin: 20px 0 12px; }
 .observations { margin: 0; padding-left: 14px; color: #6d756f; font-size: 11px; line-height: 1.6; overflow-wrap: anywhere; }
 .observations li { margin-bottom: 9px; }
+.page-index-form { margin: 20px 0 4px; padding: 14px 0; border-top: 1px solid #e5eae6; border-bottom: 1px solid #e5eae6; }
+#inspection .page-index-form h3 { margin: 0 0 7px; }
+.page-index-form p { margin: 0 0 11px; color: #707975; font-size: 11px; line-height: 1.45; }
+.page-index-form > div { display: grid; grid-template-columns: minmax(0, 1fr) 58px auto; gap: 7px; align-items: center; }
+.page-index-form label { color: #59645f; font-size: 11px; }
+#inspection #manual-page-index { width: 58px; padding: 5px; text-align: center; }
+#inspection .page-index-form button { min-height: 36px; padding: 6px 10px; }
 .source-metadata { margin-top: 26px; border-top: 1px solid #e5eae6; }
 .source-metadata details { font-size: 11px; color: #7a837d; }
 .source-metadata summary { cursor: pointer; }

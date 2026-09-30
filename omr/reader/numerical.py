@@ -6,7 +6,12 @@ from dataclasses import dataclass
 import numpy as np
 
 from omr.contracts.geometry import digit_grid_centers_mm, mm_to_px, px_per_mm
-from omr.grading.bubbles import enhanced_student_mark_fill_ratio, ink_density, student_mark_fill_ratio
+from omr.grading.bubbles import (
+    enhance_faint_marks_page,
+    enhanced_student_mark_fill_ratio,
+    ink_density,
+    student_mark_fill_ratio,
+)
 from omr.grading.mcq import (
     DEFAULT_AMBIGUOUS_FLOOR,
     DEFAULT_FILL_THRESHOLD,
@@ -48,6 +53,7 @@ def read_numerical_responses(
 ) -> list[NumericalReading]:
     radius = max(1, round(manifest["bubble_sample_radius_mm"] * px_per_mm(dpi)))
     results = []
+    enhanced_by_page: dict[int, np.ndarray] = {}
     for entry in manifest.get("numerical_block", []):
         page = entry["page"]
         if page not in images_by_page:
@@ -68,9 +74,18 @@ def read_numerical_responses(
             # Enhanced measurements are diagnostics only. They cannot turn a
             # blank into a scored digit without original-scan evidence.
             if max(ratios.values(), default=0.0) < DEFAULT_FILL_THRESHOLD:
+                if page not in enhanced_by_page:
+                    enhanced_by_page[page] = enhance_faint_marks_page(gray)
+                enhanced_image = enhanced_by_page[page]
                 for digit in range(10):
                     cx, cy = centers[(column, digit)]
-                    enhanced[str(digit)] = enhanced_student_mark_fill_ratio(gray, cx, cy, radius)
+                    enhanced[str(digit)] = enhanced_student_mark_fill_ratio(
+                        gray,
+                        cx,
+                        cy,
+                        radius,
+                        enhanced_gray=enhanced_image,
+                    )
             outcome, selected, confidence, review, reason = _assess(
                 ratios, inks, DEFAULT_FILL_THRESHOLD, DEFAULT_AMBIGUOUS_FLOOR,
                 DEFAULT_MIN_MARGIN, DEFAULT_INK_FLOOR,
@@ -100,51 +115,16 @@ def read_numerical_responses(
         elif all(value == MCQOutcome.BLANK.value for value in outcomes):
             outcome = "blank"
         elif MCQOutcome.BLANK.value in outcomes:
-            first_answered = next((index for index, value in enumerate(outcomes) if value == MCQOutcome.ANSWERED.value), None)
-            last_answered = next(
-                (index for index in range(len(outcomes) - 1, -1, -1) if outcomes[index] == MCQOutcome.ANSWERED.value),
-                None,
-            )
-            contiguous_written_digits = (
-                first_answered is not None
-                and last_answered is not None
-                and all(value == MCQOutcome.ANSWERED.value for value in outcomes[first_answered : last_answered + 1])
-                and all(value == MCQOutcome.BLANK.value for value in outcomes[:first_answered])
-                and all(value == MCQOutcome.BLANK.value for value in outcomes[last_answered + 1 :])
-            )
-            if contiguous_written_digits:
-                for index, value in enumerate(outcomes):
-                    if value != MCQOutcome.BLANK.value:
-                        continue
-                    columns[index]["selected_digit"] = "0"
-                    columns[index]["inferred_zero_place_value"] = True
-                flags.append(
-                    f"omitted leading/trailing zero place-values were inferred around the contiguous written number"
-                )
-                outcome = "answered"
-            else:
-                outcome = "incomplete"
-                flags.append(f"some place-value {position_name}s are blank; fill every {position_name} including leading zeros")
+            outcome = "incomplete"
+            flags.append(f"some place-value {position_name}s are blank; fill every {position_name} including leading zeros")
         elif flags and not all(value == MCQOutcome.ANSWERED.value for value in outcomes):
             outcome = "ambiguous"
         else:
             outcome = "answered"
         text = "".join(column["selected_digit"] for column in columns) if outcome == "answered" else None
-        # Keep the displayed grid value (for example ``400``) but compare the
-        # submitted contiguous digits when zero places were inferred. Thus a
-        # student entering ``3`` for a two-place answer is graded as 3, not 30.
-        value_text = (
-            "".join(
-                column["selected_digit"]
-                for column in columns
-                if not column.get("inferred_zero_place_value")
-            )
-            if text is not None
-            else None
-        )
         results.append(NumericalReading(
             q_no=entry["q_no"], page=page, outcome=outcome,
-            digits_text=text, value=int(value_text) if value_text else None,
+            digits_text=text, value=int(text) if text is not None else None,
             confidence="low" if flags else "high", needs_human_review=bool(flags),
             review_flags=flags, columns=columns,
         ))

@@ -940,7 +940,17 @@ def detect_page_index(gray: np.ndarray, manifest: dict, dpi: float) -> tuple[int
     return top_index, max(0.0, top_score - runner_up), scores
 
 
-def align_scan_page(gray: np.ndarray, manifest: dict, dpi: float, source_index: int = 1) -> AlignedPage:
+def align_scan_page(
+    gray: np.ndarray,
+    manifest: dict,
+    dpi: float,
+    source_index: int = 1,
+    forced_page_index: int | None = None,
+) -> AlignedPage:
+    if forced_page_index is not None and not 1 <= forced_page_index <= int(manifest["num_pages"]):
+        raise ValueError(
+            f"forced page index must be between 1 and {manifest['num_pages']}: {forced_page_index}"
+        )
     original = _as_image_array(gray)
     gray_raw = _as_gray_array(original)
     gray_detection = _denoise_for_detection(gray_raw)
@@ -964,7 +974,14 @@ def align_scan_page(gray: np.ndarray, manifest: dict, dpi: float, source_index: 
                 dpi,
             )
             canonical_gray = _as_gray_array(canonical)
-            page_index, page_confidence, _scores = detect_page_index(canonical_gray, manifest, dpi)
+            if forced_page_index is None:
+                page_index, page_confidence, _scores = detect_page_index(canonical_gray, manifest, dpi)
+            else:
+                page_index = forced_page_index
+                scores = _page_index_bar_scores(canonical_gray, manifest, dpi)
+                selected_score = scores.get(page_index, 0.0)
+                runner_up = max((score for index, score in scores.items() if index != page_index), default=0.0)
+                page_confidence = max(0.0, selected_score - runner_up)
             confidence = min(source.source_confidence, marker_confidence, orientation_confidence)
             aligned_page = AlignedPage(
                 page_index=page_index,

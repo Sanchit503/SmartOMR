@@ -185,7 +185,7 @@ def test_sp_roll_can_be_read_from_whole_strip_when_in_roster(tmp_path: Path):
     assert any("whole-strip OCR" in flag for flag in result.review_flags)
 
 
-def test_handwritten_roll_not_in_roster_is_rejected(tmp_path: Path):
+def test_handwritten_roll_not_in_roster_is_preserved_for_review(tmp_path: Path):
     manifest, page = _sheet(tmp_path)
     draw = ImageDraw.Draw(page)
     _fill_continuation_program(draw, manifest, "BTECH")
@@ -200,6 +200,6 @@ def test_handwritten_roll_not_in_roster_is_rejected(tmp_path: Path):
         valid_rolls={"2024587"},
     )
 
-    assert result.roll_no is None
+    assert result.roll_no == "9999999"
     assert result.confidence == "low"
     assert any("roster" in flag for flag in result.review_flags)
