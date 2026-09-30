@@ -162,6 +162,7 @@
       byId("identity-preview-form").hidden = !inventory.can_identity_preview;
       byId("identity-preview-form").querySelector("button").textContent = inventory.identity_preview?.status === "completed" ? "Refresh Roll Preview" : "Preview Roll Detection";
       byId("evaluate-form").hidden = !inventory.can_evaluate;
+      byId("re-evaluate-form").hidden = !inventory.can_re_evaluate;
       byId("review-link").hidden = !inventory.evaluated;
       alertText("run-error", inventory.run_error || inventory.error);
       alertText("connection-error", "");

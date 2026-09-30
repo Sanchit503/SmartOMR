@@ -1437,13 +1437,44 @@ class RunStore:
                 raise ValueError("Another operation is running. Wait for it to finish before starting this run.")
             state = self.read_state(run_id)
             index = self.inspection_index(run_id)
-            if state.get("parse_index_path"):
-                raise ValueError("Evaluation already exists for this run; create a new run for a new identity preview.")
             if index["status"] != "completed":
                 raise ValueError("Complete page inspection before previewing roll detection.")
             self.write_state(run_id, status="identity_previewing", stage="Preparing roll detection preview", error=None)
             self._worker = threading.Thread(target=self._run_identity_preview, args=(run_id,), daemon=True)
             self._worker.start()
+
+    def restart_evaluation(self, run_id: str) -> None:
+        """Archive prior evaluation output and reuse immutable inspection artifacts."""
+        with self._worker_lock:
+            if self._worker and self._worker.is_alive():
+                raise ValueError("Another operation is running. Wait for it to finish before re-running evaluation.")
+            state = self.read_state(run_id)
+            run_dir = self.run_dir(run_id)
+            parsed_root = run_dir / "parsed"
+            if not state.get("parse_index_path") or not parsed_root.is_dir():
+                raise ValueError("There is no completed evaluation to re-run.")
+            preview_path = Path(str(state.get("identity_preview_path") or ""))
+            if not preview_path.is_file():
+                raise ValueError("Refresh the roll detection preview before re-running evaluation.")
+            archive_root = run_dir / "history"
+            archive_root.mkdir(parents=True, exist_ok=True)
+            archive_name = "parsed_" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+            archive_path = archive_root / archive_name
+            if archive_path.exists():
+                raise ValueError("A previous evaluation archive already uses this timestamp; try again.")
+            shutil.move(str(parsed_root), str(archive_path))
+            self.write_state(
+                run_id,
+                status="identity_previewed",
+                stage="Previous evaluation archived; ready to re-run grouping",
+                parse_dir=None,
+                parse_index_path=None,
+                marks_csv_path=None,
+                summary=None,
+                previous_evaluation_path=str(archive_path),
+                error=None,
+            )
+        self.start_run(run_id, evaluate=True)
 
     def assign_inspection_page(self, run_id: str, source_index: int, page_index: int) -> dict[str, Any]:
         """Apply a human-confirmed template page number before evaluation."""
@@ -1558,10 +1589,11 @@ class RunStore:
             }
             preview_path = preview_root / "index.json"
             _write_json(preview_path, preview)
+            existing_evaluation = bool(state.get("parse_index_path"))
             self.write_state(
                 run_id,
-                status="identity_previewed",
-                stage="Roll detection preview complete",
+                status="completed" if existing_evaluation else "identity_previewed",
+                stage="Roll detection preview refreshed; existing evaluation retained" if existing_evaluation else "Roll detection preview complete",
                 identity_preview_path=str(preview_path),
                 error=None,
             )
@@ -1744,6 +1776,9 @@ class SmartOmrUiHandler(BaseHTTPRequestHandler):
                 elif len(parts) == 3 and parts[2] == "identity-preview":
                     self.store.start_identity_preview(parts[1])
                     self._redirect(f"/runs/{parts[1]}/pages")
+                elif len(parts) == 3 and parts[2] == "re-evaluate":
+                    self.store.restart_evaluation(parts[1])
+                    self._redirect(f"/runs/{parts[1]}/pages")
                 elif len(parts) == 5 and parts[2] == "pages" and parts[4] == "page-index":
                     self._assign_page_index(parts[1], int(parts[3]))
                 elif len(parts) == 5 and parts[2] == "students" and parts[4] in {"verify", "hold", "reject"}:
@@ -1824,8 +1859,7 @@ class SmartOmrUiHandler(BaseHTTPRequestHandler):
         index["evaluated"] = bool(state.get("parse_index_path"))
         index["identity_preview"] = preview
         index["can_identity_preview"] = (
-            not index["evaluated"]
-            and state["status"] not in {"queued", "running", "inspecting", "identity_previewing"}
+            state["status"] not in {"queued", "running", "inspecting", "identity_previewing"}
             and index["status"] == "completed"
             and bool(index["counts"]["aligned"] + index["counts"]["needs_review"])
         )
@@ -1835,6 +1869,12 @@ class SmartOmrUiHandler(BaseHTTPRequestHandler):
             and index["status"] == "completed"
             and bool(index["counts"]["aligned"] + index["counts"]["needs_review"])
             and not (self.store.run_dir(run_id) / "parsed").exists()
+            and preview is not None
+            and preview.get("status") == "completed"
+        )
+        index["can_re_evaluate"] = (
+            index["evaluated"]
+            and state["status"] == "completed"
             and preview is not None
             and preview.get("status") == "completed"
         )
