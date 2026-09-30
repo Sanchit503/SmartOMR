@@ -30,7 +30,7 @@ import numpy as np
 
 from ..contracts.geometry import mm_to_px, px_per_mm
 from ..local_registration import fit_candidate_local_transform, fit_ordered_local_transform
-from .bubbles import ink_density, student_mark_fill_ratio
+from .bubbles import enhanced_student_mark_fill_ratio, ink_density, student_mark_fill_ratio
 
 # Above this, a bubble counts as deliberately filled.
 DEFAULT_FILL_THRESHOLD = 0.5
@@ -293,6 +293,7 @@ class MCQReading:
     selected_option: str | None
     fill_ratios: dict[str, float]
     ink_densities: dict[str, float] = field(default_factory=dict)
+    enhanced_fill_ratios: dict[str, float] = field(default_factory=dict)
     confidence: Confidence = Confidence.HIGH
     needs_human_review: bool = False
     review_reason: str | None = None
@@ -406,6 +407,35 @@ def _assess(
     return MCQOutcome.BLANK, None, Confidence.HIGH, False, None
 
 
+def faint_provisional_option(
+    ratios: dict[str, float],
+    inks: dict[str, float],
+    enhanced_ratios: dict[str, float],
+    fill_threshold: float = DEFAULT_FILL_THRESHOLD,
+    min_margin: float = DEFAULT_MIN_MARGIN,
+    ink_floor: float = DEFAULT_INK_FLOOR,
+) -> str | None:
+    """Return one defensible faint-mark choice, otherwise abstain.
+
+    The enhanced view is compared against local white paper, but is never
+    trusted alone. The same option must also contain more original-scan ink
+    than its neighbouring blank bubbles. This rejects uniform grey haze.
+    """
+    if not enhanced_ratios:
+        return None
+    ranked = sorted(enhanced_ratios, key=lambda option: enhanced_ratios[option], reverse=True)
+    if not ranked:
+        return None
+    selected = ranked[0]
+    runner_up = enhanced_ratios[ranked[1]] if len(ranked) > 1 else 0.0
+    if enhanced_ratios[selected] < fill_threshold or enhanced_ratios[selected] - runner_up < min_margin:
+        return None
+    baseline = float(np.median([ink for option, ink in inks.items() if option != selected])) if len(inks) > 1 else 0.0
+    if inks.get(selected, 0.0) < ink_floor or inks.get(selected, 0.0) - baseline < DEFAULT_INK_EXCESS_FLOOR:
+        return None
+    return selected
+
+
 def read_mcq_responses(
     images_by_page: dict[int, np.ndarray],
     manifest: dict,
@@ -443,14 +473,33 @@ def read_mcq_responses(
 
         ratios: dict[str, float] = {}
         inks: dict[str, float] = {}
+        enhanced: dict[str, float] = {}
         for i, opt in enumerate(entry["options"]):
             cx, cy = calibrated_centers[(entry["q_no"], opt)]
             ratios[opt] = student_mark_fill_ratio(image, cx, cy, radius_px)
             inks[opt] = ink_density(image, cx, cy, radius_px)
 
+        # Preserve raw evidence and record a contrast-retry diagnostic. A
+        # contrast image never changes a grade by itself: uniform scan haze
+        # can otherwise look exactly like a faint filled bubble.
+        if max(ratios.values(), default=0.0) < fill_threshold:
+            for opt in entry["options"]:
+                cx, cy = calibrated_centers[(entry["q_no"], opt)]
+                enhanced[opt] = enhanced_student_mark_fill_ratio(image, cx, cy, radius_px)
+
         outcome, selected, confidence, needs_review, reason = _assess(
             ratios, inks, fill_threshold, ambiguous_floor, min_margin, ink_floor
         )
+        provisional = None
+        if outcome == MCQOutcome.BLANK and needs_review:
+            provisional = faint_provisional_option(ratios, inks, enhanced, fill_threshold, min_margin, ink_floor)
+        if provisional is not None:
+            outcome = MCQOutcome.ANSWERED
+            selected = provisional
+            confidence = Confidence.LOW
+            needs_review = True
+            note = "faint-pencil response provisionally selected from local white-paper contrast; verify against original scan"
+            reason = f"{reason}; {note}" if reason else note
         readings.append(
             MCQReading(
                 q_no=entry["q_no"],
@@ -458,6 +507,7 @@ def read_mcq_responses(
                 selected_option=selected,
                 fill_ratios=ratios,
                 ink_densities=inks,
+                enhanced_fill_ratios=enhanced,
                 confidence=confidence,
                 needs_human_review=needs_review,
                 review_reason=reason,

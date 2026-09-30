@@ -10,9 +10,15 @@ from PIL import Image, ImageDraw
 from omr.contracts.geometry import mm_to_px, px_per_mm
 from omr.generator.config import ExamConfig, WrittenQuestionConfig
 from omr.generator.generate import generate_exam
-from omr.models import Student
+from omr.models import AlignedPage, Student
 from omr.reader.handwriting import RollOcrResult
-from omr.workflows.batch import _reconcile_roster, parse_exam_bundle
+from omr.workflows.batch import (
+    _PageRecord,
+    _group_records_by_identity,
+    _reconcile_exact_cross_page_roll_pairs,
+    _reconcile_roster,
+    parse_exam_bundle,
+)
 
 
 DPI = 200
@@ -69,6 +75,73 @@ class SourceAwareFakeOcr:
     def read_digit(self, crop_path: Path) -> RollOcrResult:
         cell_index = int(crop_path.stem.rsplit("_", 1)[-1]) - 1
         return RollOcrResult(self._roll(crop_path)[cell_index], confidence=0.95)
+
+
+def _record(source_index: int, page_index: int, roll_no: str, confidence: str) -> _PageRecord:
+    return _PageRecord(
+        source_path=Path("bundle.pdf"),
+        source_index=source_index,
+        aligned_page=AlignedPage(page_index, source_index, Image.new("L", (8, 8), 255), 1.0, 1.0),
+        identity_kind="bubbled" if page_index == 1 else "handwritten",
+        roll_no=roll_no,
+        program="BTECH",
+        confidence=confidence,
+        identity_payload={},
+        review_flags=[],
+    )
+
+
+def test_exact_cross_page_roll_pair_is_recovered_only_with_roster_match():
+    page_one = _record(11, 1, "2023011", "medium")
+    page_two = _record(47, 2, "2023011", "medium")
+
+    grouped, unmatched = _reconcile_exact_cross_page_roll_pairs(
+        [page_one, page_two],
+        {},
+        [page_one, page_two],
+        page_one_index=1,
+        valid_rolls={"2023011"},
+    )
+
+    assert unmatched == []
+    assert [record.source_index for record in grouped["2023011"]] == [11, 47]
+    assert grouped["2023011"][1].identity_kind == "exact_cross_page_roll"
+    assert "source order was not used" in grouped["2023011"][1].review_flags[0]
+
+    _, unmatched = _reconcile_exact_cross_page_roll_pairs(
+        [page_one, page_two],
+        {},
+        [page_one, page_two],
+        page_one_index=1,
+        valid_rolls={"2023999"},
+    )
+    assert {record.source_index for record in unmatched} == {11, 47}
+
+
+def test_clear_inferred_program_roll_creates_reviewable_page_one_group():
+    page_one = _record(11, 1, "2023011", "low")
+    page_one.identity_payload = {
+        "review_flags": [
+            "program selector is blank",
+            "program inferred as BTECH from completed digit grid",
+        ]
+    }
+
+    grouped, unmatched = _group_records_by_identity(
+        [page_one],
+        "high",
+        valid_rolls={"2023011"},
+    )
+    assert list(grouped) == ["2023011"]
+    assert unmatched == []
+
+    grouped, unmatched = _group_records_by_identity(
+        [page_one],
+        "high",
+        valid_rolls={"2023999"},
+    )
+    assert grouped == {}
+    assert unmatched == [page_one]
 
 
 def test_roster_reconciliation_exposes_missing_and_unexpected_rolls():

@@ -9,6 +9,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import numpy as np
+from PIL import Image, ImageOps
 
 from omr.contracts.geometry import digit_grid_centers_mm, mm_to_px, px_per_mm
 from omr.grading.bubbles import ink_density, student_mark_fill_ratio
@@ -430,7 +431,7 @@ def roll_sample_centers(
     return centers
 
 
-def read_roll_number(gray: np.ndarray, manifest: dict, dpi: float) -> RollRead:
+def _read_roll_number_once(gray: np.ndarray, manifest: dict, dpi: float) -> RollRead:
     block = manifest["roll_number_block"]
     mapping = _program_grid_keys(block)
     grid_programs = {
@@ -495,3 +496,58 @@ def read_roll_number(gray: np.ndarray, manifest: dict, dpi: float) -> RollRead:
         roll_no = "".join(roll_no.upper().split())
     confidence = _roll_confidence(roll_no, flags)
     return RollRead(program=program, roll_no=roll_no, confidence=confidence, ratios=ratios, review_flags=flags)
+
+
+def _enhance_faint_pencil(gray: np.ndarray) -> np.ndarray:
+    """Normalize paper background and enhance local pencil contrast.
+
+    This is used only as a low-confidence retry. It is not applied to every
+    page because aggressive thresholding can turn paper texture or erasures
+    into false marks.
+    """
+    source = np.asarray(gray, dtype=np.uint8)
+    try:
+        import cv2
+    except ImportError:
+        return np.asarray(ImageOps.autocontrast(Image.fromarray(source, mode="L"), cutoff=1), dtype=np.uint8)
+
+    background = cv2.GaussianBlur(source, (0, 0), sigmaX=21, sigmaY=21)
+    flattened = cv2.divide(source, background, scale=255)
+    clahe = cv2.createCLAHE(clipLimit=1.5, tileGridSize=(16, 16))
+    return clahe.apply(flattened)
+
+
+def read_roll_number(gray: np.ndarray, manifest: dict, dpi: float) -> RollRead:
+    """Read roll bubbles, retrying a faint-pencil contrast variant when needed."""
+    initial = _read_roll_number_once(gray, manifest, dpi)
+    if initial.confidence != "low":
+        return initial
+
+    enhanced = _enhance_faint_pencil(gray)
+    if np.array_equal(enhanced, np.asarray(gray, dtype=np.uint8)):
+        return initial
+    retry = _read_roll_number_once(enhanced, manifest, dpi)
+    if not retry.roll_no or retry.confidence == "low":
+        return initial
+    if initial.roll_no and initial.roll_no != retry.roll_no:
+        flags = list(initial.review_flags)
+        flags.append(
+            f"faint-pencil contrast retry read {retry.roll_no}, conflicting with the original roll {initial.roll_no}"
+        )
+        return RollRead(
+            program=initial.program,
+            roll_no=initial.roll_no,
+            confidence="low",
+            ratios=initial.ratios,
+            review_flags=flags,
+        )
+
+    flags = list(retry.review_flags)
+    flags.append("faint-pencil contrast normalization recovered this roll; review before release")
+    return RollRead(
+        program=retry.program,
+        roll_no=retry.roll_no,
+        confidence="medium",
+        ratios=retry.ratios,
+        review_flags=flags,
+    )

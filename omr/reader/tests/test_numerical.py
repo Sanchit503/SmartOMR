@@ -76,7 +76,7 @@ def test_reads_numerical_grid_with_leading_zeros(tmp_path: Path, orientation):
 
 
 @pytest.mark.parametrize("orientation", ["horizontal", "vertical"])
-def test_incomplete_numerical_grid_is_sent_to_review(tmp_path: Path, orientation):
+def test_omitted_zero_place_values_are_provisionally_inferred_and_sent_to_review(tmp_path: Path, orientation):
     manifest, page = _sheet(tmp_path, orientation)
     entry = manifest["numerical_block"][0]
     draw = ImageDraw.Draw(page)
@@ -84,10 +84,10 @@ def test_incomplete_numerical_grid_is_sent_to_review(tmp_path: Path, orientation
 
     reading = read_numerical_responses({1: np.asarray(page)}, manifest, DPI)[0]
 
-    assert reading.outcome == "incomplete"
-    assert reading.value is None
+    assert reading.outcome == "answered"
+    assert reading.value == 4
     assert reading.needs_human_review
-    assert any("leading zeros" in flag for flag in reading.review_flags)
+    assert any("zero place-values were inferred" in flag for flag in reading.review_flags)
 
 
 @pytest.mark.parametrize("orientation", ["horizontal", "vertical"])

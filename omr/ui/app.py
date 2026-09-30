@@ -544,9 +544,14 @@ def _build_ui_roll_ocr_backend() -> tuple[object | None, dict[str, Any]]:
             "provider": "none",
             "warning": str(exc),
         }
+    provenance = None
+    provenance_method = getattr(backend, "provenance", None)
+    if callable(provenance_method):
+        provenance = provenance_method()
     return backend, {
         "enabled": backend is not None,
         "provider": getattr(backend, "provider", "local") if backend is not None else "none",
+        "provenance": provenance,
         "warning": None,
     }
 
@@ -557,7 +562,7 @@ def _require_ui_roll_ocr_backend() -> tuple[object, dict[str, Any]]:
         detail = str(state.get("warning") or "local roll OCR could not be initialized")
         raise RuntimeError(
             "Roll-number OCR is required for professor UI processing. "
-            f"{detail} Ensure data/models/roll_digit_resnet_omr_finetuned.pt is present, then start the run again."
+            f"{detail} Ensure the roll-digit ensemble manifest and its fine-tuned checkpoints are present, then start the run again."
         )
     return backend, state
 
@@ -1233,20 +1238,26 @@ class RunStore:
         manifest_path = Path(str(saved.get("manifest") or ""))
         if not manifest_path.exists():
             raise ValueError("manifest.json is required")
-        scan_path = Path(str(saved.get("scan_pdf") or ""))
+        folder_value = (fields.get("scan_folder_path") or "").strip().strip('"')
+        folder_path = Path(folder_value) if folder_value else None
+        if folder_path and folder_path.is_dir():
+            scan_path = folder_path
+        else:
+            scan_path = Path(str(saved.get("scan_pdf") or ""))
         if not scan_path.exists():
-            raise ValueError("student OMR PDF/image is required")
+            raise ValueError("upload one scanned OMR PDF/image or provide a valid roll-named PDF/image folder path")
 
         manifest = load_manifest(manifest_path)
         manifest_exam_id = str(manifest.get("exam_id") or exam_id).strip()
         if not exam_id:
             exam_id = manifest_exam_id
 
+        grouping_only = fields.get("grouping_only") == "1"
         answer_key_csv = None
-        if saved.get("answer_key"):
+        if not grouping_only and saved.get("answer_key"):
             answer_key_csv = inputs / "answer_key.csv"
             _normalize_tabular_upload(Path(str(saved["answer_key"])), answer_key_csv)
-        else:
+        elif not grouping_only:
             answer_key_csv = _write_answer_key_from_form(manifest, fields, inputs / "answer_key.csv")
 
         students_csv = None
@@ -1267,6 +1278,8 @@ class RunStore:
             "inputs": {
                 "manifest_path": str(manifest_path),
                 "scan_path": str(scan_path),
+                "filename_roll_mode": bool(folder_path and folder_path.is_dir()),
+                "grouping_only": grouping_only,
                 "answer_key_path": str(answer_key_csv) if answer_key_csv else None,
                 "students_path": str(students_csv) if students_csv else None,
                 "original_answer_key_upload": saved.get("answer_key"),
@@ -2080,7 +2093,11 @@ class SmartOmrUiHandler(BaseHTTPRequestHandler):
             </div>
             <div>
               <label>Scanned filled OMR PDF / image</label>
-              <input type="file" name="scan_pdf" required accept=".pdf,.png,.jpg,.jpeg,.tif,.tiff">
+              <input type="file" name="scan_pdf" accept=".pdf,.png,.jpg,.jpeg,.tif,.tiff">
+            </div>
+            <div>
+              <label>Roll-named PDF/image folder on this computer</label>
+              <input name="scan_folder_path" placeholder="C:\\IIIT Delhi\\BTP\\SmartOMR\\data\\manual_uploads\\CSE557_QUIZ1_2026\\student_pdfs">
             </div>
             <div>
               <label>Manifest JSON</label>
@@ -2095,6 +2112,10 @@ class SmartOmrUiHandler(BaseHTTPRequestHandler):
               <input type="file" name="master_list" accept=".csv,.xlsx">
             </div>
           </div>
+          <label style="display:flex;align-items:center;gap:8px;margin-top:14px">
+            <input id="grouping-only" type="checkbox" name="grouping_only" value="1">
+            Test roll detection and create student PDFs only (skip answer-key grading)
+          </label>
           <section class="band" style="margin-top:16px">
             <h2>Answer Key</h2>
             <input type="hidden" name="answer_key_mode" value="manifest_form">
@@ -2102,11 +2123,12 @@ class SmartOmrUiHandler(BaseHTTPRequestHandler):
             <div id="answer-key-summary" class="muted">Waiting for manifest.json...</div>
             <div id="answer-key-table"></div>
           </section>
-          <p class="muted">Uploaded answer key CSV/XLSX takes priority over the table above. Master list columns: roll_no, name, email, program. First-page written roll OCR cross-check runs automatically when local Tesseract is available.</p>
+          <p class="muted">Upload one bundle PDF/image, or enter a folder containing roll-named PDF/image files. Folder mode groups sheets by filename. Uploaded answer key CSV/XLSX takes priority over the table above.</p>
           <button type="submit">Start Evaluation</button>
         </form>
         <script>
         const manifestInput = document.getElementById("manifest-file");
+        const groupingOnly = document.getElementById("grouping-only");
         const summary = document.getElementById("answer-key-summary");
         const target = document.getElementById("answer-key-table");
 
@@ -2151,6 +2173,16 @@ class SmartOmrUiHandler(BaseHTTPRequestHandler):
             <tbody>${rows}</tbody>
           </table>`;
         }
+
+        groupingOnly.addEventListener("change", () => {
+          const disabled = groupingOnly.checked;
+          document.querySelectorAll("#answer-key-table input, input[name='answer_key']").forEach(input => {
+            input.disabled = disabled;
+          });
+          summary.textContent = disabled
+            ? "Grouping-only test selected: pages will be aligned, assigned to roll numbers, and written into student PDFs. Marks will not be calculated."
+            : "Choose the manifest above and enter answers to calculate marks.";
+        });
 
         manifestInput?.addEventListener("change", async () => {
           const file = manifestInput.files?.[0];

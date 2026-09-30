@@ -247,6 +247,7 @@ def _mcq_payload(
                 "dropped": dropped,
                 "fill_ratios": reading.fill_ratios,
                 "ink_densities": reading.ink_densities,
+                "enhanced_fill_ratios": reading.enhanced_fill_ratios,
             }
         )
 
@@ -299,10 +300,11 @@ def _numerical_payload(images_by_page, manifest, dpi, answer_key, review_flags):
                         "or be 0 for a dropped question"
                     )
                 payload["correct_value"] = expected
-                if not reading.needs_human_review:
-                    awarded = key.marks if reading.outcome == "answered" and reading.value == expected else 0.0
-                    payload["marks_awarded"] = awarded
-                    score += awarded
+                # A review flag keeps email release blocked, but a readable
+                # provisional answer must still receive its provisional mark.
+                awarded = key.marks if reading.outcome == "answered" and reading.value == expected else 0.0
+                payload["marks_awarded"] = awarded
+                score += awarded
         elif answer_key is not None:
             review_flags.append(f"answer key is missing numerical Q{reading.q_no}")
         if payload["marks_awarded"] is None:

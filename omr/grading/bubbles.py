@@ -24,6 +24,7 @@ __all__ = [
     "px_per_mm",
     "STUDENT_MARK_CORE_RATIO",
     "student_mark_fill_ratio",
+    "enhanced_student_mark_fill_ratio",
 ]
 
 DARK_THRESHOLD = 150
@@ -100,3 +101,36 @@ def ink_density(gray: np.ndarray, cx_px: int, cy_px: int, radius_px: int) -> flo
     if pixels is None:
         return 0.0
     return float((255.0 - pixels.astype(np.float32)).mean()) / 255.0
+
+
+def enhanced_student_mark_fill_ratio(gray: np.ndarray, cx_px: int, cy_px: int, radius_px: int) -> float:
+    """Faint-pencil retry ratio using darkness relative to nearby paper.
+
+    A faint mark may be grey rather than black, so a fixed intensity cutoff
+    misses it. Here the cutoff is the local annulus median minus a modest
+    contrast amount. The core-and-full rule remains in place to reject the
+    printed bubble outline. This is a review-only recovery signal.
+    """
+    from omr.reader.enhancement import enhance_faint_ink
+
+    enhanced = enhance_faint_ink(gray)
+    h, w = enhanced.shape[:2]
+    outer = max(radius_px + 2, round(radius_px * 1.8))
+    x0, x1 = max(0, cx_px - outer), min(w, cx_px + outer + 1)
+    y0, y1 = max(0, cy_px - outer), min(h, cy_px + outer + 1)
+    if x0 >= x1 or y0 >= y1:
+        return 0.0
+    yy, xx = np.ogrid[y0:y1, x0:x1]
+    distance2 = (xx - cx_px) ** 2 + (yy - cy_px) ** 2
+    annulus = (distance2 >= max(radius_px + 1, round(radius_px * 1.15)) ** 2) & (distance2 <= outer**2)
+    nearby_paper = enhanced[y0:y1, x0:x1][annulus]
+    if nearby_paper.size < 8:
+        return 0.0
+    threshold = max(0, int(np.median(nearby_paper)) - 18)
+    full_pixels = _disc(enhanced, cx_px, cy_px, radius_px)
+    core_pixels = _disc(enhanced, cx_px, cy_px, max(1, round(radius_px * STUDENT_MARK_CORE_RATIO)))
+    if full_pixels is None or core_pixels is None:
+        return 0.0
+    full = float((full_pixels < threshold).sum()) / full_pixels.size
+    core = float((core_pixels < threshold).sum()) / core_pixels.size
+    return min(full, core)

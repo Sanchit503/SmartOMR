@@ -152,7 +152,7 @@ def test_sheared_printed_grid_is_locally_calibrated(sheet):
     assert readings[4].selected_option == "B"
 
 
-def test_a_light_pencil_fill_is_flagged_not_silently_blanked(sheet):
+def test_a_light_pencil_fill_is_provisionally_selected_and_flagged(sheet):
     """The dangerous failure, and the reason `ink_density` exists: a light
     pencil answer covers the whole bubble but never gets dark enough to
     cross the hard fill threshold. On `fill_ratio` alone it scores 0.00 —
@@ -165,10 +165,11 @@ def test_a_light_pencil_fill_is_flagged_not_silently_blanked(sheet):
     assert r.fill_ratios["B"] == pytest.approx(0.0, abs=0.01), "expected the hard threshold to miss this"
     assert r.ink_densities["B"] > 0.2, "but mean darkness should still see it"
 
-    assert r.outcome == MCQOutcome.BLANK
+    assert r.outcome == MCQOutcome.ANSWERED
+    assert r.selected_option == "B"
     assert r.needs_human_review
     assert r.confidence == Confidence.LOW
-    assert "faint or erased" in r.review_reason
+    assert "faint-pencil response provisionally selected" in r.review_reason
 
 
 def test_erased_and_rebubbled_answer_is_flagged(sheet):

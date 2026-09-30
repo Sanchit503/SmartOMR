@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import os
 import re
+import json
+import hashlib
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
@@ -21,9 +23,11 @@ from omr.contracts.geometry import mm_to_px, px_per_mm
 from omr.grading.bubbles import ink_density, student_mark_fill_ratio
 from omr.grading.mcq import DEFAULT_AMBIGUOUS_FLOOR, DEFAULT_FILL_THRESHOLD, DEFAULT_INK_FLOOR
 from omr.models import HandwrittenRollRead
+from omr.reader.enhancement import enhance_faint_ink
 
 
 DEFAULT_RESNET_ROLL_MODEL = Path("data/models/roll_digit_resnet_omr_finetuned.pt")
+DEFAULT_RESNET_ROLL_ENSEMBLE_MANIFEST = Path("data/models/roll_digit_ensemble_7/ensemble_manifest.json")
 
 
 @dataclass(frozen=True)
@@ -130,16 +134,196 @@ class LocalResnetRollOcr:
         return self.read_digit_image(Image.open(crop_path).convert("L"))
 
     def read_digit_image(self, image: Image.Image) -> RollOcrResult:
-        image = ImageOps.autocontrast(image)
-        image = ImageOps.pad(image, (64, 64), color=255)
-        array = np.asarray(image, dtype=np.float32) / 255.0
-        tensor = self.torch.from_numpy((1.0 - array - 0.15) / 0.35).unsqueeze(0).unsqueeze(0)
+        tensor = _resnet_digit_tensor(image, self.torch).unsqueeze(0)
         with self.torch.no_grad():
             probabilities = self.torch.softmax(self.model(tensor), dim=1)[0]
         confidence, index = self.torch.max(probabilities, dim=0)
         label = self.labels[int(index.item())]
         digit = "" if label == "blank" else label
         return RollOcrResult(digit, confidence=float(confidence.item()), raw={"provider": self.provider, "label": label})
+
+
+def _resnet_digit_tensor(image: Image.Image, torch: object):
+    """Match the image preprocessing used by the roll-digit trainer."""
+    image = ImageOps.autocontrast(image.convert("L"))
+    image = ImageOps.pad(image, (64, 64), color=255)
+    array = np.asarray(image, dtype=np.float32) / 255.0
+    return torch.from_numpy((1.0 - array - 0.15) / 0.35).unsqueeze(0)
+
+
+class LocalResnetProbabilityEnsembleRollOcr:
+    """Validation-weighted probability ensemble of fine-tuned roll-digit ResNets."""
+
+    provider = "local_resnet_probability_ensemble"
+
+    def __init__(self, manifest_path: str | Path) -> None:
+        try:
+            import torch
+            from omr.datasets.train_roll_digit_resnet import LABELS, SmallRollDigitResNet
+        except ImportError as exc:
+            raise RuntimeError("PyTorch is required to use the roll-digit ensemble") from exc
+
+        self.manifest_path = Path(manifest_path)
+        if not self.manifest_path.is_file():
+            raise FileNotFoundError(f"roll-digit ensemble manifest not found: {self.manifest_path}")
+        manifest = json.loads(self.manifest_path.read_text(encoding="utf-8"))
+        members = manifest.get("members")
+        if manifest.get("kind") != "roll_digit_resnet_probability_ensemble" or not isinstance(members, list) or len(members) < 2:
+            raise ValueError(f"invalid roll-digit ensemble manifest: {self.manifest_path}")
+
+        self.torch = torch
+        self.labels = LABELS
+        self.models = []
+        self.member_paths: list[str] = []
+        self.members: list[dict[str, object]] = []
+        weights: list[float] = []
+        for member in members:
+            if not isinstance(member, dict):
+                raise ValueError(f"invalid member in ensemble manifest: {self.manifest_path}")
+            model_path = _resolve_ensemble_model_path(self.manifest_path, member.get("model_path"))
+            payload = torch.load(model_path, map_location="cpu")
+            state = payload.get("model_state", payload) if isinstance(payload, dict) else payload
+            model = SmallRollDigitResNet(num_classes=len(LABELS))
+            model.load_state_dict(state)
+            model.eval()
+            self.models.append(model)
+            self.member_paths.append(str(model_path))
+            accuracy = max(0.0, float(member.get("best_val_accuracy") or 0.0))
+            weights.append(accuracy)
+            self.members.append(
+                {
+                    "member": member.get("member"),
+                    "seed": member.get("seed"),
+                    "best_val_accuracy": accuracy,
+                    "checkpoint_path": str(model_path),
+                    "checkpoint_sha256": _file_sha256(model_path),
+                }
+            )
+        if not any(weights):
+            weights = [1.0] * len(self.models)
+        self.weights = np.asarray(weights, dtype=np.float32)
+        self.weights /= self.weights.sum()
+        self.aggregation = str(manifest.get("aggregation") or "validation-weighted probability average")
+
+    def provenance(self) -> dict[str, object]:
+        return {
+            "kind": "roll_digit_resnet_probability_ensemble",
+            "manifest_path": str(self.manifest_path),
+            "manifest_sha256": _file_sha256(self.manifest_path),
+            "member_count": len(self.models),
+            "aggregation": self.aggregation,
+            "members": self.members,
+        }
+
+    def read_roll(self, crop_path: Path, program: str | None = None, valid_rolls: set[str] | None = None) -> RollOcrResult:
+        expected_digits = _expected_digit_count(program)
+        if expected_digits is None:
+            return RollOcrResult("", confidence=0.0, raw={"reason": "program_required_for_resnet_ensemble"})
+        image = Image.open(crop_path).convert("L")
+        reads = self._read_digit_images(_segment_digit_cells(image, expected_digits))
+        digits = "".join(_first_digit(read.text) or "?" for read in reads)
+        confidence = min((float(read.confidence or 0.0) for read in reads), default=0.0) if "?" not in digits else 0.0
+        return RollOcrResult(
+            _format_roll_digits(program, digits),
+            confidence=confidence,
+            raw={
+                "provider": self.provider,
+                "ensemble_manifest": str(self.manifest_path),
+                "member_count": len(self.models),
+                "aggregation": self.aggregation,
+                "cells": [_ocr_result_payload(read) for read in reads],
+            },
+        )
+
+    def read_digit(self, crop_path: Path) -> RollOcrResult:
+        return self.read_digit_image(Image.open(crop_path).convert("L"))
+
+    def read_digit_image(self, image: Image.Image) -> RollOcrResult:
+        return self._read_digit_images([image])[0]
+
+    def _read_digit_images(self, images: list[Image.Image]) -> list[RollOcrResult]:
+        combined = self._probabilities(images)
+        # Retry only weak cells. Agreement can support the original read;
+        # disagreement is deliberately kept as a review signal.
+        weak_indexes: list[int] = []
+        for position, row in enumerate(combined):
+            ranked = np.sort(row)
+            margin = float(ranked[-1] - ranked[-2]) if len(ranked) > 1 else 1.0
+            if float(row.max()) < 0.86 or margin < 0.18:
+                weak_indexes.append(position)
+        variants: dict[int, np.ndarray] = {}
+        if weak_indexes:
+            retry_images = [Image.fromarray(enhance_faint_ink(images[position]), mode="L") for position in weak_indexes]
+            for position, row in zip(weak_indexes, self._probabilities(retry_images)):
+                variants[position] = row
+
+        reads: list[RollOcrResult] = []
+        for position, original in enumerate(combined):
+            row = original.copy()
+            variant = variants.get(position)
+            enhancement = "not_needed"
+            disagreement = False
+            if variant is not None:
+                if int(np.argmax(original)) == int(np.argmax(variant)):
+                    row = original * 0.65 + variant * 0.35
+                    enhancement = "contrast_retry_agreed"
+                else:
+                    enhancement = "contrast_retry_disagreed"
+                    disagreement = True
+            index = int(np.argmax(row))
+            label = self.labels[index]
+            ranked = np.sort(row)
+            runner_up = float(ranked[-2]) if len(ranked) > 1 else 0.0
+            confidence = float(row[index])
+            if disagreement:
+                confidence = min(confidence, 0.58)
+            reads.append(
+                RollOcrResult(
+                    "" if label == "blank" else label,
+                    confidence=confidence,
+                    raw={
+                        "provider": self.provider,
+                        "label": label,
+                        "member_count": len(self.models),
+                        "top_probability": float(row[index]),
+                        "runner_up_probability": runner_up,
+                        "probability_margin": float(row[index]) - runner_up,
+                        "enhancement": enhancement,
+                        "enhancement_disagreement": disagreement,
+                    },
+                )
+            )
+        return reads
+
+    def _probabilities(self, images: list[Image.Image]) -> np.ndarray:
+        tensors = self.torch.stack([_resnet_digit_tensor(image, self.torch) for image in images])
+        combined = None
+        with self.torch.no_grad():
+            for weight, model in zip(self.weights, self.models):
+                probabilities = self.torch.softmax(model(tensors), dim=1).cpu().numpy()
+                combined = probabilities * float(weight) if combined is None else combined + probabilities * float(weight)
+        assert combined is not None
+        return combined
+
+
+def _resolve_ensemble_model_path(manifest_path: Path, value: object) -> Path:
+    if not value:
+        raise ValueError(f"ensemble member has no model_path: {manifest_path}")
+    candidate = Path(str(value))
+    if candidate.is_file():
+        return candidate
+    relative_to_manifest = manifest_path.parent / candidate
+    if relative_to_manifest.is_file():
+        return relative_to_manifest
+    raise FileNotFoundError(f"fine-tuned ensemble member not found: {candidate}")
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 class LocalEnsembleRollOcr:
@@ -310,6 +494,7 @@ def build_roll_ocr_backend(
     *,
     digit_model_path: str | Path | None = None,
     resnet_model_path: str | Path | None = None,
+    ensemble_manifest_path: str | Path | None = None,
 ) -> RollOcrBackend | None:
     selected = (provider or "none").strip().lower()
     if selected in {"", "none", "off", "disabled"}:
@@ -318,7 +503,15 @@ def build_roll_ocr_backend(
         backends: list[RollOcrBackend] = []
         warnings: list[str] = []
         resnet_path = resnet_model_path or os.environ.get("SMARTOMR_ROLL_RESNET_MODEL")
-        if resnet_path is None and digit_model_path is None:
+        manifest_path = ensemble_manifest_path or os.environ.get("SMARTOMR_ROLL_ENSEMBLE_MANIFEST")
+        if manifest_path is None and resnet_path is None and digit_model_path is None:
+            manifest_path = DEFAULT_RESNET_ROLL_ENSEMBLE_MANIFEST
+        if manifest_path and Path(manifest_path).is_file():
+            try:
+                backends.append(LocalResnetProbabilityEnsembleRollOcr(manifest_path))
+            except (RuntimeError, ValueError, FileNotFoundError) as exc:
+                warnings.append(str(exc))
+        if not backends and resnet_path is None and digit_model_path is None:
             resnet_path = DEFAULT_RESNET_ROLL_MODEL
         if resnet_path and Path(resnet_path).is_file():
             try:
@@ -330,7 +523,7 @@ def build_roll_ocr_backend(
             backends.append(LocalDigitModelRollOcr(model_path))
         if not backends:
             raise RuntimeError(
-                "No local roll digit model is available. Train or provide the fine-tuned ResNet checkpoint. "
+                "No local roll digit ensemble or fine-tuned ResNet checkpoint is available. "
                 "Tesseract is intentionally disabled for roll-number matching."
             )
         if len(backends) == 1:

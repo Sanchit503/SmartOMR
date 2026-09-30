@@ -149,6 +149,7 @@ def evaluate_scan(
                 "review_reason": reading.review_reason,
                 "fill_ratios": reading.fill_ratios,
                 "ink_densities": reading.ink_densities,
+                "enhanced_fill_ratios": reading.enhanced_fill_ratios,
             }
         )
 

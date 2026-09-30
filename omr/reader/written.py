@@ -13,6 +13,7 @@ from PIL import Image
 
 from omr.contracts.geometry import mm_to_px, px_per_mm
 from omr.models import WrittenCrop
+from omr.reader.enhancement import enhance_faint_ink
 
 
 def _gray_array(image: object) -> np.ndarray:
@@ -151,7 +152,10 @@ def _normalize_background(gray: np.ndarray) -> np.ndarray:
 
 def _remove_form_rules(gray: np.ndarray) -> np.ndarray:
     cv2 = _cv2()
-    normalized = _normalize_background(gray)
+    # The enhanced view is used only to find faint strokes. The saved crop is
+    # still based on the original scan, keeping the professor-visible evidence
+    # faithful to the submitted sheet.
+    normalized = enhance_faint_ink(_normalize_background(gray))
     blurred = cv2.GaussianBlur(normalized, (3, 3), 0)
     _threshold, ink = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU)
     h, w = ink.shape[:2]

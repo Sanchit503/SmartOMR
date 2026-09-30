@@ -60,10 +60,12 @@ HANDWRITTEN_OCR_NOT_CONFIGURED_FLAG = "handwritten roll OCR is not configured; s
 PAGE_MAJOR_IDENTITY_KIND = "page_major_order"
 SHEET_MAJOR_IDENTITY_KIND = "sheet_major_order"
 WRITE_IN_SIMILARITY_IDENTITY_KIND = "write_in_similarity"
+EXACT_CROSS_PAGE_ROLL_IDENTITY_KIND = "exact_cross_page_roll"
 GROUPED_IDENTITY_KINDS = {
     PAGE_MAJOR_IDENTITY_KIND,
     SHEET_MAJOR_IDENTITY_KIND,
     WRITE_IN_SIMILARITY_IDENTITY_KIND,
+    EXACT_CROSS_PAGE_ROLL_IDENTITY_KIND,
 }
 WRITE_IN_SIMILARITY_MIN_SCORE = 0.88
 WRITE_IN_SIMILARITY_REVIEW_MARGIN = 0.03
@@ -244,6 +246,29 @@ def _page_one_write_in_matches_bubbles(record: _PageRecord) -> bool:
     return write_roll_no == record.roll_no and _strong_enough(write_confidence, "medium")
 
 
+def _is_clear_program_inferred_anchor(record: _PageRecord, valid_rolls: set[str] | None) -> bool:
+    """Allow a clear BTech-only grid when the program selector was left blank.
+
+    This is deliberately narrower than accepting every low-confidence page:
+    the completed grid must identify one program, the roll must be in the
+    roster, and there may be no bubble-grid ambiguity beyond the selector.
+    """
+    if record.identity_kind != "bubbled" or not record.roll_no or not record.program:
+        return False
+    if valid_rolls is None or record.roll_no not in valid_rolls:
+        return False
+    payload = record.identity_payload or {}
+    flags = [str(flag) for flag in payload.get("review_flags", [])]
+    if not any(flag.startswith("program inferred as ") for flag in flags):
+        return False
+    allowed = (
+        "program selector is blank",
+        "program selector is faint/ambiguous:",
+        "program inferred as ",
+    )
+    return all(flag.startswith(allowed) for flag in flags)
+
+
 def _best_page(existing: _PageRecord, challenger: _PageRecord) -> _PageRecord:
     existing_score = (
         CONFIDENCE_RANK.get(existing.confidence, 0),
@@ -262,6 +287,7 @@ def _group_records_by_identity(
     records: list[_PageRecord],
     min_group_confidence: str,
     page_one_index: int = 1,
+    valid_rolls: set[str] | None = None,
 ) -> tuple[dict[str, list[_PageRecord]], list[_PageRecord]]:
     grouped: dict[str, list[_PageRecord]] = {}
     unmatched: list[_PageRecord] = []
@@ -271,7 +297,10 @@ def _group_records_by_identity(
     for record in ordered:
         if record.aligned_page.page_index != page_one_index:
             continue
-        if record.roll_no and _strong_enough(record.confidence, min_group_confidence):
+        if record.roll_no and (
+            _strong_enough(record.confidence, min_group_confidence)
+            or _is_clear_program_inferred_anchor(record, valid_rolls)
+        ):
             grouped.setdefault(record.roll_no, []).append(record)
             if _page_one_write_in_matches_bubbles(record):
                 verified_anchor_rolls.add(record.roll_no)
@@ -293,6 +322,74 @@ def _group_records_by_identity(
             continue
         grouped.setdefault(record.roll_no, []).append(record)
     return grouped, unmatched
+
+
+def _reconcile_exact_cross_page_roll_pairs(
+    records: list[_PageRecord],
+    grouped: dict[str, list[_PageRecord]],
+    unmatched: list[_PageRecord],
+    *,
+    page_one_index: int,
+    valid_rolls: set[str] | None,
+) -> tuple[dict[str, list[_PageRecord]], list[_PageRecord]]:
+    """Recover pages only from exact independent roll evidence, never source order."""
+    page_one_by_source = {
+        record.source_index: record
+        for record in records
+        if record.aligned_page.page_index == page_one_index and record.roll_no
+    }
+    page_one_by_roll: dict[str, _PageRecord] = {}
+    page_one_roll_counts: dict[str, int] = {}
+    for record in page_one_by_source.values():
+        assert record.roll_no is not None
+        page_one_roll_counts[record.roll_no] = page_one_roll_counts.get(record.roll_no, 0) + 1
+        page_one_by_roll[record.roll_no] = record
+
+    unmatched_by_source = {record.source_index: record for record in unmatched}
+    recovered_sources: set[int] = set()
+    for continuation in sorted(unmatched, key=lambda item: item.source_index):
+        if continuation.aligned_page.page_index == page_one_index or not continuation.roll_no:
+            continue
+        anchor = page_one_by_roll.get(continuation.roll_no)
+        if (
+            anchor is None
+            or not anchor.roll_no
+            or not _strong_enough(anchor.confidence, "medium")
+            or not _strong_enough(continuation.confidence, "medium")
+            or page_one_roll_counts.get(anchor.roll_no) != 1
+            or (valid_rolls is not None and anchor.roll_no not in valid_rolls)
+            or anchor.source_index in recovered_sources
+            or continuation.source_index in recovered_sources
+        ):
+            continue
+
+        if anchor.source_index in unmatched_by_source:
+            grouped.setdefault(anchor.roll_no, []).append(anchor)
+            recovered_sources.add(anchor.source_index)
+
+        identity_payload = dict(continuation.identity_payload or {})
+        identity_payload.update(
+            {
+                "grouped_roll_no": anchor.roll_no,
+                "grouped_program": anchor.program,
+                "grouped_from_page1_source_index": anchor.source_index,
+                "original_identity_kind": continuation.identity_kind,
+                "original_roll_no": continuation.roll_no,
+                "original_confidence": continuation.confidence,
+                "reconciliation": "exact page-1 bubble roll and continuation handwritten roll",
+            }
+        )
+        continuation.identity_kind = EXACT_CROSS_PAGE_ROLL_IDENTITY_KIND
+        continuation.program = continuation.program or anchor.program
+        continuation.identity_payload = identity_payload
+        continuation.review_flags.append(
+            "grouped only after exact agreement between the page-1 bubble roll and continuation "
+            "handwritten roll; source order was not used; review before release"
+        )
+        grouped.setdefault(anchor.roll_no, []).append(continuation)
+        recovered_sources.add(continuation.source_index)
+
+    return grouped, [record for record in unmatched if record.source_index not in recovered_sources]
 
 
 def _page_sequence(records: list[_PageRecord]) -> list[int]:
@@ -1462,6 +1559,7 @@ def parse_exam_bundle(
         page_records_for_bundle,
         min_group_confidence,
         page_one_index=int(manifest["roll_number_block"].get("page", 1)),
+        valid_rolls=valid_rolls,
     )
     if applied_grouping_mode == "page-major":
         grouped, unmatched = _group_records_by_page_major(page_records_for_bundle, manifest, min_group_confidence)
@@ -1469,6 +1567,13 @@ def parse_exam_bundle(
         grouped, unmatched = _group_records_by_sheet_major(page_records_for_bundle, manifest, min_group_confidence)
     else:
         grouped, unmatched = identity_grouped, identity_unmatched
+        grouped, unmatched = _reconcile_exact_cross_page_roll_pairs(
+            page_records_for_bundle,
+            grouped,
+            unmatched,
+            page_one_index=int(manifest["roll_number_block"].get("page", 1)),
+            valid_rolls=valid_rolls,
+        )
 
     student_results: list[dict[str, Any]] = []
     grouped_students = sorted(grouped.items())
