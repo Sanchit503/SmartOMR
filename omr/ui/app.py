@@ -1559,7 +1559,16 @@ class RunStore:
                 kind, roll_no, program, confidence, payload, flags = _page_identity(
                     aligned, manifest, 200.0, identity_dir, backend, valid_rolls,
                 )
-                review = not roll_no or confidence == "low" or bool(flags)
+                # Quality observations (for example, a faint pencil trace or a
+                # slightly shifted grid) are useful audit evidence, but they do
+                # not erase a complete, high-confidence literal roll read.
+                identity_warning = any(
+                    marker in str(flag).lower()
+                    for flag in flags
+                    for marker in ("could not be decoded", "low confidence", "conflicts with", "requires manual")
+                )
+                review = not roll_no or confidence == "low" or identity_warning
+                status = "needs_review" if review else "detected_with_caution" if flags else "detected"
                 rows.append({
                     "source_index": source_index,
                     "sheet_page": aligned.page_index,
@@ -1568,13 +1577,14 @@ class RunStore:
                     "program": program,
                     "confidence": confidence,
                     "roster_member": bool(valid_rolls is not None and roll_no in valid_rolls),
-                    "status": "needs_review" if review else "detected",
+                    "status": status,
                     "review_flags": flags,
                     "identity": _relative_identity_payload(payload, run_dir),
                 })
                 self.write_state(run_id, stage=f"Previewing roll detection: {source_index}/{total}")
             counts = {
-                "detected": sum(row["status"] == "detected" for row in rows),
+                "detected": sum(row["status"] in {"detected", "detected_with_caution"} for row in rows),
+                "detected_with_caution": sum(row["status"] == "detected_with_caution" for row in rows),
                 "needs_review": sum(row["status"] == "needs_review" for row in rows),
                 "undetected": sum(not row.get("literal_roll_no") for row in rows),
                 "unavailable": sum(row["status"] == "unavailable" for row in rows),

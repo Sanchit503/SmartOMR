@@ -171,7 +171,7 @@
       if (preview?.status === "completed") {
         const counts = preview.counts || {};
         previewSummary.hidden = false;
-        previewSummary.textContent = `Roll preview: ${counts.detected || 0} literal rolls detected, ${counts.needs_review || 0} need review, ${counts.undetected || 0} not detected. Review this before starting evaluation.`;
+        previewSummary.textContent = `Roll preview: ${counts.detected || 0} literal rolls detected (${counts.detected_with_caution || 0} with quality observations), ${counts.needs_review || 0} identity reads need review, ${counts.undetected || 0} not detected. Review identity issues before starting evaluation.`;
       } else if (inventory.run_status === "identity_previewing") {
         previewSummary.hidden = false;
         previewSummary.textContent = inventory.stage || "Reading rolls from inspected pages";
