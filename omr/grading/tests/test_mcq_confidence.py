@@ -172,6 +172,21 @@ def test_a_light_pencil_fill_is_provisionally_selected_and_flagged(sheet):
     assert "faint-pencil response provisionally selected" in r.review_reason
 
 
+def test_a_very_light_pencil_fill_uses_neighbouring_bubbles_as_its_baseline(sheet):
+    """A bright scan can contain a visible pencil mark below the old absolute
+    ink floor. It is accepted only because the original neighbouring bubbles
+    are measurably lighter; a uniform haze still fails the earlier test."""
+    manifest, img = sheet
+    shade(img, manifest, 2, 1, coverage=1.0, darkness=215)
+
+    r = read(img, manifest)[2]
+
+    assert r.outcome == MCQOutcome.ANSWERED
+    assert r.selected_option == "B"
+    assert r.needs_human_review
+    assert r.confidence == Confidence.LOW
+
+
 def test_erased_and_rebubbled_answer_is_flagged(sheet):
     """Section 13 calls this out explicitly. A rubbed-out pencil mark leaves
     residue behind, so two bubbles read as marked and the reader must not

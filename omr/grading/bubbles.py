@@ -119,26 +119,41 @@ def enhanced_student_mark_fill_ratio(
     printed bubble outline. This is a review-only recovery signal.
     """
     enhanced = enhance_faint_marks_page(gray) if enhanced_gray is None else enhanced_gray
-    h, w = enhanced.shape[:2]
-    outer = max(radius_px + 2, round(radius_px * 1.8))
-    x0, x1 = max(0, cx_px - outer), min(w, cx_px + outer + 1)
-    y0, y1 = max(0, cy_px - outer), min(h, cy_px + outer + 1)
-    if x0 >= x1 or y0 >= y1:
-        return 0.0
-    yy, xx = np.ogrid[y0:y1, x0:x1]
-    distance2 = (xx - cx_px) ** 2 + (yy - cy_px) ** 2
-    annulus = (distance2 >= max(radius_px + 1, round(radius_px * 1.15)) ** 2) & (distance2 <= outer**2)
-    nearby_paper = enhanced[y0:y1, x0:x1][annulus]
-    if nearby_paper.size < 8:
-        return 0.0
-    threshold = max(0, int(np.median(nearby_paper)) - 18)
-    full_pixels = _disc(enhanced, cx_px, cy_px, radius_px)
-    core_pixels = _disc(enhanced, cx_px, cy_px, max(1, round(radius_px * STUDENT_MARK_CORE_RATIO)))
-    if full_pixels is None or core_pixels is None:
-        return 0.0
-    full = float((full_pixels < threshold).sum()) / full_pixels.size
-    core = float((core_pixels < threshold).sum()) / core_pixels.size
-    return min(full, core)
+    source = _as_gray_array(gray)
+
+    def locally_contrasted_ratio(image: np.ndarray) -> float:
+        h, w = image.shape[:2]
+        outer = max(radius_px + 2, round(radius_px * 1.8))
+        x0, x1 = max(0, cx_px - outer), min(w, cx_px + outer + 1)
+        y0, y1 = max(0, cy_px - outer), min(h, cy_px + outer + 1)
+        if x0 >= x1 or y0 >= y1:
+            return 0.0
+        yy, xx = np.ogrid[y0:y1, x0:x1]
+        distance2 = (xx - cx_px) ** 2 + (yy - cy_px) ** 2
+        annulus = (distance2 >= max(radius_px + 1, round(radius_px * 1.15)) ** 2) & (distance2 <= outer**2)
+        nearby_paper = image[y0:y1, x0:x1][annulus]
+        if nearby_paper.size < 8:
+            return 0.0
+        # The ring crosses the printed bubble outline. Paper is represented by
+        # its bright portion, not the median of a region contaminated by that
+        # dark outline or nearby printed labels.
+        paper_reference = float(np.percentile(nearby_paper, 80))
+        bright_paper = nearby_paper[nearby_paper >= np.percentile(nearby_paper, 55)]
+        paper_mad = float(np.median(np.abs(bright_paper.astype(np.float32) - paper_reference)))
+        contrast_gap = int(np.clip(round(8.0 + 1.5 * paper_mad), 8, 18))
+        threshold = max(0, int(paper_reference) - contrast_gap)
+        full_pixels = _disc(image, cx_px, cy_px, radius_px)
+        core_pixels = _disc(image, cx_px, cy_px, max(1, round(radius_px * STUDENT_MARK_CORE_RATIO)))
+        if full_pixels is None or core_pixels is None:
+            return 0.0
+        full = float((full_pixels < threshold).sum()) / full_pixels.size
+        core = float((core_pixels < threshold).sum()) / core_pixels.size
+        return min(full, core)
+
+    # A page-level enhancement can flatten a tiny light mark if its blur
+    # background includes the bubble. Preserve the raw local-paper result as
+    # a second view; both are later gated by neighbouring raw-bubble ink.
+    return max(locally_contrasted_ratio(source), locally_contrasted_ratio(enhanced))
 
 
 def enhance_faint_marks_page(gray: np.ndarray) -> np.ndarray:

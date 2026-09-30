@@ -91,7 +91,7 @@ def read_numerical_responses(
                 DEFAULT_MIN_MARGIN, DEFAULT_INK_FLOOR,
             )
             provisional = None
-            if outcome == MCQOutcome.BLANK and review:
+            if outcome == MCQOutcome.BLANK:
                 provisional = faint_provisional_option(ratios, inks, enhanced)
             if provisional is not None:
                 outcome = MCQOutcome.ANSWERED

@@ -53,6 +53,7 @@ DEFAULT_MIN_MARGIN = 0.18
 # bubble reaches ~0.25 while still scoring 0.0 on the hard fill threshold.
 DEFAULT_INK_FLOOR = 0.24
 DEFAULT_INK_EXCESS_FLOOR = 0.10
+DEFAULT_FAINT_INK_EXCESS_FLOOR = 0.055
 
 
 def _cv2():
@@ -436,7 +437,10 @@ def faint_provisional_option(
     if enhanced_ratios[selected] < fill_threshold or enhanced_ratios[selected] - runner_up < min_margin:
         return None
     baseline = float(np.median([ink for option, ink in inks.items() if option != selected])) if len(inks) > 1 else 0.0
-    if inks.get(selected, 0.0) < ink_floor or inks.get(selected, 0.0) - baseline < DEFAULT_INK_EXCESS_FLOOR:
+    # Faint pencil can have low absolute ink density on a bright scan. Its
+    # reliable signal is being materially darker than neighbouring unfilled
+    # bubbles in the original image. Uniform scan haze fails this comparison.
+    if inks.get(selected, 0.0) - baseline < DEFAULT_FAINT_INK_EXCESS_FLOOR:
         return None
     return selected
 
@@ -506,7 +510,7 @@ def read_mcq_responses(
             ratios, inks, fill_threshold, ambiguous_floor, min_margin, ink_floor
         )
         provisional = None
-        if outcome == MCQOutcome.BLANK and needs_review:
+        if outcome == MCQOutcome.BLANK:
             provisional = faint_provisional_option(ratios, inks, enhanced, fill_threshold, min_margin, ink_floor)
         if provisional is not None:
             outcome = MCQOutcome.ANSWERED

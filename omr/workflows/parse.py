@@ -280,6 +280,7 @@ def _numerical_payload(images_by_page, manifest, dpi, answer_key, review_flags):
             max_marks=0.0 if dropped else entry["max_marks"],
             printed_max_marks=entry["max_marks"],
             correct_value=None,
+            correct_values=[],
             marks_awarded=0.0 if dropped else None,
             dropped=dropped,
         )
@@ -288,21 +289,24 @@ def _numerical_payload(images_by_page, manifest, dpi, answer_key, review_flags):
         if key is not None:
             if dropped:
                 pass
-            elif not re.fullmatch(r"[0-9]+", key.answer) or len(key.answer) > 100:
-                raise ValueError(f"numerical answer key Q{reading.q_no} must be a non-negative whole number")
             else:
-                expected = int(key.answer)
-                if expected >= 10 ** entry["positions"]:
+                expected_values = _numerical_answer_values(key.answer, reading.q_no)
+                if any(expected >= 10 ** entry["positions"] for expected in expected_values):
                     raise ValueError(f"numerical answer key Q{reading.q_no} exceeds its digit capacity")
                 if not math.isfinite(key.marks) or key.marks != entry["max_marks"]:
                     raise ValueError(
                         f"numerical answer key Q{reading.q_no} marks must match manifest max_marks "
                         "or be 0 for a dropped question"
                     )
-                payload["correct_value"] = expected
+                payload["correct_values"] = expected_values
+                payload["correct_value"] = (
+                    expected_values[0]
+                    if len(expected_values) == 1
+                    else " or ".join(str(value) for value in expected_values)
+                )
                 # A review flag keeps email release blocked, but a readable
                 # provisional answer must still receive its provisional mark.
-                awarded = key.marks if reading.outcome == "answered" and reading.value == expected else 0.0
+                awarded = key.marks if reading.outcome == "answered" and reading.value in expected_values else 0.0
                 payload["marks_awarded"] = awarded
                 score += awarded
         elif answer_key is not None:
@@ -339,10 +343,20 @@ def _validate_numerical_answer_key(
             )
         if key.marks == 0:
             continue
-        if not re.fullmatch(r"[0-9]+", key.answer) or len(key.answer) > 100:
-            raise ValueError(f"numerical answer key Q{q_no} must be a non-negative whole number")
-        if int(key.answer) >= 10 ** int(entry["positions"]):
+        expected_values = _numerical_answer_values(key.answer, q_no)
+        if any(value >= 10 ** int(entry["positions"]) for value in expected_values):
             raise ValueError(f"numerical answer key Q{q_no} exceeds its digit capacity")
+
+
+def _numerical_answer_values(answer: str, q_no: int) -> list[int]:
+    """Parse equivalent numerical answers, for example ``35|36``."""
+    raw = str(answer)
+    values = [item.strip() for item in re.split(r"[|,]", raw) if item.strip()]
+    if not values or any(not re.fullmatch(r"[0-9]+", value) for value in values):
+        raise ValueError(f"numerical answer key Q{q_no} must contain one or more non-negative whole numbers")
+    if len(raw) > 100:
+        raise ValueError(f"numerical answer key Q{q_no} is too long")
+    return sorted({int(value) for value in values})
 
 
 def _mcq_answer_summary(result: dict) -> list[dict]:

@@ -12,10 +12,34 @@ from omr.generator.generate import generate_exam
 from omr.reader.digit_model import train_digit_model
 from omr.reader.handwriting import (
     RollOcrResult,
+    _roster_suggestion_from_cell_probabilities,
     build_roll_ocr_backend,
     normalize_handwritten_roll_text,
     read_continuation_roll_number,
 )
+
+
+def test_roster_probability_suggestion_is_review_only():
+    rows = [
+        {"2": 0.92, "3": 0.03},
+        {"0": 0.94, "1": 0.02},
+        {"2": 0.93, "3": 0.02},
+        {"3": 0.91, "8": 0.03},
+        {"0": 0.93, "8": 0.02},
+        {"4": 0.92, "5": 0.02},
+        {"6": 0.95, "8": 0.01},
+    ]
+    payload = {
+        "BTECH": {
+            "cells": {"raw": {"cells": [{"raw": {"class_probabilities": row}} for row in rows]}}
+        }
+    }
+
+    suggestion = _roster_suggestion_from_cell_probabilities(payload, {"2023046", "2023858"})
+
+    assert suggestion is not None
+    assert suggestion["roll_no"] == "2023046"
+    assert suggestion["policy"] == "review_only_literal_ocr_unchanged"
 
 
 DPI = 200

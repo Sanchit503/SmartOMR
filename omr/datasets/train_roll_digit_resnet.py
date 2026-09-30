@@ -127,7 +127,28 @@ def _augment_image(image: Image.Image) -> Image.Image:
         image = ImageEnhance.Contrast(image).enhance(random.uniform(0.85, 1.25))
     if random.random() < 0.35:
         image = ImageEnhance.Brightness(image).enhance(random.uniform(0.90, 1.10))
+    if random.random() < 0.40:
+        image = _simulate_faint_pencil(image)
     return image
+
+
+def _simulate_faint_pencil(image: Image.Image) -> Image.Image:
+    """Fade ink and add mild uneven illumination without erasing its shape.
+
+    Real pencil marks can be visible to a person yet be only a small local
+    contrast change after scanning. Training on this variation makes the
+    ResNet less dependent on dark pen strokes. It is applied only to training
+    crops, never validation data.
+    """
+    array = np.asarray(image.convert("L"), dtype=np.float32)
+    ink_strength = random.uniform(0.28, 0.72)
+    faded = 255.0 - (255.0 - array) * ink_strength
+    height, width = faded.shape
+    left = random.uniform(-7.0, 7.0)
+    right = random.uniform(-7.0, 7.0)
+    illumination = np.linspace(left, right, width, dtype=np.float32)[None, :]
+    illumination = np.repeat(illumination, height, axis=0)
+    return Image.fromarray(np.clip(faded + illumination, 0, 255).astype(np.uint8), mode="L")
 
 
 class ResidualBlock(nn.Module):

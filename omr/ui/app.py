@@ -52,6 +52,7 @@ from omr.workflows.batch import (
     _PageRecord,
     _mcq_answer_summary,
     _page_identity,
+    _relative_identity_payload,
     _write_review_reports,
     _write_student_group,
     parse_exam_bundle,
@@ -294,8 +295,10 @@ def _write_answer_key_from_form(manifest: dict, fields: dict[str, str], output_p
                 raise ValueError(f"answer key is missing Q{q_no}; enter an answer or mark it dropped")
             if question["kind"] == "mcq" and answer not in set(question.get("options") or []):
                 raise ValueError(f"MCQ Q{q_no} answer must be one of {', '.join(question.get('options') or [])}")
-            if question["kind"] == "numerical" and not re.fullmatch(r"[0-9]+", answer):
-                raise ValueError(f"numerical Q{q_no} answer must be digits only")
+            if question["kind"] == "numerical" and not all(
+                re.fullmatch(r"[0-9]+", item.strip()) for item in re.split(r"[|,]", answer) if item.strip()
+            ):
+                raise ValueError(f"numerical Q{q_no} answer must be digits, or alternatives separated by |")
             writer.writerow({"q_no": q_no, "answer": answer, "marks": marks})
     return output_path
 
@@ -1415,6 +1418,9 @@ class RunStore:
                     index["counts"]["aligned"] + index["counts"]["needs_review"]
                 ):
                     raise ValueError("Complete page inspection with at least one aligned page before evaluation.")
+                preview_path = Path(str(state.get("identity_preview_path") or ""))
+                if not preview_path.is_file():
+                    raise ValueError("Preview roll detection before evaluation so page identities can be reviewed.")
             target = self._run_batch if evaluate else self._run_inspection
             self.write_state(
                 run_id,
@@ -1422,6 +1428,21 @@ class RunStore:
                 stage="Queued",
             )
             self._worker = threading.Thread(target=target, args=(run_id,), daemon=True)
+            self._worker.start()
+
+    def start_identity_preview(self, run_id: str) -> None:
+        """Read literal page identities after inspection, without grouping or grading."""
+        with self._worker_lock:
+            if self._worker and self._worker.is_alive():
+                raise ValueError("Another operation is running. Wait for it to finish before starting this run.")
+            state = self.read_state(run_id)
+            index = self.inspection_index(run_id)
+            if state.get("parse_index_path"):
+                raise ValueError("Evaluation already exists for this run; create a new run for a new identity preview.")
+            if index["status"] != "completed":
+                raise ValueError("Complete page inspection before previewing roll detection.")
+            self.write_state(run_id, status="identity_previewing", stage="Preparing roll detection preview", error=None)
+            self._worker = threading.Thread(target=self._run_identity_preview, args=(run_id,), daemon=True)
             self._worker.start()
 
     def assign_inspection_page(self, run_id: str, source_index: int, page_index: int) -> dict[str, Any]:
@@ -1481,6 +1502,76 @@ class RunStore:
                 status="inspection_interrupted",
                 stage="Inspection interrupted",
                 error=index["error"],
+            )
+
+    def _run_identity_preview(self, run_id: str) -> None:
+        """Produce review evidence only; this cannot assign page ownership."""
+        try:
+            state = self.read_state(run_id)
+            inputs = state["inputs"]
+            run_dir = self.run_dir(run_id)
+            manifest = load_manifest(inputs["manifest_path"])
+            students = load_students(inputs["students_path"]) if inputs.get("students_path") else None
+            valid_rolls = set(students) if students else None
+            backend, backend_state = _require_ui_roll_ocr_backend()
+            self.write_state(run_id, roll_ocr=backend_state, stage="Loading inspected pages for roll preview")
+            pages, unavailable = _load_inspected_pages(run_dir)
+            total = len(pages) + len(unavailable)
+            rows: list[dict[str, Any]] = []
+            preview_root = run_dir / "identity_preview"
+            for source_index in range(1, total + 1):
+                aligned = pages.get(source_index)
+                if aligned is None:
+                    rows.append({"source_index": source_index, "status": "unavailable", "reason": unavailable.get(source_index)})
+                    continue
+                identity_dir = preview_root / f"source_{source_index:04d}"
+                kind, roll_no, program, confidence, payload, flags = _page_identity(
+                    aligned, manifest, 200.0, identity_dir, backend, valid_rolls,
+                )
+                review = not roll_no or confidence == "low" or bool(flags)
+                rows.append({
+                    "source_index": source_index,
+                    "sheet_page": aligned.page_index,
+                    "identity_kind": kind,
+                    "literal_roll_no": roll_no,
+                    "program": program,
+                    "confidence": confidence,
+                    "roster_member": bool(valid_rolls is not None and roll_no in valid_rolls),
+                    "status": "needs_review" if review else "detected",
+                    "review_flags": flags,
+                    "identity": _relative_identity_payload(payload, run_dir),
+                })
+                self.write_state(run_id, stage=f"Previewing roll detection: {source_index}/{total}")
+            counts = {
+                "detected": sum(row["status"] == "detected" for row in rows),
+                "needs_review": sum(row["status"] == "needs_review" for row in rows),
+                "undetected": sum(not row.get("literal_roll_no") for row in rows),
+                "unavailable": sum(row["status"] == "unavailable" for row in rows),
+            }
+            preview = {
+                "version": 1,
+                "status": "completed",
+                "created_at": _now(),
+                "policy": "preview-only; literal identity reads do not group pages or change roster records",
+                "counts": counts,
+                "pages": rows,
+            }
+            preview_path = preview_root / "index.json"
+            _write_json(preview_path, preview)
+            self.write_state(
+                run_id,
+                status="identity_previewed",
+                stage="Roll detection preview complete",
+                identity_preview_path=str(preview_path),
+                error=None,
+            )
+        except Exception as exc:
+            self.write_state(
+                run_id,
+                status="identity_preview_failed",
+                stage="Roll detection preview failed",
+                error=f"{type(exc).__name__}: {exc}",
+                traceback=traceback.format_exc(),
             )
 
     def _run_batch(self, run_id: str) -> None:
@@ -1650,6 +1741,9 @@ class SmartOmrUiHandler(BaseHTTPRequestHandler):
                 if len(parts) == 3 and parts[2] in {"inspect", "evaluate"}:
                     self.store.start_run(parts[1], evaluate=parts[2] == "evaluate")
                     self._redirect(f"/runs/{parts[1]}/pages")
+                elif len(parts) == 3 and parts[2] == "identity-preview":
+                    self.store.start_identity_preview(parts[1])
+                    self._redirect(f"/runs/{parts[1]}/pages")
                 elif len(parts) == 5 and parts[2] == "pages" and parts[4] == "page-index":
                     self._assign_page_index(parts[1], int(parts[3]))
                 elif len(parts) == 5 and parts[2] == "students" and parts[4] in {"verify", "hold", "reject"}:
@@ -1706,24 +1800,46 @@ class SmartOmrUiHandler(BaseHTTPRequestHandler):
         if not path.is_relative_to(root.resolve()) or not path.is_file():
             self._not_found()
             return
-        self._send_file(path, mimetypes.guess_type(str(path))[0] or "application/octet-stream")
+        # Windows can register .js as text/plain. With our nosniff header that
+        # prevents browsers from executing the inspection client altogether.
+        content_types = {
+            ".js": "application/javascript; charset=utf-8",
+            ".css": "text/css; charset=utf-8",
+        }
+        self._send_file(
+            path,
+            content_types.get(path.suffix.lower())
+            or mimetypes.guess_type(str(path))[0]
+            or "application/octet-stream",
+        )
 
     def _inspection_json(self, run_id: str) -> None:
         state = self.store.read_state(run_id)
         index = self.store.inspection_index(run_id)
+        preview_path = Path(str(state.get("identity_preview_path") or ""))
+        preview = _read_json(preview_path) if preview_path.is_file() else None
         index["run_status"] = state["status"]
         index["stage"] = state.get("stage")
         index["run_error"] = state.get("error")
         index["evaluated"] = bool(state.get("parse_index_path"))
+        index["identity_preview"] = preview
+        index["can_identity_preview"] = (
+            not index["evaluated"]
+            and state["status"] not in {"queued", "running", "inspecting", "identity_previewing"}
+            and index["status"] == "completed"
+            and bool(index["counts"]["aligned"] + index["counts"]["needs_review"])
+        )
         index["can_evaluate"] = (
             not index["evaluated"]
-            and state["status"] not in {"queued", "running", "inspecting"}
+            and state["status"] not in {"queued", "running", "inspecting", "identity_previewing"}
             and index["status"] == "completed"
             and bool(index["counts"]["aligned"] + index["counts"]["needs_review"])
             and not (self.store.run_dir(run_id) / "parsed").exists()
+            and preview is not None
+            and preview.get("status") == "completed"
         )
         index["can_inspect"] = (
-            state["status"] not in {"queued", "running", "inspecting"}
+            state["status"] not in {"queued", "running", "inspecting", "identity_previewing"}
             and (index["status"] != "completed" or bool(index["counts"]["failed"]))
         )
         payload = json.dumps(index).encode("utf-8")

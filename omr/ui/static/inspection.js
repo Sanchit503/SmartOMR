@@ -159,10 +159,22 @@
       else byId("progress").value = inventory.processed;
       byId("inspect-form").hidden = !inventory.can_inspect;
       byId("inspect-form").querySelector("button").textContent = inventory.status === "completed" ? "Retry Failed Pages" : "Resume Inspection";
+      byId("identity-preview-form").hidden = !inventory.can_identity_preview;
+      byId("identity-preview-form").querySelector("button").textContent = inventory.identity_preview?.status === "completed" ? "Refresh Roll Preview" : "Preview Roll Detection";
       byId("evaluate-form").hidden = !inventory.can_evaluate;
       byId("review-link").hidden = !inventory.evaluated;
       alertText("run-error", inventory.run_error || inventory.error);
       alertText("connection-error", "");
+      const preview = inventory.identity_preview;
+      const previewSummary = byId("identity-preview-summary");
+      if (preview?.status === "completed") {
+        const counts = preview.counts || {};
+        previewSummary.hidden = false;
+        previewSummary.textContent = `Roll preview: ${counts.detected || 0} literal rolls detected, ${counts.needs_review || 0} need review, ${counts.undetected || 0} not detected. Review this before starting evaluation.`;
+      } else if (inventory.run_status === "identity_previewing") {
+        previewSummary.hidden = false;
+        previewSummary.textContent = inventory.stage || "Reading rolls from inspected pages";
+      } else previewSummary.hidden = true;
       text("file-name", inventory.source_name);
       text("render-dpi", inventory.source_name.toLowerCase().endsWith(".pdf") ? `${inventory.dpi} DPI (PDF)` : "Native image");
       text("source-hash", inventory.source_sha256);

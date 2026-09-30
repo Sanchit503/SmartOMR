@@ -295,6 +295,10 @@ class LocalResnetProbabilityEnsembleRollOcr:
                         "top_probability": float(row[index]),
                         "runner_up_probability": runner_up,
                         "probability_margin": float(row[index]) - runner_up,
+                        "class_probabilities": {
+                            label: round(float(probability), 6)
+                            for label, probability in zip(self.labels, row)
+                        },
                         "enhancement": enhancement,
                         "enhancement_disagreement": disagreement,
                     },
@@ -763,6 +767,21 @@ def _read_write_in_roll_number(
         if strip_normalized:
             candidates.append((program, strip_normalized, strip_result.confidence, strip_result.text, "strip"))
 
+    # The roster can help a professor inspect a likely correction, but it must
+    # never replace the literal OCR result or establish page ownership. The
+    # grouping workflow consumes only the literal read above.
+    if valid_rolls:
+        suggestion = _roster_suggestion_from_cell_probabilities(ocr_results, valid_rolls)
+        if suggestion is not None:
+            ocr_results["_roster_suggestion"] = suggestion
+            if bool(suggestion["clear"]):
+                review_flags.append(
+                    "roster suggests "
+                    f"{suggestion['roll_no']} from ResNet cell probabilities "
+                    f"(score {suggestion['score']:.2f}, margin {suggestion['margin']:.2f}); "
+                    "literal OCR remains unchanged and manual review is required"
+                )
+
     if not candidates:
         review_flags.append("handwritten roll OCR did not produce a valid roll number")
         return HandwrittenRollRead(
@@ -822,6 +841,76 @@ def _read_write_in_roll_number(
         ocr_results=ocr_results,
         review_flags=review_flags,
     )
+
+
+def _roster_suggestion_from_cell_probabilities(
+    ocr_results: dict[str, dict[str, object]],
+    valid_rolls: set[str],
+) -> dict[str, object] | None:
+    """Rank roster values for review without changing an OCR prediction.
+
+    This is deliberately an advisory function. It is useful when a student
+    made a one-digit error, but acceptance would make the roster a hidden OCR
+    decoder and could attach another student's page.
+    """
+    ranked: list[tuple[float, str, str]] = []
+    for program, payload in ocr_results.items():
+        if program.startswith("_"):
+            continue
+        cell_payload = payload.get("cells")
+        if not isinstance(cell_payload, dict):
+            continue
+        raw = cell_payload.get("raw")
+        if not isinstance(raw, dict) or not isinstance(raw.get("cells"), list):
+            continue
+        probability_rows: list[dict[str, float]] = []
+        for cell in raw["cells"]:
+            if not isinstance(cell, dict) or not isinstance(cell.get("raw"), dict):
+                probability_rows = []
+                break
+            probabilities = cell["raw"].get("class_probabilities")
+            if not isinstance(probabilities, dict):
+                probability_rows = []
+                break
+            probability_rows.append({str(label): float(value) for label, value in probabilities.items()})
+        if not probability_rows:
+            continue
+        for roll_no in valid_rolls:
+            labels = _roster_roll_labels(roll_no, program)
+            if labels is None or len(labels) != len(probability_rows):
+                continue
+            score = float(np.exp(np.mean(np.log([max(1e-6, row.get(label, 0.0)) for row, label in zip(probability_rows, labels)]))))
+            ranked.append((score, roll_no, program))
+    if not ranked:
+        return None
+    ranked.sort(reverse=True)
+    score, roll_no, program = ranked[0]
+    runner_up = ranked[1][0] if len(ranked) > 1 else 0.0
+    margin = score - runner_up
+    return {
+        "roll_no": roll_no,
+        "program": program,
+        "score": round(score, 6),
+        "margin": round(margin, 6),
+        "clear": score >= 0.62 and margin >= 0.12,
+        "candidate_count": len(ranked),
+        "policy": "review_only_literal_ocr_unchanged",
+    }
+
+
+def _roster_roll_labels(roll_no: str, program: str) -> list[str] | None:
+    """Return digit labels only for a roster value matching this field."""
+    value = normalize_handwritten_roll_text(roll_no, program=program)
+    if value is None:
+        return None
+    normalized_program = program.upper()
+    if normalized_program == "BTECH":
+        return list(value) if value.isdigit() and len(value) == 7 else None
+    if normalized_program == "MTECH" and value.startswith("MT"):
+        return list(value[2:])
+    if normalized_program == "PHD" and value.startswith("PHD"):
+        return list(value[3:])
+    return None
 
 
 def _gray_array(image: object) -> np.ndarray:

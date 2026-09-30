@@ -1,0 +1,74 @@
+{
+  "kind": "roll_digit_resnet_probability_ensemble",
+  "training_data": "Kaggle digits pretraining followed by private OMR fine-tuning; source data is intentionally not versioned.",
+  "kaggle_epochs": 4,
+  "kaggle_limit": null,
+  "member_count": 7,
+  "members": [
+    {
+      "member": 1,
+      "seed": 557,
+      "kaggle_pretrained_path": "data\\models\\roll_digit_ensemble_7\\kaggle_pretrained_member_01_seed_557.pt",
+      "model_path": "data\\models\\roll_digit_ensemble_7\\omr_finetuned_member_01_seed_557.pt",
+      "metrics_path": "data\\models\\roll_digit_ensemble_7\\omr_finetuned_member_01_seed_557.metrics.json",
+      "checkpoint_sha256": "7a85a82c8394518335a40c2993e47ca7d0f10059580cebf082f39ad077921f97",
+      "best_val_accuracy": 0.979381443298969
+    },
+    {
+      "member": 2,
+      "seed": 558,
+      "kaggle_pretrained_path": "data\\models\\roll_digit_ensemble_7\\kaggle_pretrained_member_02_seed_558.pt",
+      "model_path": "data\\models\\roll_digit_ensemble_7\\omr_finetuned_member_02_seed_558.pt",
+      "metrics_path": "data\\models\\roll_digit_ensemble_7\\omr_finetuned_member_02_seed_558.metrics.json",
+      "checkpoint_sha256": "67ac4af3633f46a9f43d596361c996864a34c4918bdbdc4495ba3ef055885552",
+      "best_val_accuracy": 0.9871134020618557
+    },
+    {
+      "member": 3,
+      "seed": 559,
+      "kaggle_pretrained_path": "data\\models\\roll_digit_ensemble_7\\kaggle_pretrained_member_03_seed_559.pt",
+      "model_path": "data\\models\\roll_digit_ensemble_7\\omr_finetuned_member_03_seed_559.pt",
+      "metrics_path": "data\\models\\roll_digit_ensemble_7\\omr_finetuned_member_03_seed_559.metrics.json",
+      "checkpoint_sha256": "a51a25acf73b3d9837c152c9c4501c8950c1e901ac6b950398761bf40414a88b",
+      "best_val_accuracy": 0.9819587628865979
+    },
+    {
+      "member": 4,
+      "seed": 560,
+      "kaggle_pretrained_path": "data\\models\\roll_digit_ensemble_7\\kaggle_pretrained_member_04_seed_560.pt",
+      "model_path": "data\\models\\roll_digit_ensemble_7\\omr_finetuned_member_04_seed_560.pt",
+      "metrics_path": "data\\models\\roll_digit_ensemble_7\\omr_finetuned_member_04_seed_560.metrics.json",
+      "checkpoint_sha256": "c1a157125f8467e8bfff493b591217e59da3fbff7ee7b69a9ab034e689e989a6",
+      "best_val_accuracy": 0.9819587628865979
+    },
+    {
+      "member": 5,
+      "seed": 561,
+      "kaggle_pretrained_path": "data\\models\\roll_digit_ensemble_7\\kaggle_pretrained_member_05_seed_561.pt",
+      "model_path": "data\\models\\roll_digit_ensemble_7\\omr_finetuned_member_05_seed_561.pt",
+      "metrics_path": "data\\models\\roll_digit_ensemble_7\\omr_finetuned_member_05_seed_561.metrics.json",
+      "checkpoint_sha256": "a999c95be8cbd3a1b0c1f130d1b13191216ed496c9dfd613b0a3b796e9c1e445",
+      "best_val_accuracy": 0.979381443298969
+    },
+    {
+      "member": 6,
+      "seed": 562,
+      "kaggle_pretrained_path": "data\\models\\roll_digit_ensemble_7\\kaggle_pretrained_member_06_seed_562.pt",
+      "model_path": "data\\models\\roll_digit_ensemble_7\\omr_finetuned_member_06_seed_562.pt",
+      "metrics_path": "data\\models\\roll_digit_ensemble_7\\omr_finetuned_member_06_seed_562.metrics.json",
+      "checkpoint_sha256": "895da00dd6e68c92f3170a03f761e3028df072bbcde96b0d30de1f73df50880f",
+      "best_val_accuracy": 0.9845360824742269
+    },
+    {
+      "member": 7,
+      "seed": 563,
+      "kaggle_pretrained_path": "data\\models\\roll_digit_ensemble_7\\kaggle_pretrained_member_07_seed_563.pt",
+      "model_path": "data\\models\\roll_digit_ensemble_7\\omr_finetuned_member_07_seed_563.pt",
+      "metrics_path": "data\\models\\roll_digit_ensemble_7\\omr_finetuned_member_07_seed_563.metrics.json",
+      "checkpoint_sha256": "33e886e4da423e35ca98608497552577ec882f97dc8ee59d9ad346b59c945b9e",
+      "best_val_accuracy": 0.9871134020618557
+    }
+  ],
+  "aggregation": "validation-weighted probability average",
+  "decision_policy": "literal ResNet prediction only; the roster validates and suggests review candidates but never rewrites identity"
+}

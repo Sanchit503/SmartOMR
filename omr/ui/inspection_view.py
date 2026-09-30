@@ -26,6 +26,7 @@ def inspection_body(state: dict) -> str:
         <div class="run-actions">
           <a class="quiet-command" href="{source_url}">{_icon('download')}Source file</a>
           <form id="inspect-form" method="post" action="/runs/{run_id}/inspect" hidden><button class="secondary" type="submit">Resume Inspection</button></form>
+          <form id="identity-preview-form" method="post" action="/runs/{run_id}/identity-preview" hidden><button class="secondary" type="submit">Preview Roll Detection</button></form>
           <form id="evaluate-form" method="post" action="/runs/{run_id}/evaluate" hidden><button type="submit">Run OCR &amp; Grouping{_icon('arrow-right')}</button></form>
           <a id="review-link" class="button" href="/runs/{run_id}" hidden>Student Review{_icon('arrow-right')}</a>
         </div>
@@ -39,6 +40,7 @@ def inspection_body(state: dict) -> str:
       </div>
       <div id="connection-error" class="inspection-alert" role="alert" hidden></div>
       <div id="run-error" class="inspection-alert" role="alert" hidden></div>
+      <div id="identity-preview-summary" class="inspection-alert" hidden></div>
       <div class="inspection-workspace">
         <aside class="source-sidebar" aria-label="Source pages">
           <div class="source-filters">

@@ -252,7 +252,8 @@ def test_http_inventory_assets_and_error_routes(tmp_path, generated, monkeypatch
         assert b"Detected sheet page" in body and b"Run OCR &amp; Grouping" in body
         payload, headers = get(base + "/inspection.json")
         index = json.loads(payload)
-        assert index["total"] == 2 and index["can_evaluate"]
+        assert index["total"] == 2 and index["can_identity_preview"]
+        assert not index["can_evaluate"]
         assert headers["Cache-Control"] == "no-store"
         image, _ = get(base + "/pages/1/original")
         assert Image.open(io.BytesIO(image)).size == (8, 12)
@@ -261,6 +262,8 @@ def test_http_inventory_assets_and_error_routes(tmp_path, generated, monkeypatch
         assert headers["Content-Type"] == "application/json"
         for resource in ("inspection.css", "inspection.js", "icons/zoom-in.svg", "icons/LICENSE"):
             assert get(f"{url}/static/{resource}")[0]
+        _, headers = get(f"{url}/static/inspection.js")
+        assert headers["Content-Type"].startswith("application/javascript")
         for path, code in (("/pages/0/original", 400), ("/pages/3/original", 400), ("/pages/1/unknown", 400)):
             with pytest.raises(urllib.error.HTTPError) as error:
                 get(base + path)

@@ -508,6 +508,7 @@ def _measure_bubble_anchors(
     page_index: int,
     dpi: float,
     review_flags: list[str],
+    warnings: list[str],
 ) -> dict[str, Any]:
     scale = px_per_mm(dpi)
     anchor_blocks = _expected_bubble_anchor_blocks(manifest, page_index)
@@ -548,12 +549,12 @@ def _measure_bubble_anchors(
             f"({matched_count}/{expected_count} printed bubbles re-detected)"
         )
     if residuals_px and mean_residual_mm > 0.85:
-        review_flags.append(
+        warnings.append(
             "bubble grid is locally shifted "
             f"(mean residual {mean_residual_mm:.2f}mm)"
         )
     if residuals_px and max_residual_mm > 1.75:
-        review_flags.append(
+        warnings.append(
             "at least one bubble anchor is far from its manifest position "
             f"(max residual {max_residual_mm:.2f}mm)"
         )
@@ -640,7 +641,7 @@ def assess_alignment_quality(
 
     metrics["registration_markers"] = _measure_marker_quality(gray, manifest, page_index, dpi, geometry_flags)
     metrics["page_marks"] = _measure_page_marks(gray, manifest, page_index, dpi, geometry_flags)
-    metrics["bubble_anchors"] = _measure_bubble_anchors(gray, manifest, page_index, dpi, local_flags)
+    metrics["bubble_anchors"] = _measure_bubble_anchors(gray, manifest, page_index, dpi, local_flags, warnings)
     metrics["image_quality"] = _measure_image_quality(gray, warnings, image_flags)
     metrics["image_quality"]["status"] = _quality_status(image_flags, warnings)
 
