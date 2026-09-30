@@ -624,6 +624,38 @@ def _load_inspected_pages(run_dir: Path) -> tuple[dict[int, AlignedPage], dict[i
     return pages, errors
 
 
+def _identity_preview_status(roll_no: str | None, confidence: str, flags: list[str]) -> str:
+    """Keep faint-image observations distinct from actual identity uncertainty."""
+    identity_warning = any(
+        marker in str(flag).lower()
+        for flag in flags
+        for marker in ("could not be decoded", "low confidence", "conflicts with", "requires manual")
+    )
+    if not roll_no or confidence == "low" or identity_warning:
+        return "needs_review"
+    return "detected_with_caution" if flags else "detected"
+
+
+def _refresh_identity_preview_counts(preview: dict[str, Any]) -> None:
+    """Migrate stored preview labels when the audit policy becomes more precise."""
+    for row in preview.get("pages", []):
+        if row.get("status") == "unavailable":
+            continue
+        raw_flags = row.get("review_flags", [])
+        flags = [str(raw_flags)] if isinstance(raw_flags, str) else [str(flag) for flag in raw_flags]
+        row["status"] = _identity_preview_status(
+            row.get("literal_roll_no"), str(row.get("confidence") or "low"), flags,
+        )
+    rows = list(preview.get("pages", []))
+    preview["counts"] = {
+        "detected": sum(row.get("status") in {"detected", "detected_with_caution"} for row in rows),
+        "detected_with_caution": sum(row.get("status") == "detected_with_caution" for row in rows),
+        "needs_review": sum(row.get("status") == "needs_review" for row in rows),
+        "undetected": sum(not row.get("literal_roll_no") for row in rows),
+        "unavailable": sum(row.get("status") == "unavailable" for row in rows),
+    }
+
+
 def _xlsx_shared_strings(zf: zipfile.ZipFile) -> list[str]:
     path = "xl/sharedStrings.xml"
     if path not in zf.namelist():
@@ -1559,16 +1591,7 @@ class RunStore:
                 kind, roll_no, program, confidence, payload, flags = _page_identity(
                     aligned, manifest, 200.0, identity_dir, backend, valid_rolls,
                 )
-                # Quality observations (for example, a faint pencil trace or a
-                # slightly shifted grid) are useful audit evidence, but they do
-                # not erase a complete, high-confidence literal roll read.
-                identity_warning = any(
-                    marker in str(flag).lower()
-                    for flag in flags
-                    for marker in ("could not be decoded", "low confidence", "conflicts with", "requires manual")
-                )
-                review = not roll_no or confidence == "low" or identity_warning
-                status = "needs_review" if review else "detected_with_caution" if flags else "detected"
+                status = _identity_preview_status(roll_no, confidence, flags)
                 rows.append({
                     "source_index": source_index,
                     "sheet_page": aligned.page_index,
@@ -1582,21 +1605,15 @@ class RunStore:
                     "identity": _relative_identity_payload(payload, run_dir),
                 })
                 self.write_state(run_id, stage=f"Previewing roll detection: {source_index}/{total}")
-            counts = {
-                "detected": sum(row["status"] in {"detected", "detected_with_caution"} for row in rows),
-                "detected_with_caution": sum(row["status"] == "detected_with_caution" for row in rows),
-                "needs_review": sum(row["status"] == "needs_review" for row in rows),
-                "undetected": sum(not row.get("literal_roll_no") for row in rows),
-                "unavailable": sum(row["status"] == "unavailable" for row in rows),
-            }
             preview = {
                 "version": 1,
                 "status": "completed",
                 "created_at": _now(),
                 "policy": "preview-only; literal identity reads do not group pages or change roster records",
-                "counts": counts,
+                "counts": {},
                 "pages": rows,
             }
+            _refresh_identity_preview_counts(preview)
             preview_path = preview_root / "index.json"
             _write_json(preview_path, preview)
             existing_evaluation = bool(state.get("parse_index_path"))
@@ -1863,6 +1880,8 @@ class SmartOmrUiHandler(BaseHTTPRequestHandler):
         index = self.store.inspection_index(run_id)
         preview_path = Path(str(state.get("identity_preview_path") or ""))
         preview = _read_json(preview_path) if preview_path.is_file() else None
+        if preview is not None:
+            _refresh_identity_preview_counts(preview)
         index["run_status"] = state["status"]
         index["stage"] = state.get("stage")
         index["run_error"] = state.get("error")
