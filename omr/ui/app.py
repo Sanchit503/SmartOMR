@@ -2653,6 +2653,11 @@ class SmartOmrUiHandler(BaseHTTPRequestHandler):
             "inspecting",
             "inspected",
             "inspection_interrupted",
+            "identity_previewing",
+            "identity_previewed",
+            "identity_preview_failed",
+            "queued",
+            "running",
         }:
             self._redirect(f"/runs/{run_id}/pages")
             return

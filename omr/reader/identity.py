@@ -111,15 +111,18 @@ def _marked_roll_digits(signals: dict[int, tuple[float, float]]) -> list[int]:
 def _roll_confidence(roll_no: str | None, flags: list[str]) -> str:
     if not roll_no:
         return "low"
-    severe_terms = (
-        "blank",
-        "could not",
-        "multiple filled",
-        "too close",
-        "only faint",
-        "also has marks",
-    )
-    if any(any(term in flag for term in severe_terms) for flag in flags):
+    # A blank program selector is not a blank digit column. The previous
+    # substring check treated both as equally severe and downgraded otherwise
+    # complete BTech roll grids to low confidence.
+    def severe(flag: str) -> bool:
+        value = flag.lower()
+        if value.startswith("could not") or value.startswith("completed digit grid"):
+            return True
+        if "roll column" not in value:
+            return False
+        return any(term in value for term in (" is blank", "multiple filled", "too close", "only faint"))
+
+    if any(severe(str(flag)) for flag in flags):
         return "low"
     if flags:
         return "medium"

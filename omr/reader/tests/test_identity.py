@@ -9,10 +9,15 @@ from PIL import Image, ImageDraw
 from omr.contracts.geometry import mm_to_px, px_per_mm
 from omr.generator.config import ExamConfig
 from omr.generator.generate import generate_exam
-from omr.reader.identity import read_roll_number
+from omr.reader.identity import _roll_confidence, read_roll_number
 
 
 DPI = 200
+
+
+def test_blank_program_selector_does_not_invalidate_complete_roll_digits():
+    assert _roll_confidence("2023011", ["program selector is blank"]) == "medium"
+    assert _roll_confidence("2023011", ["BTECH roll column 3 is blank"]) == "low"
 
 
 def _page(tmp_path: Path) -> tuple[dict, Image.Image]:

@@ -183,6 +183,88 @@ def test_identity_grouping_refuses_continuation_program_mismatch():
     assert any("does not match" in flag for flag in page_two.review_flags)
 
 
+def test_exact_cross_page_recovery_allows_blank_btech_selector_with_exact_roll():
+    page_one = _record(11, 1, "2023011", "medium")
+    page_one.identity_payload = {
+        "write_in_roll_read": {"roll_no": "2023011", "confidence": "medium"}
+    }
+    page_two = _record(47, 2, "2023011", "medium")
+    page_two.review_flags.append("page 2 continuation program selector is blank")
+
+    grouped, unmatched = _group_records_by_identity(
+        [page_one, page_two], "high", valid_rolls={"2023011"}
+    )
+    grouped, unmatched = _reconcile_exact_cross_page_roll_pairs(
+        [page_one, page_two],
+        grouped,
+        unmatched,
+        page_one_index=1,
+        valid_rolls={"2023011"},
+    )
+
+    assert [record.source_index for record in grouped["2023011"]] == [11, 47]
+    assert unmatched == []
+
+
+def test_exact_cross_page_recovery_refuses_blank_mtech_selector():
+    page_one = _record(11, 1, "MT25007", "medium")
+    page_one.program = "MTECH"
+    page_one.identity_payload = {
+        "write_in_roll_read": {"roll_no": "MT25007", "confidence": "medium"}
+    }
+    page_two = _record(47, 2, "MT25007", "medium")
+    page_two.program = "MTECH"
+    page_two.review_flags.append("page 2 continuation program selector is blank")
+
+    grouped, unmatched = _group_records_by_identity(
+        [page_one, page_two], "high", valid_rolls={"MT25007"}
+    )
+    grouped, unmatched = _reconcile_exact_cross_page_roll_pairs(
+        [page_one, page_two],
+        grouped,
+        unmatched,
+        page_one_index=1,
+        valid_rolls={"MT25007"},
+    )
+
+    assert grouped == {"MT25007": [page_one]}
+    assert unmatched == [page_two]
+
+
+def test_identity_grouping_refuses_duplicate_page_one_claims():
+    first = _record(11, 1, "2023011", "high")
+    second = _record(12, 1, "2023011", "high")
+    for record in (first, second):
+        record.identity_payload = {
+            "write_in_roll_read": {"roll_no": "2023011", "confidence": "high"}
+        }
+
+    grouped, unmatched = _group_records_by_identity(
+        [first, second], "high", valid_rolls={"2023011"},
+    )
+
+    assert grouped == {}
+    assert {record.source_index for record in unmatched} == {11, 12}
+    assert all("duplicate page-1 ownership claim" in record.review_flags[-1] for record in unmatched)
+
+
+def test_identity_grouping_refuses_duplicate_continuation_claims():
+    page_one = _record(11, 1, "2023011", "high")
+    page_one.identity_payload = {
+        "write_in_roll_read": {"roll_no": "2023011", "confidence": "high"}
+    }
+    first = _record(47, 2, "2023011", "high")
+    second = _record(48, 2, "2023011", "high")
+
+    grouped, unmatched = _group_records_by_identity(
+        [page_one, first, second], "high", valid_rolls={"2023011"},
+    )
+
+    assert [record.source_index for record in grouped["2023011"]] == [11]
+    assert {record.source_index for record in unmatched} == {47, 48}
+    assert all("duplicate page-2 ownership claim" in record.review_flags[-1] for record in unmatched)
+
+
 def test_batch_consumes_inspected_alignment_without_realigning(tmp_path: Path, monkeypatch):
     result = generate_exam(
         ExamConfig(
@@ -387,6 +469,8 @@ def test_batch_pdf_groups_unordered_pages_by_page_identity(tmp_path: Path):
     pages = _render_pages(result["pdf_path"])
     _fill_btech_roll(pages[1], manifest, "2024587")
     _fill_continuation_program(pages[2], manifest, "BTECH")
+    _write_btech_roll_boxes(pages[1], manifest, 1, "2024587")
+    _write_btech_roll_boxes(pages[2], manifest, 2, "2024587")
 
     bundle_path = tmp_path / "unordered_bundle.pdf"
     pages[2].save(bundle_path, save_all=True, append_images=[pages[1]], resolution=DPI)
@@ -455,6 +539,7 @@ def test_batch_flags_first_page_write_in_roll_conflict(tmp_path: Path):
     manifest = result["manifest"]
     pages = _render_pages(result["pdf_path"])
     _fill_btech_roll(pages[1], manifest, "2024587")
+    _write_btech_roll_boxes(pages[1], manifest, 1, "2024587")
 
     bundle_path = tmp_path / "roll_conflict_bundle.pdf"
     pages[1].save(bundle_path, resolution=DPI)

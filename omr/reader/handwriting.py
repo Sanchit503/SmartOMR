@@ -28,6 +28,11 @@ from omr.reader.enhancement import enhance_faint_ink
 
 DEFAULT_RESNET_ROLL_MODEL = Path("data/models/roll_digit_resnet_omr_finetuned.pt")
 DEFAULT_RESNET_ROLL_ENSEMBLE_MANIFEST = Path("data/models/roll_digit_ensemble_7/ensemble_manifest.json")
+# Cell crops contain 1.5 mm context around the printed box. A 20% inset of
+# that padded crop corresponds to about a 12% inset of the actual cell.
+BLANK_CELL_INSET_FRACTION = 0.20
+BLANK_CELL_INK_FRACTION = 0.005
+BLANK_CELL_DARKNESS_DELTA = 25
 
 
 @dataclass(frozen=True)
@@ -98,6 +103,7 @@ class LocalResnetRollOcr:
     """Roll digit OCR backed by the project's fine-tuned handwritten-cell ResNet."""
 
     provider = "local_resnet_roll_digit"
+    fast_cell_first = True
 
     def __init__(self, model_path: str | Path) -> None:
         try:
@@ -155,6 +161,9 @@ class LocalResnetProbabilityEnsembleRollOcr:
     """Validation-weighted probability ensemble of fine-tuned roll-digit ResNets."""
 
     provider = "local_resnet_probability_ensemble"
+    # Exact manifest cell crops are the primary ResNet input. Whole-strip
+    # segmentation is retained only when the cells are not independently strong.
+    fast_cell_first = True
 
     def __init__(self, manifest_path: str | Path) -> None:
         try:
@@ -282,8 +291,6 @@ class LocalResnetProbabilityEnsembleRollOcr:
             ranked = np.sort(row)
             runner_up = float(ranked[-2]) if len(ranked) > 1 else 0.0
             confidence = float(row[index])
-            if disagreement:
-                confidence = min(confidence, 0.58)
             reads.append(
                 RollOcrResult(
                     "" if label == "blank" else label,
@@ -738,21 +745,28 @@ def _read_write_in_roll_number(
             review_flags=review_flags,
         )
 
-    programs_to_read = [selected_program] if selected_program and selected_program in crop_paths else list(crop_paths)
+    if selected_program and selected_program in crop_paths:
+        programs_to_read = [selected_program]
+    elif selector_flags:
+        # MTech and PhD share the five-digit layout. With no reliable selector,
+        # only the distinct BTech field can be used as a possible exact-anchor
+        # match; the grouping layer never infers MTech/PhD from this path.
+        programs_to_read = ["BTECH"] if "BTECH" in crop_paths else []
+        if programs_to_read:
+            review_flags.append("continuation selector unresolved; read BTECH field only")
+    else:
+        programs_to_read = list(crop_paths)
     candidates: list[tuple[str, str, float | None, str, str]] = []
+    empty_field = False
     for program in programs_to_read:
         crop_path = Path(crop_paths[program])
         cell_result = _read_roll_from_cells(ocr_backend, [Path(path) for path in cell_crop_paths.get(program, [])], program)
         cell_normalized = normalize_handwritten_roll_text(cell_result.text, program=program)
-        trusted_cells = bool(cell_normalized)
-        if getattr(ocr_backend, "fast_cell_first", False) and trusted_cells:
-            strip_result = RollOcrResult(
-                "",
-                confidence=None,
-                raw={"skipped": "validated cell OCR succeeded"},
-            )
-        else:
-            strip_result = ocr_backend.read_roll(crop_path, program=program, valid_rolls=valid_rolls)
+        cell_raw = cell_result.raw if isinstance(cell_result.raw, dict) else {}
+        empty_field = empty_field or bool(cell_raw.get("empty_field"))
+        # Strip segmentation is deliberately diagnostic only. It may be useful
+        # to a reviewer, but it cannot veto a literal exact-cell result.
+        strip_result = ocr_backend.read_roll(crop_path, program=program, valid_rolls=valid_rolls)
         strip_normalized = normalize_handwritten_roll_text(strip_result.text, program=program)
         ocr_results[program] = {
             "strip": _ocr_result_payload(strip_result),
@@ -764,17 +778,24 @@ def _read_write_in_roll_number(
         }
         if cell_normalized:
             candidates.append((program, cell_normalized, cell_result.confidence, cell_result.text, "cells"))
-        if strip_normalized:
+        if cell_normalized and strip_normalized and cell_normalized != strip_normalized:
+            review_flags.append(f"STRIP_DISAGREES: {program} cells={cell_normalized}, strip={strip_normalized}")
+        if not cell_normalized and strip_normalized:
             candidates.append((program, strip_normalized, strip_result.confidence, strip_result.text, "strip"))
+
+    if empty_field:
+        review_flags.append("EMPTY_FIELD: handwritten roll field has blank digit cells")
+        candidates = []
 
     # The roster can help a professor inspect a likely correction, but it must
     # never replace the literal OCR result or establish page ownership. The
     # grouping workflow consumes only the literal read above.
     if valid_rolls:
         suggestion = _roster_suggestion_from_cell_probabilities(ocr_results, valid_rolls)
-        if suggestion is not None:
+        if suggestion is not None and not empty_field:
             ocr_results["_roster_suggestion"] = suggestion
-            if bool(suggestion["clear"]):
+            literal_rolls = {roll for _program, roll, _confidence, _text, _source in candidates}
+            if bool(suggestion["clear"]) and suggestion["roll_no"] not in literal_rolls:
                 review_flags.append(
                     "roster suggests "
                     f"{suggestion['roll_no']} from ResNet cell probabilities "
@@ -920,6 +941,19 @@ def _gray_array(image: object) -> np.ndarray:
     return gray.astype(np.uint8, copy=False)
 
 
+def _relative_cell_ink(cell_path: Path) -> float:
+    """Measure handwritten ink away from the printed box border."""
+    gray = np.asarray(Image.open(cell_path).convert("L"), dtype=np.uint8)
+    height, width = gray.shape
+    inset_y = max(1, round(height * BLANK_CELL_INSET_FRACTION))
+    inset_x = max(1, round(width * BLANK_CELL_INSET_FRACTION))
+    interior = gray[inset_y : height - inset_y, inset_x : width - inset_x]
+    if interior.size == 0:
+        return 0.0
+    paper_level = float(np.percentile(interior, 90))
+    return float(np.mean(interior <= paper_level - BLANK_CELL_DARKNESS_DELTA))
+
+
 def _read_roll_from_cells(
     backend: RollOcrBackend,
     cell_paths: list[Path],
@@ -931,9 +965,21 @@ def _read_roll_from_cells(
         return RollOcrResult("", confidence=0.0, raw={"reason": "missing exact cell geometry"})
 
     def read_cell(cell_path: Path) -> RollOcrResult:
+        relative_ink = _relative_cell_ink(cell_path)
+        if relative_ink < BLANK_CELL_INK_FRACTION:
+            return RollOcrResult(
+                "",
+                confidence=1.0,
+                raw={"blank_cell": True, "relative_ink": relative_ink},
+            )
         if hasattr(backend, "read_digit"):
-            return backend.read_digit(cell_path)  # type: ignore[attr-defined]
-        return backend.read_roll(cell_path, program=program)
+            read = backend.read_digit(cell_path)  # type: ignore[attr-defined]
+        else:
+            read = backend.read_roll(cell_path, program=program)
+        raw = dict(read.raw) if isinstance(read.raw, dict) else {}
+        raw["blank_cell"] = False
+        raw["relative_ink"] = relative_ink
+        return RollOcrResult(read.text, confidence=read.confidence, raw=raw)
 
     if getattr(backend, "parallel_cell_reads", False) and len(cell_paths) > 1:
         with ThreadPoolExecutor(max_workers=min(8, len(cell_paths))) as executor:
@@ -944,20 +990,33 @@ def _read_roll_from_cells(
     digits = ""
     confidences: list[float] = []
     cell_payloads: list[dict[str, object]] = []
+    blank_count = 0
+    low_ink_digits: list[str] = []
     for result in results:
         digit = _first_digit(result.text)
         digits += digit or "?"
         if result.confidence is not None:
             confidences.append(float(result.confidence))
         cell_payloads.append(_ocr_result_payload(result))
+        raw = result.raw if isinstance(result.raw, dict) else {}
+        if bool(raw.get("blank_cell")):
+            blank_count += 1
+        if digit in {"1", "7"} and float(raw.get("relative_ink", 1.0)) < 0.012:
+            low_ink_digits.append(digit)
 
+    empty_field = blank_count >= 2 or (len(low_ink_digits) == len(results) and bool(low_ink_digits))
+    raw_payload = {
+        "cells": cell_payloads,
+        "blank_cell_count": blank_count,
+        "empty_field": empty_field,
+    }
     if "?" in digits:
-        return RollOcrResult(digits, confidence=0.0, raw={"cells": cell_payloads})
+        return RollOcrResult(digits, confidence=0.0, raw=raw_payload)
     text = _format_roll_digits(program, digits)
     # One wrong digit changes the entire student identity. Roll confidence is
     # bounded by the weakest cell instead of being hidden by the median.
     confidence = min(confidences) if confidences else 0.0
-    return RollOcrResult(text, confidence=confidence, raw={"cells": cell_payloads})
+    return RollOcrResult(text, confidence=confidence, raw=raw_payload)
 
 
 def _ocr_result_payload(result: RollOcrResult) -> dict[str, object]:
@@ -1006,18 +1065,14 @@ def _choose_digit_result(results: list[RollOcrResult], warnings: list[str] | Non
     )
     digit, confidences = ranked[0]
     confidence = _digit_vote_confidence(confidences, total_attempts=max(1, len(results)))
-    if len(ranked) > 1:
-        runner_up = ranked[1]
-        if len(runner_up[1]) == len(confidences):
-            confidence = min(confidence, 0.58)
-        else:
-            confidence = min(confidence, 0.72)
+    disagreement = len(ranked) > 1
     return RollOcrResult(
         digit,
         confidence=confidence,
         raw={
             "provider": "local_ensemble",
             "warnings": warnings or [],
+            "disagreement": disagreement,
             "votes": votes,
             "candidates": candidates,
         },
@@ -1047,8 +1102,6 @@ def _ensemble_confidence(
     confidence = max(agreeing)
     if len(agreeing) > 1:
         confidence = min(0.99, 0.08 + confidence)
-    if conflicting:
-        confidence = min(confidence, 0.58)
     return confidence
 
 
@@ -1286,8 +1339,8 @@ def _read_continuation_program(
 
 def _roll_confidence(confidence: float | None, review_flags: list[str]) -> str:
     value = confidence if confidence is not None else 0.65
-    if review_flags:
-        return "medium" if value >= 0.82 else "low"
+    if any(flag.startswith("EMPTY_FIELD") for flag in review_flags):
+        return "low"
     if value >= 0.82:
         return "high"
     if value >= 0.60:

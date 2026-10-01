@@ -242,8 +242,75 @@ def _page_one_write_in_matches_bubbles(record: _PageRecord) -> bool:
     if not isinstance(write_in, dict):
         return False
     write_roll_no = normalize_roll(str(write_in.get("roll_no") or "")) or None
-    write_confidence = str(write_in.get("confidence") or "low")
-    return write_roll_no == record.roll_no and _strong_enough(write_confidence, "medium")
+    return (
+        write_roll_no == record.roll_no
+        and _cell_roll_matches(write_in, record.roll_no)
+        and _cell_min_probability(write_in) >= 0.30
+        and _cell_geometric_mean(write_in) >= 0.55
+    )
+
+
+def _cell_payload(read: dict[str, Any]) -> dict[str, Any] | None:
+    program = str(read.get("program") or "").upper()
+    results = read.get("ocr_results")
+    if not isinstance(results, dict) or not program:
+        return None
+    payload = results.get(program)
+    return payload if isinstance(payload, dict) else None
+
+
+def _cell_roll_matches(read: dict[str, Any], roll_no: str) -> bool:
+    payload = _cell_payload(read)
+    if payload is None:
+        # Compatibility for older persisted run artifacts that predate exact
+        # cell payload storage. New reads always take the branch below.
+        return normalize_roll(str(read.get("roll_no") or "")) == roll_no
+    cells = payload.get("cells")
+    if not isinstance(cells, dict):
+        return False
+    return normalize_roll(str(cells.get("text") or "")) == roll_no
+
+
+def _cell_min_probability(read: dict[str, Any]) -> float:
+    payload = _cell_payload(read)
+    cells = payload.get("cells") if payload else None
+    if not isinstance(cells, dict):
+        return {"high": 0.90, "medium": 0.60}.get(str(read.get("confidence") or "").lower(), 0.0)
+    try:
+        return float(cells.get("confidence") or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _cell_geometric_mean(read: dict[str, Any]) -> float:
+    payload = _cell_payload(read)
+    cells = payload.get("cells") if payload else None
+    raw = cells.get("raw") if isinstance(cells, dict) else None
+    entries = raw.get("cells") if isinstance(raw, dict) else None
+    probabilities: list[float] = []
+    if isinstance(entries, list):
+        for entry in entries:
+            value = entry.get("raw", {}).get("top_probability") if isinstance(entry, dict) else None
+            try:
+                probabilities.append(float(value))
+            except (TypeError, ValueError):
+                continue
+    if probabilities:
+        return float(np.exp(np.mean(np.log(np.clip(probabilities, 1e-6, 1.0)))))
+    return _cell_min_probability(read)
+
+
+def _record_has_usable_cell_roll(record: _PageRecord, minimum: float = 0.30) -> bool:
+    payload = record.identity_payload or {}
+    read = payload.get("write_in_roll_read") if record.identity_kind == "bubbled" else payload
+    if not isinstance(read, dict) or not read:
+        # Compatibility for pre-evidence test records and persisted artifacts.
+        return _strong_enough(record.confidence, "medium")
+    return (
+        record.roll_no is not None
+        and _cell_roll_matches(read, record.roll_no)
+        and _cell_min_probability(read) >= minimum
+    )
 
 
 def _is_clear_program_inferred_anchor(record: _PageRecord, valid_rolls: set[str] | None) -> bool:
@@ -267,6 +334,27 @@ def _is_clear_program_inferred_anchor(record: _PageRecord, valid_rolls: set[str]
         "program inferred as ",
     )
     return all(flag.startswith(allowed) for flag in flags)
+
+
+def _has_blank_continuation_selector(record: _PageRecord) -> bool:
+    """Return whether a continuation page has no marked program selector."""
+    payload = record.identity_payload or {}
+    flags = [*record.review_flags, *[str(flag) for flag in payload.get("review_flags", [])]]
+    return any("continuation program selector is blank" in flag.lower() for flag in flags)
+
+
+def _continuation_program_matches_anchor(record: _PageRecord, anchor_program: str | None) -> bool:
+    """Allow blank-selector inference only for BTech continuation fields.
+
+    A blank selector is safe only when the literal handwritten roll already
+    matches a unique verified BTech page-one anchor. MTech and PhD share a
+    five-digit layout, so their blank selectors remain unmatched.
+    """
+    if not anchor_program or record.program != anchor_program:
+        return False
+    if not _has_blank_continuation_selector(record):
+        return True
+    return anchor_program == "BTECH" and record.program == "BTECH"
 
 
 def _best_page(existing: _PageRecord, challenger: _PageRecord) -> _PageRecord:
@@ -295,20 +383,37 @@ def _group_records_by_identity(
     verified_anchor_rolls: set[str] = set()
     verified_anchor_programs: dict[str, str | None] = {}
     ordered = sorted(records, key=lambda item: item.source_index)
+    anchor_claims: dict[str, list[_PageRecord]] = {}
     for record in ordered:
         if record.aligned_page.page_index != page_one_index:
             continue
+        exact_identity_match = _page_one_write_in_matches_bubbles(record)
         if record.roll_no and (
             _strong_enough(record.confidence, min_group_confidence)
+            or exact_identity_match
             or _is_clear_program_inferred_anchor(record, valid_rolls)
         ):
-            grouped.setdefault(record.roll_no, []).append(record)
-            if _page_one_write_in_matches_bubbles(record):
-                verified_anchor_rolls.add(record.roll_no)
-                verified_anchor_programs[record.roll_no] = record.program
+            anchor_claims.setdefault(record.roll_no, []).append(record)
         else:
             unmatched.append(record)
 
+    # Duplicate ownership claims are evidence of a scanner/OCR problem, not a
+    # tie that may be solved by selecting the most confident page.
+    for roll_no, claims in anchor_claims.items():
+        if len(claims) != 1:
+            for record in claims:
+                record.review_flags.append(
+                    f"duplicate page-1 ownership claim for roll {roll_no}; left unmatched"
+                )
+                unmatched.append(record)
+            continue
+        record = claims[0]
+        grouped.setdefault(roll_no, []).append(record)
+        if _page_one_write_in_matches_bubbles(record):
+            verified_anchor_rolls.add(roll_no)
+            verified_anchor_programs[roll_no] = record.program
+
+    continuation_claims: dict[tuple[str, int], list[_PageRecord]] = {}
     for record in ordered:
         if record.aligned_page.page_index == page_one_index:
             continue
@@ -323,14 +428,26 @@ def _group_records_by_identity(
             unmatched.append(record)
             continue
         anchor_program = verified_anchor_programs.get(record.roll_no)
-        if not anchor_program or record.program != anchor_program:
+        if not _continuation_program_matches_anchor(record, anchor_program):
             record.review_flags.append(
                 f"continuation page program {record.program or 'unreadable'} does not match "
                 f"the verified page-1 program {anchor_program or 'unreadable'}"
             )
             unmatched.append(record)
             continue
-        grouped.setdefault(record.roll_no, []).append(record)
+        continuation_claims.setdefault(
+            (record.roll_no, record.aligned_page.page_index), []
+        ).append(record)
+
+    for (roll_no, page_index), claims in continuation_claims.items():
+        if len(claims) != 1:
+            for record in claims:
+                record.review_flags.append(
+                    f"duplicate page-{page_index} ownership claim for roll {roll_no}; left unmatched"
+                )
+                unmatched.append(record)
+            continue
+        grouped.setdefault(roll_no, []).append(claims[0])
     return grouped, unmatched
 
 
@@ -379,15 +496,14 @@ def _reconcile_exact_cross_page_roll_pairs(
             or not anchor.roll_no
             or anchor.identity_kind != "bubbled"
             or not _page_one_write_in_matches_bubbles(anchor)
-            or not _strong_enough(anchor.confidence, "medium")
-            or not _strong_enough(continuation.confidence, "medium")
+            or not _record_has_usable_cell_roll(anchor)
+            or not _record_has_usable_cell_roll(continuation)
             or page_one_roll_counts.get(anchor.roll_no) != 1
             or (valid_rolls is not None and anchor.roll_no not in valid_rolls)
             or continuation_slot_counts.get(
                 (continuation.roll_no, continuation.aligned_page.page_index)
             ) != 1
-            or not anchor.program
-            or continuation.program != anchor.program
+            or not _continuation_program_matches_anchor(continuation, anchor.program)
             or continuation.source_index in recovered_sources
         ):
             continue

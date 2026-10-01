@@ -61,7 +61,7 @@ class FakeOcr:
         return RollOcrResult(digit, self.confidence)
 
 
-def _sheet(tmp_path: Path) -> tuple[dict, Image.Image]:
+def _sheet(tmp_path: Path, *, mark_roll_cells: bool = True) -> tuple[dict, Image.Image]:
     result = generate_exam(
         ExamConfig(
             exam_id="HANDWRITING_TEST",
@@ -78,7 +78,20 @@ def _sheet(tmp_path: Path) -> tuple[dict, Image.Image]:
     with pymupdf.open(result["pdf_path"]) as doc:
         page = doc[1]
         pix = page.get_pixmap(dpi=DPI, colorspace=pymupdf.csGRAY)
-    return result["manifest"], Image.frombytes("L", (pix.width, pix.height), pix.samples)
+    image = Image.frombytes("L", (pix.width, pix.height), pix.samples)
+    if mark_roll_cells:
+        draw = ImageDraw.Draw(image)
+        for field in result["manifest"]["write_in_fields"]:
+            if field["page"] != 2 or field["name"] != "roll_number":
+                continue
+            for index in range(int(field["cells"])):
+                cx, cy = mm_to_px(
+                    field["x_mm"] + index * field["cell_pitch_mm"] + field["cell_width_mm"] / 2,
+                    field["y_mm"] + field["height_mm"] / 2,
+                    DPI,
+                )
+                draw.ellipse([cx - 2, cy - 2, cx + 2, cy + 2], fill=0)
+    return result["manifest"], image
 
 
 def _fill_continuation_program(draw: ImageDraw.ImageDraw, manifest: dict, program: str) -> None:
@@ -170,7 +183,7 @@ def test_phd_continuation_roll_uses_shared_five_cell_crop(tmp_path: Path):
     assert len(result.cell_crop_paths["PHD"]) == 5
 
 
-def test_conflicting_handwriting_ocr_strategies_are_rejected(tmp_path: Path):
+def test_strip_disagreement_is_diagnostic_when_cells_are_valid(tmp_path: Path):
     manifest, page = _sheet(tmp_path)
     draw = ImageDraw.Draw(page)
     _fill_continuation_program(draw, manifest, "BTECH")
@@ -184,9 +197,45 @@ def test_conflicting_handwriting_ocr_strategies_are_rejected(tmp_path: Path):
         ocr_backend=FakeOcr("9999999", digits="2024587"),
     )
 
+    assert result.roll_no == "2024587"
+    assert result.confidence == "high"
+    assert any(flag.startswith("STRIP_DISAGREES") for flag in result.review_flags)
+
+
+def test_blank_continuation_selector_reads_btech_field_only(tmp_path: Path):
+    manifest, page = _sheet(tmp_path)
+
+    result = read_continuation_roll_number(
+        np.asarray(page),
+        manifest,
+        DPI,
+        2,
+        tmp_path / "identity",
+        ocr_backend=FakeOcr("2024587", digits="2024587"),
+    )
+
+    assert result.program == "BTECH"
+    assert result.roll_no == "2024587"
+    assert {key for key in result.ocr_results if not key.startswith("_")} == {"BTECH"}
+    assert any("read BTECH field only" in flag for flag in result.review_flags)
+
+
+def test_empty_roll_field_is_not_sent_to_resnet_candidates(tmp_path: Path):
+    manifest, page = _sheet(tmp_path, mark_roll_cells=False)
+    draw = ImageDraw.Draw(page)
+    _fill_continuation_program(draw, manifest, "BTECH")
+
+    result = read_continuation_roll_number(
+        np.asarray(page),
+        manifest,
+        DPI,
+        2,
+        tmp_path / "identity",
+        ocr_backend=FakeOcr("2024587", digits="2024587"),
+    )
+
     assert result.roll_no is None
-    assert result.confidence == "low"
-    assert any("conflicting candidates" in flag for flag in result.review_flags)
+    assert any(flag.startswith("EMPTY_FIELD") for flag in result.review_flags)
 
 
 def test_sp_roll_can_be_read_from_whole_strip_when_in_roster(tmp_path: Path):

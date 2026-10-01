@@ -58,6 +58,7 @@ class HandwrittenRollRead:
     cell_crop_paths: dict[str, list[str]]
     ocr_results: dict[str, dict[str, object]]
     review_flags: list[str]
+    evidence_flags: list[dict[str, str]] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
