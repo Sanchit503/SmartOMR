@@ -250,6 +250,7 @@ def test_http_inventory_assets_and_error_routes(tmp_path, generated, monkeypatch
         base = f"{url}/runs/{state['run_id']}"
         body, _ = get(base + "/pages")
         assert b"Detected sheet page" in body and b"Run OCR &amp; Grouping" in body
+        assert f'/runs/{state["run_id"]}/review'.encode() in body
         assert b"Identity needs review" in body and b"Roll preview" in body
         payload, headers = get(base + "/inspection.json")
         index = json.loads(payload)

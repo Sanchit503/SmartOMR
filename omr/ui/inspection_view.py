@@ -29,7 +29,7 @@ def inspection_body(state: dict) -> str:
           <form id="identity-preview-form" method="post" action="/runs/{run_id}/identity-preview" hidden><button class="secondary" type="submit">Preview Roll Detection</button></form>
           <form id="evaluate-form" method="post" action="/runs/{run_id}/evaluate" hidden><button type="submit">Run OCR &amp; Grouping{_icon('arrow-right')}</button></form>
           <form id="re-evaluate-form" method="post" action="/runs/{run_id}/re-evaluate" hidden><button class="secondary" type="submit">Re-run Grouping</button></form>
-          <a id="review-link" class="button" href="/runs/{run_id}" hidden>Student Review{_icon('arrow-right')}</a>
+          <a id="review-link" class="button" href="/runs/{run_id}/review" hidden>Review Cases{_icon('arrow-right')}</a>
         </div>
       </div>
       <div class="inspection-summary">
