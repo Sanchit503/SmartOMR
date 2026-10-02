@@ -249,7 +249,7 @@ def test_http_inventory_assets_and_error_routes(tmp_path, generated, monkeypatch
     with server(store) as url:
         base = f"{url}/runs/{state['run_id']}"
         body, _ = get(base + "/pages")
-        assert b"Detected sheet page" in body and b"Run OCR &amp; Grouping" in body
+        assert b"Detected sheet page" in body and b"Run OCR, Grouping &amp; Grading" in body
         assert f'/runs/{state["run_id"]}/review'.encode() in body
         assert b"Identity needs review" in body and b"Roll preview" in body
         payload, headers = get(base + "/inspection.json")
@@ -351,6 +351,68 @@ def test_student_view_uses_current_manual_selection_and_verified_pdf(tmp_path):
             assert abs(pix.pixel(pix.width // 2, pix.height // 2)[0] - 170) <= 2
         assert b"MANUALLY_CHECKED" in body
         assert b"Regrading required" in body
+
+
+def test_grouping_only_ui_hides_and_rejects_grading_operations(tmp_path):
+    parsed_dir = _write_parsed_batch(tmp_path)
+    initialize_verification_index(parsed_dir)
+    store = RunStore(UiConfig(tmp_path))
+    app._write_json(store.state_path("grouping-test"), {
+        "run_id": "grouping-test",
+        "exam_id": "EXAM_REVIEW",
+        "status": "completed",
+        "stage": "Completed",
+        "inputs": {"grouping_only": True},
+        "parse_dir": str(parsed_dir),
+        "parse_index_path": str(parsed_dir / "parse_index.json"),
+        "marks_csv_path": str(tmp_path / "obsolete-marks.csv"),
+    })
+
+    with server(store) as url:
+        base = url + "/runs/grouping-test"
+        dashboard, _ = get(base)
+        assert b"Sheet Matching Review" in dashboard
+        assert b"Download Marks CSV" not in dashboard
+        assert b"<th>Marks</th>" not in dashboard
+
+        student, _ = get(base + "/students/2024001")
+        assert b"Regrading required" not in student
+        assert b"Answers And Marks" not in student
+        assert b"Edit Marks" not in student
+        assert b"Save Marks And CSV" not in student
+        assert b"Upload And Re-evaluate" not in student
+        assert b"Upload And Reprocess Sheet" in student
+
+        review, _ = get(base + "/review")
+        assert b"Sheet Matching Review" in review
+        assert b"<th>Marks</th>" not in review
+
+        email, _ = get(base + "/email")
+        assert b"Verified Sheet - no marks" in email
+        assert b"Evaluated Sheet + Marks" not in email
+        assert b"{marks_obtained}" not in email
+        assert b"<th>Marks</th>" not in email
+
+        with pytest.raises(urllib.error.HTTPError) as error:
+            post(base + "/students/2024001/marks", {"marks_obtained": "10"})
+        assert error.value.code == 400
+        assert b"marks cannot be edited in a grouping-only run" in error.value.read()
+
+        with pytest.raises(urllib.error.HTTPError) as error:
+            post(base + "/email/prepare", {"release_mode": "evaluated_marks"})
+        assert error.value.code == 400
+        assert b"without marks only" in error.value.read()
+
+
+def test_grouping_only_inspection_uses_matching_labels():
+    body = app.inspection_body({
+        "run_id": "grouping-test",
+        "exam_id": "EXAM_REVIEW",
+        "inputs": {"scan_path": "scan.pdf", "grouping_only": True},
+    })
+    assert "Match &amp; Segregate Sheets" in body
+    assert "Sheet Matching Review" in body
+    assert "Grouping &amp; Grading" not in body
 
 
 def test_review_page_shows_identity_evidence_and_records_rejection(tmp_path):

@@ -17,6 +17,9 @@ def inspection_body(state: dict) -> str:
     run_id = html.escape(state["run_id"], quote=True)
     exam_id = html.escape(state["exam_id"])
     source_url = "/artifact?path=" + urllib.parse.quote(state["inputs"]["scan_path"])
+    grouping_only = bool(state.get("inputs", {}).get("grouping_only"))
+    process_label = "Match &amp; Segregate Sheets" if grouping_only else "Run OCR, Grouping &amp; Grading"
+    review_label = "Sheet Matching Review" if grouping_only else "Review Cases"
     return f"""
     <link rel="stylesheet" href="/static/inspection.css">
     <script src="/static/inspection.js" defer></script>
@@ -27,9 +30,9 @@ def inspection_body(state: dict) -> str:
           <a class="quiet-command" href="{source_url}">{_icon('download')}Source file</a>
           <form id="inspect-form" method="post" action="/runs/{run_id}/inspect" hidden><button class="secondary" type="submit">Resume Inspection</button></form>
           <form id="identity-preview-form" method="post" action="/runs/{run_id}/identity-preview" hidden><button class="secondary" type="submit">Preview Roll Detection</button></form>
-          <form id="evaluate-form" method="post" action="/runs/{run_id}/evaluate" hidden><button type="submit">Run OCR &amp; Grouping{_icon('arrow-right')}</button></form>
+          <form id="evaluate-form" method="post" action="/runs/{run_id}/evaluate" hidden><button type="submit">{process_label}{_icon('arrow-right')}</button></form>
           <form id="re-evaluate-form" method="post" action="/runs/{run_id}/re-evaluate" hidden><button class="secondary" type="submit">Re-run Grouping</button></form>
-          <a id="review-link" class="button" href="/runs/{run_id}/review" hidden>Review Cases{_icon('arrow-right')}</a>
+          <a id="review-link" class="button" href="/runs/{run_id}/review" hidden>{review_label}{_icon('arrow-right')}</a>
         </div>
       </div>
       <div class="inspection-summary">

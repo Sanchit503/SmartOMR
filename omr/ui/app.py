@@ -566,6 +566,11 @@ def _marks_label(details: dict[str, Any], verified: dict[str, Any] | None = None
     return f"{_fmt_num(score)} / {_fmt_num(total)}"
 
 
+def _is_grouping_only(state: dict[str, Any]) -> bool:
+    inputs = state.get("inputs")
+    return bool(isinstance(inputs, dict) and inputs.get("grouping_only"))
+
+
 def _fmt_num(value: float | int | None) -> str:
     if value is None:
         return ""
@@ -1214,7 +1219,8 @@ def _parse_student_reupload(
         roll_ocr_backend,
         None,
     )
-    result.setdefault("review_flags", []).append("student sheet was re-uploaded and re-evaluated from professor UI")
+    action = "reprocessed" if answer_key is None else "re-evaluated"
+    result.setdefault("review_flags", []).append(f"student sheet was re-uploaded and {action} from professor UI")
     _write_json(Path(result["details_path"]), result)
     return result
 
@@ -1343,8 +1349,9 @@ def _parse_student_page_replacement(
         roll_ocr_backend,
         None,
     )
+    action = "reprocessed" if answer_key is None else "re-evaluated"
     result.setdefault("review_flags", []).append(
-        f"page {target_page} was replaced from professor UI and the student was re-evaluated"
+        f"page {target_page} was replaced from professor UI and the student was {action}"
     )
     _write_json(Path(result["details_path"]), result)
     return result
@@ -1387,11 +1394,11 @@ def _commit_student_result(
     index["review_report_html_path"] = report_paths["html"]
     _write_json(index_path, index)
     _replace_verified_student(parse_dir, roll_no, result)
-    marks_csv = _write_marks_csv(run_dir, parse_dir, index)
+    marks_csv = None if _is_grouping_only(state) else _write_marks_csv(run_dir, parse_dir, index)
     counts = index.get("status_counts", {})
     store.write_state(
         run_id,
-        marks_csv_path=str(marks_csv),
+        marks_csv_path=str(marks_csv) if marks_csv else None,
         roll_ocr=roll_ocr_state,
         summary={
             **dict(state.get("summary") or {}),
@@ -1923,7 +1930,7 @@ class RunStore:
             self.write_state(run_id, stage="Preparing review dashboard")
             initialize_verification_index(parse_dir, force=True)
             index = _read_json(index_path)
-            marks_csv = _write_marks_csv(run_dir, parse_dir, index)
+            marks_csv = None if _is_grouping_only(state) else _write_marks_csv(run_dir, parse_dir, index)
             counts = index.get("status_counts", {})
             self.write_state(
                 run_id,
@@ -1931,7 +1938,7 @@ class RunStore:
                 stage="Completed",
                 parse_dir=str(parse_dir),
                 parse_index_path=str(index_path),
-                marks_csv_path=str(marks_csv),
+                marks_csv_path=str(marks_csv) if marks_csv else None,
                 summary={
                     "students": len(index.get("students", [])),
                     "ready": counts.get("ready", 0),
@@ -2230,6 +2237,8 @@ class SmartOmrUiHandler(BaseHTTPRequestHandler):
 
     def _update_student_marks(self, run_id: str, roll_no: str) -> None:
         state = self.store.read_state(run_id)
+        if _is_grouping_only(state):
+            raise ValueError("marks cannot be edited in a grouping-only run")
         parse_dir = Path(str(state.get("parse_dir") or ""))
         run_dir = self.store.run_dir(run_id)
         index_path = Path(str(state.get("parse_index_path") or ""))
@@ -2429,7 +2438,10 @@ class SmartOmrUiHandler(BaseHTTPRequestHandler):
                 {
                     "action": "student_reupload",
                     "reviewer": "professor-ui",
-                    "note": note or f"Uploaded replacement sheet {saved_upload.name} and re-evaluated only this student.",
+                    "note": note or (
+                        f"Uploaded replacement sheet {saved_upload.name} and "
+                        f"{'reprocessed' if _is_grouping_only(state) else 're-evaluated'} only this student."
+                    ),
                     "created_at": _now(),
                 }
             )
@@ -2460,11 +2472,11 @@ class SmartOmrUiHandler(BaseHTTPRequestHandler):
             index["review_report_html_path"] = report_paths["html"]
             _write_json(index_path, index)
             _replace_verified_student(parse_dir, roll_no, result)
-            marks_csv = _write_marks_csv(run_dir, parse_dir, index)
+            marks_csv = None if _is_grouping_only(state) else _write_marks_csv(run_dir, parse_dir, index)
             counts = index.get("status_counts", {})
             self.store.write_state(
                 run_id,
-                marks_csv_path=str(marks_csv),
+                marks_csv_path=str(marks_csv) if marks_csv else None,
                 roll_ocr=roll_ocr_state,
                 summary={
                     **dict(state.get("summary") or {}),
@@ -2540,7 +2552,10 @@ class SmartOmrUiHandler(BaseHTTPRequestHandler):
                 {
                     "action": "replace_page",
                     "reviewer": "professor-ui",
-                    "note": note or f"Replaced page {target_page} with {saved_upload.name} and re-evaluated this student.",
+                    "note": note or (
+                        f"Replaced page {target_page} with {saved_upload.name} and "
+                        f"{'reprocessed' if _is_grouping_only(state) else 're-evaluated'} this student."
+                    ),
                     "created_at": _now(),
                 }
             )
@@ -2618,6 +2633,8 @@ class SmartOmrUiHandler(BaseHTTPRequestHandler):
         sender = form.get("sender") or "professor@example.edu"
         sender_name = form.get("sender_name") or None
         sheet_only = (form.get("release_mode") or "sheet_verification") == "sheet_verification"
+        if _is_grouping_only(state) and not sheet_only:
+            raise ValueError("grouping-only runs can release verified sheets without marks only")
         subject = form.get("subject") or (
             "{exam_id}: response sheet verification"
             if sheet_only
@@ -2931,6 +2948,7 @@ class SmartOmrUiHandler(BaseHTTPRequestHandler):
 
     def _page_run(self, run_id: str) -> None:
         state = self.store.read_state(run_id)
+        grouping_only = _is_grouping_only(state)
         if state.get("status") in {
             "inspection_pending",
             "inspecting",
@@ -2973,7 +2991,8 @@ class SmartOmrUiHandler(BaseHTTPRequestHandler):
             self._send_html("Run Failed", body)
             return
         if state.get("status") != "completed":
-            body = f"<h1>{html.escape(state.get('exam_id',''))}</h1><div class=\"grid\">{metric_html}</div>{roll_ocr_warning}<p class=\"muted\">This page refreshes while the evaluation runs.</p>"
+            activity = "sheet matching" if grouping_only else "evaluation"
+            body = f"<h1>{html.escape(state.get('exam_id',''))}</h1><div class=\"grid\">{metric_html}</div>{roll_ocr_warning}<p class=\"muted\">This page refreshes while {activity} runs.</p>"
             self._send_html("Run Progress", body, refresh=refresh)
             return
 
@@ -2995,34 +3014,39 @@ class SmartOmrUiHandler(BaseHTTPRequestHandler):
             name = str(details.get("student", {}).get("name") or student.get("student_name") or "")
             email = str(details.get("student", {}).get("email") or student.get("student_email") or "")
             flags = details.get("review_flags", [])
+            marks_cell = "" if grouping_only else f"<td>{_marks_label(details, verified_by_roll.get(roll))}</td>"
             rows.append(
                 "<tr>"
                 f"<td><a href=\"/runs/{html.escape(run_id)}/students/{urllib.parse.quote(roll)}\">{html.escape(roll)}</a></td>"
                 f"<td>{html.escape(name)}</td>"
                 f"<td>{html.escape(email)}</td>"
-                f"<td>{_marks_label(details, verified_by_roll.get(roll))}</td>"
+                f"{marks_cell}"
                 f"<td>{_badge(_professor_status(details.get('status'), verified_by_roll.get(roll, {}).get('status')))}</td>"
                 f"<td>{len(flags)}</td>"
                 f"<td class=\"flags\">{html.escape(' | '.join(str(flag) for flag in flags[:3]))}</td>"
                 "</tr>"
             )
-        marks_link = _asset_url(state.get("marks_csv_path"))
+        marks_action = "" if grouping_only else f'<a class="button" href="{_asset_url(state.get("marks_csv_path"))}">Download Marks CSV</a>'
         review_link = f"/runs/{html.escape(run_id)}/review"
+        marks_heading = "" if grouping_only else "<th>Marks</th>"
+        column_count = 6 if grouping_only else 7
+        review_label = "Sheet Matching Review" if grouping_only else "Review Cases"
+        student_rows_html = "".join(rows) or f'<tr><td colspan="{column_count}" class="empty">No students detected</td></tr>'
         body = f"""
         <h1>{html.escape(state.get('exam_id',''))}</h1>
         <div class="grid">{metric_html}</div>
         {roll_ocr_warning}
         <div class="actions band">
           <a class="button secondary" href="/runs/{html.escape(run_id)}/pages">Inspect Source Pages</a>
-          <a class="button" href="{marks_link}">Download Marks CSV</a>
-          <a class="button secondary" href="{review_link}">Review Cases</a>
+          {marks_action}
+          <a class="button secondary" href="{review_link}">{review_label}</a>
           <a class="button secondary" href="/runs/{html.escape(run_id)}/email">Email Release</a>
           <a class="button secondary" href="{_asset_url(parse_dir / 'review_report.html')}">Open Raw Review Report</a>
         </div>
         <div class="section-title"><h2>Students</h2></div>
         <table>
-          <thead><tr><th>Roll No</th><th>Name</th><th>Email</th><th>Marks</th><th>Status</th><th>Flags</th><th>Review Notes</th></tr></thead>
-          <tbody>{''.join(rows) or '<tr><td colspan="7" class="empty">No students detected</td></tr>'}</tbody>
+          <thead><tr><th>Roll No</th><th>Name</th><th>Email</th>{marks_heading}<th>Status</th><th>Flags</th><th>Review Notes</th></tr></thead>
+          <tbody>{student_rows_html}</tbody>
         </table>
         """
         self._send_html("Run Dashboard", body)
@@ -3050,6 +3074,7 @@ class SmartOmrUiHandler(BaseHTTPRequestHandler):
 
     def _page_student(self, run_id: str, roll_no: str) -> None:
         state, parse_dir, details, verified = self._student_details(run_id, roll_no)
+        grouping_only = _is_grouping_only(state)
         student = details.get("student", {})
         score, total = _score(details)
         status = verified.get("status") if verified else details.get("status")
@@ -3148,12 +3173,34 @@ class SmartOmrUiHandler(BaseHTTPRequestHandler):
             "</tr>"
             for page in current_pages
         )
+        marks_metric = "" if grouping_only else f'<div class="metric"><span>Marks</span><strong>{_marks_label(details, verified)}</strong></div>'
+        answers_section = "" if grouping_only else f"""
+            <div class="section-title"><h2>Answers And Marks</h2></div>
+            <table>
+              <thead><tr><th>Question</th><th>Type</th><th>Student Answer</th><th>Correct Answer</th><th>Marks</th><th>Status</th><th>Confidence</th><th>Notes</th></tr></thead>
+              <tbody>{''.join(answer_rows) or '<tr><td colspan="8" class="empty">No objective answers found</td></tr>'}</tbody>
+            </table>
+        """
+        edit_marks_operation = "" if grouping_only else f"""
+                <div class="operation">
+                  <h3>Edit Marks</h3>
+                  <form method="post" action="/runs/{html.escape(run_id)}/students/{urllib.parse.quote(roll_no)}/marks">
+                    <div class="form-grid">
+                      <div><label>Marks Obtained</label><input name="marks_obtained" type="number" step="0.01" value="{html.escape(_fmt_num(score))}" required></div>
+                      <div><label>Max Marks</label><input name="max_marks" type="number" step="0.01" value="{html.escape(_fmt_num(total))}"></div>
+                      <div class="wide"><label>Note</label><input name="note" placeholder="Reason for mark edit"></div>
+                    </div>
+                    <p><button type="submit">Save Marks And CSV</button></p>
+                  </form>
+                </div>
+        """
+        replacement_button = "Upload And Reprocess Sheet" if grouping_only else "Upload And Re-evaluate"
         body = f"""
         <h1>Student {html.escape(str(student.get('roll_no') or roll_no))}</h1>
         <div class="grid">
           <div class="metric"><span>Name</span><strong>{html.escape(str(student.get('name') or ''))}</strong></div>
           <div class="metric"><span>Email</span><strong>{html.escape(str(student.get('email') or ''))}</strong></div>
-          <div class="metric"><span>Marks</span><strong>{_marks_label(details, verified)}</strong></div>
+          {marks_metric}
           <div class="metric"><span>Status</span><strong>{_badge(display_status)}</strong></div>
         </div>
         <div class="actions band toolbar">
@@ -3167,11 +3214,7 @@ class SmartOmrUiHandler(BaseHTTPRequestHandler):
           <section>
             <div class="section-title"><h2>Full Sheet Images</h2></div>
             <div class="pages">{''.join(pages) or '<p class="empty">No page images found</p>'}</div>
-            <div class="section-title"><h2>Answers And Marks</h2></div>
-            <table>
-              <thead><tr><th>Question</th><th>Type</th><th>Student Answer</th><th>Correct Answer</th><th>Marks</th><th>Status</th><th>Confidence</th><th>Notes</th></tr></thead>
-              <tbody>{''.join(answer_rows) or '<tr><td colspan="8" class="empty">No objective answers found</td></tr>'}</tbody>
-            </table>
+            {answers_section}
           </section>
           <aside class="side-stack">
             <section class="band">
@@ -3186,17 +3229,7 @@ class SmartOmrUiHandler(BaseHTTPRequestHandler):
             <section class="band">
               <h2>Review Operations</h2>
               <div class="operation-grid">
-                <div class="operation">
-                  <h3>Edit Marks</h3>
-                  <form method="post" action="/runs/{html.escape(run_id)}/students/{urllib.parse.quote(roll_no)}/marks">
-                    <div class="form-grid">
-                      <div><label>Marks Obtained</label><input name="marks_obtained" type="number" step="0.01" value="{html.escape(_fmt_num(score))}" required></div>
-                      <div><label>Max Marks</label><input name="max_marks" type="number" step="0.01" value="{html.escape(_fmt_num(total))}"></div>
-                      <div class="wide"><label>Note</label><input name="note" placeholder="Reason for mark edit"></div>
-                    </div>
-                    <p><button type="submit">Save Marks And CSV</button></p>
-                  </form>
-                </div>
+                {edit_marks_operation}
                 <div class="operation">
                   <h3>Correct Roll Mapping</h3>
                   <form method="post" action="/runs/{html.escape(run_id)}/students/{urllib.parse.quote(roll_no)}/correct-roll">
@@ -3227,7 +3260,7 @@ class SmartOmrUiHandler(BaseHTTPRequestHandler):
                       <div class="wide"><label>Correct Student PDF / Image</label><input name="student_sheet" type="file" accept=".pdf,.png,.jpg,.jpeg,.tif,.tiff" required></div>
                       <div class="wide"><label>Note</label><input name="note" placeholder="Why this replacement is being uploaded"></div>
                     </div>
-                    <p><button type="submit">Upload And Re-evaluate</button></p>
+                    <p><button type="submit">{replacement_button}</button></p>
                   </form>
                 </div>
               </div>
@@ -3245,6 +3278,7 @@ class SmartOmrUiHandler(BaseHTTPRequestHandler):
 
     def _page_review(self, run_id: str) -> None:
         state = self.store.read_state(run_id)
+        grouping_only = _is_grouping_only(state)
         parse_dir = Path(str(state["parse_dir"]))
         index, _verified_path = load_or_initialize_verified_index(parse_dir)
         identity_resolution = load_identity_resolution(parse_dir)
@@ -3259,10 +3293,11 @@ class SmartOmrUiHandler(BaseHTTPRequestHandler):
             missing = ", ".join(str(page) for page in student.get("missing_pages", []))
             decisions = student.get("decision_log", [])
             latest_note = str(decisions[-1].get("note") or "") if decisions else ""
+            marks_cell = "" if grouping_only else f"<td>{_fmt_num(score)} / {_fmt_num(total)}</td>"
             rows.append(
                 "<tr>"
                 f"<td><a href=\"/runs/{html.escape(run_id)}/students/{urllib.parse.quote(roll)}\">{html.escape(roll)}</a></td>"
-                f"<td>{_fmt_num(score)} / {_fmt_num(total)}</td>"
+                f"{marks_cell}"
                 f"<td>{_badge(status)}</td>"
                 f"<td>{html.escape(missing)}</td>"
                 f"<td>{len(flags)}</td>"
@@ -3346,14 +3381,18 @@ class SmartOmrUiHandler(BaseHTTPRequestHandler):
             index,
             identity_resolution,
         )
+        marks_heading = "" if grouping_only else "<th>Marks</th>"
+        review_column_count = 6 if grouping_only else 7
+        review_rows_html = "".join(rows) or f'<tr><td colspan="{review_column_count}" class="empty">No student review cases</td></tr>'
+        review_title = "Sheet Matching Review" if grouping_only else "Review Cases"
         body = f"""
-        <h1>Review Cases</h1>
+        <h1>{review_title}</h1>
         <div class="actions band"><a class="button secondary" href="/runs/{html.escape(run_id)}">Back to Exam</a></div>
         <datalist id="student-rolls">{roll_options}</datalist>
         {suggestion_html}
         <div class="section-title"><h2>Students Needing Review</h2></div>
-        <table><thead><tr><th>Roll No</th><th>Marks</th><th>Status</th><th>Missing Pages</th><th>Flags</th><th>Parser Notes</th><th>Latest Decision</th></tr></thead>
-        <tbody>{''.join(rows) or '<tr><td colspan="7" class="empty">No student review cases</td></tr>'}</tbody></table>
+        <table><thead><tr><th>Roll No</th>{marks_heading}<th>Status</th><th>Missing Pages</th><th>Flags</th><th>Parser Notes</th><th>Latest Decision</th></tr></thead>
+        <tbody>{review_rows_html}</tbody></table>
         <div class="section-title"><h2>Unmatched Pages</h2></div>
         <table><thead><tr><th>Source Index</th><th>Detected Page</th><th>Status</th><th>Flags</th><th>Details</th><th>Resolution</th></tr></thead>
         <tbody>{''.join(unmatched_rows) or '<tr><td colspan="6" class="empty">No unmatched pages</td></tr>'}</tbody></table>
@@ -3364,14 +3403,28 @@ class SmartOmrUiHandler(BaseHTTPRequestHandler):
         <table><thead><tr><th>Roll No</th><th>Name</th><th>Email</th><th>Program</th></tr></thead>
         <tbody>{''.join(missing_roster_rows) or '<tr><td colspan="4" class="empty">Every roster student has a detected sheet</td></tr>'}</tbody></table>
         """
-        self._send_html("Review Cases", body)
+        self._send_html(review_title, body)
 
     def _page_email(self, run_id: str) -> None:
         state = self.store.read_state(run_id)
+        grouping_only = _is_grouping_only(state)
         parse_dir = Path(str(state.get("parse_dir") or ""))
         release_dir = parse_dir / "email_release"
         queue_path = release_dir / EMAIL_QUEUE_CSV
         skipped_path = release_dir / EMAIL_SKIPPED_CSV
+        release_options = (
+            '<option value="sheet_verification">Verified Sheet - no marks</option>'
+            if grouping_only
+            else (
+                '<option value="sheet_verification">Sheet Verification - no marks</option>'
+                '<option value="evaluated_marks">Evaluated Sheet + Marks</option>'
+            )
+        )
+        template_placeholders = (
+            "{exam_id}, {roll_no}, {name}, {display_name}"
+            if grouping_only
+            else "{exam_id}, {roll_no}, {name}, {display_name}, {marks_obtained}, {max_marks}"
+        )
         body = f"""
         <h1>Email Release</h1>
         <div class="actions band"><a class="button secondary" href="/runs/{html.escape(run_id)}">Back to Exam</a></div>
@@ -3383,8 +3436,7 @@ class SmartOmrUiHandler(BaseHTTPRequestHandler):
               <div>
                 <label>Release Type</label>
                 <select name="release_mode">
-                  <option value="sheet_verification">Sheet Verification - no marks</option>
-                  <option value="evaluated_marks">Evaluated Sheet + Marks</option>
+                  {release_options}
                 </select>
               </div>
               <div>
@@ -3400,7 +3452,7 @@ class SmartOmrUiHandler(BaseHTTPRequestHandler):
             <input name="subject" placeholder="Uses a safe default for the selected release type">
             <label>Custom Message</label>
             <textarea name="body_template" rows="10" placeholder="Leave blank to use the release-type default"></textarea>
-            <p class="muted">Available placeholders: {{exam_id}}, {{roll_no}}, {{name}}, {{display_name}}, {{marks_obtained}}, {{max_marks}}</p>
+            <p class="muted">Available placeholders: {html.escape(template_placeholders)}</p>
             <button type="submit">Prepare Email Queue</button>
           </form>
         </section>
@@ -3440,17 +3492,23 @@ class SmartOmrUiHandler(BaseHTTPRequestHandler):
   --sender-name "Course Staff" `
   --confirm-count {len(queued)} `
   --send"""
-            rows = "".join(
-                "<tr>"
-                f"<td>{html.escape(row.get('roll_no',''))}</td>"
-                f"<td>{html.escape(row.get('student_name',''))}</td>"
-                f"<td>{html.escape(row.get('student_email',''))}</td>"
-                f"<td>{html.escape('Sheet verification' if row.get('release_mode') == 'sheet_verification' else 'Evaluated marks')}</td>"
-                f"<td>{html.escape('Not included' if row.get('release_mode') == 'sheet_verification' else str(row.get('marks_obtained', '')) + ' / ' + str(row.get('max_marks', '')))}</td>"
-                f"<td><a href=\"{_asset_url(row.get('preview_eml_path'), parse_dir)}\">preview</a></td>"
-                "</tr>"
-                for row in queued[:50]
-            )
+            rows = []
+            for row in queued[:50]:
+                marks_cell = "" if grouping_only else (
+                    f"<td>{html.escape('Not included' if row.get('release_mode') == 'sheet_verification' else str(row.get('marks_obtained', '')) + ' / ' + str(row.get('max_marks', '')))}</td>"
+                )
+                rows.append(
+                    "<tr>"
+                    f"<td>{html.escape(row.get('roll_no',''))}</td>"
+                    f"<td>{html.escape(row.get('student_name',''))}</td>"
+                    f"<td>{html.escape(row.get('student_email',''))}</td>"
+                    f"<td>{html.escape('Sheet verification' if row.get('release_mode') == 'sheet_verification' else 'Evaluated marks')}</td>"
+                    f"{marks_cell}"
+                    f"<td><a href=\"{_asset_url(row.get('preview_eml_path'), parse_dir)}\">preview</a></td>"
+                    "</tr>"
+                )
+            queue_marks_heading = "" if grouping_only else "<th>Marks</th>"
+            queue_column_count = 5 if grouping_only else 6
             body += f"""
             <div class="grid">
               <div class="metric"><span>Queued</span><strong>{len(queued)}</strong></div>
@@ -3530,8 +3588,8 @@ class SmartOmrUiHandler(BaseHTTPRequestHandler):
             </section>
             <div class="section-title"><h2>Queued Students</h2></div>
             <table>
-              <thead><tr><th>Roll No</th><th>Name</th><th>Email</th><th>Release Type</th><th>Marks</th><th>Preview</th></tr></thead>
-              <tbody>{rows or '<tr><td colspan="6" class="empty">No queued emails</td></tr>'}</tbody>
+              <thead><tr><th>Roll No</th><th>Name</th><th>Email</th><th>Release Type</th>{queue_marks_heading}<th>Preview</th></tr></thead>
+              <tbody>{''.join(rows) or f'<tr><td colspan="{queue_column_count}" class="empty">No queued emails</td></tr>'}</tbody>
             </table>
             <div class="actions band">
               <a class="button secondary" href="{_asset_url(log_path)}">Download Send Log</a>
