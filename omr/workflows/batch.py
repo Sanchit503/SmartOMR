@@ -77,6 +77,9 @@ PAGE_MAJOR_IDENTITY_KIND = "page_major_order"
 SHEET_MAJOR_IDENTITY_KIND = "sheet_major_order"
 WRITE_IN_SIMILARITY_IDENTITY_KIND = "write_in_similarity"
 EXACT_CROSS_PAGE_ROLL_IDENTITY_KIND = "exact_cross_page_roll"
+AUTO_ORDER_MIN_OBSERVATIONS = 8
+AUTO_ORDER_MIN_SCORE = 0.98
+AUTO_ORDER_MIN_MARGIN = 0.15
 GROUPED_IDENTITY_KINDS = {
     PAGE_MAJOR_IDENTITY_KIND,
     SHEET_MAJOR_IDENTITY_KIND,
@@ -671,14 +674,86 @@ def _matches_sheet_major_sequence(page_sequence: list[int], num_pages: int) -> b
     return page_sequence == expected
 
 
-def _infer_grouping_mode(records: list[_PageRecord], manifest: dict) -> str:
-    page_sequence = _page_sequence(records)
-    num_pages = manifest["num_pages"]
-    if _matches_sheet_major_sequence(page_sequence, num_pages):
-        return "sheet-major"
-    if _matches_page_major_sequence(page_sequence, num_pages):
-        return "page-major"
-    return "identity"
+def _source_order_inference(
+    records: list[_PageRecord],
+    manifest: dict,
+    total_source_pages: int,
+) -> dict[str, Any]:
+    """Infer scanner collation from source slots while tolerating isolated failures.
+
+    Source indices are retained even when a page fails alignment.  Comparing a
+    detected template page against its expected source slot therefore lets one
+    unreadable scan remain local instead of disabling order evidence for the
+    entire bundle.
+    """
+    num_pages = int(manifest["num_pages"])
+    observed = len(records)
+    result: dict[str, Any] = {
+        "mode": "identity",
+        "observed_pages": observed,
+        "total_source_pages": int(total_source_pages),
+        "minimum_score": AUTO_ORDER_MIN_SCORE,
+        "minimum_margin": AUTO_ORDER_MIN_MARGIN,
+        "scores": {"sheet-major": 0.0, "page-major": 0.0},
+        "reason": "insufficient page-order evidence",
+    }
+    if num_pages <= 1 or observed < max(AUTO_ORDER_MIN_OBSERVATIONS, num_pages * 3):
+        return result
+
+    sheet_matches = sum(
+        record.aligned_page.page_index == ((record.source_index - 1) % num_pages) + 1
+        for record in records
+    )
+    sheet_score = sheet_matches / observed
+    page_score = 0.0
+    page_matches = 0
+    student_count = 0
+    if total_source_pages > 0 and total_source_pages % num_pages == 0:
+        student_count = total_source_pages // num_pages
+        page_matches = sum(
+            record.aligned_page.page_index == ((record.source_index - 1) // student_count) + 1
+            for record in records
+        )
+        page_score = page_matches / observed
+
+    scores = {"sheet-major": sheet_score, "page-major": page_score}
+    ranked = sorted(scores.items(), key=lambda item: (-item[1], item[0]))
+    best_mode, best_score = ranked[0]
+    runner_up_score = ranked[1][1]
+    margin = best_score - runner_up_score
+    result.update(
+        {
+            "scores": {key: round(value, 6) for key, value in scores.items()},
+            "matches": {
+                "sheet-major": sheet_matches,
+                "page-major": page_matches,
+            },
+            "student_count": student_count or None,
+            "best_mode": best_mode,
+            "best_score": round(best_score, 6),
+            "margin": round(margin, 6),
+        }
+    )
+    if best_score < AUTO_ORDER_MIN_SCORE:
+        result["reason"] = "detected page codes do not consistently match a scanner order"
+        return result
+    if margin < AUTO_ORDER_MIN_MARGIN:
+        result["reason"] = "scanner order is ambiguous"
+        return result
+    result["mode"] = best_mode
+    result["reason"] = (
+        f"{best_mode} order matched {result['matches'][best_mode]}/{observed} readable source pages"
+    )
+    return result
+
+
+def _infer_grouping_mode(
+    records: list[_PageRecord],
+    manifest: dict,
+    total_source_pages: int | None = None,
+) -> str:
+    total = total_source_pages or max((record.source_index for record in records), default=0)
+    return str(_source_order_inference(records, manifest, total)["mode"])
 
 
 def _roll_write_in_field(manifest: dict, page_index: int, program: str | None) -> dict | None:
@@ -814,6 +889,120 @@ def _positional_record(record: _PageRecord, anchor: _PageRecord, grouping_mode: 
         identity_payload=identity_payload,
         review_flags=review_flags,
     )
+
+
+def _group_records_by_inferred_order(
+    records: list[_PageRecord],
+    manifest: dict,
+    grouping_mode: str,
+    *,
+    total_source_pages: int,
+    valid_rolls: set[str] | None,
+) -> tuple[dict[str, list[_PageRecord]], list[_PageRecord]]:
+    """Group a strongly detected scanner order without hiding identity conflicts.
+
+    Page 1 remains the ownership anchor and must contain a readable bubbled roll.
+    Source order only determines which continuation pages belong beside that
+    anchor.  Duplicate roll claims and sheets without a valid anchor stay
+    unmatched for human review.
+    """
+    if grouping_mode not in {"sheet-major", "page-major"}:
+        raise ValueError(f"unsupported inferred grouping mode: {grouping_mode}")
+    num_pages = int(manifest["num_pages"])
+    if num_pages <= 1:
+        return _group_records_by_identity(records, "high", valid_rolls=valid_rolls)
+
+    student_count = total_source_pages // num_pages if total_source_pages % num_pages == 0 else 0
+    if grouping_mode == "page-major" and student_count <= 0:
+        return {}, list(records)
+
+    slots: dict[int, dict[int, _PageRecord]] = {}
+    unmatched: list[_PageRecord] = []
+    for record in sorted(records, key=lambda item: item.source_index):
+        if grouping_mode == "sheet-major":
+            slot = (record.source_index - 1) // num_pages
+            expected_page = ((record.source_index - 1) % num_pages) + 1
+        else:
+            slot = (record.source_index - 1) % student_count
+            expected_page = ((record.source_index - 1) // student_count) + 1
+        if record.aligned_page.page_index != expected_page:
+            record.review_flags.append(
+                f"auto-detected {grouping_mode} order expected source {record.source_index} "
+                f"to be sheet page {expected_page}, but its page code reads "
+                f"{record.aligned_page.page_index}; left unmatched"
+            )
+            unmatched.append(record)
+            continue
+        slots.setdefault(slot, {})[expected_page] = record
+
+    anchors: dict[int, _PageRecord] = {}
+    claims_by_roll: dict[str, list[int]] = {}
+    for slot, pages in slots.items():
+        anchor = pages.get(1)
+        if (
+            anchor is None
+            or anchor.identity_kind != "bubbled"
+            or not anchor.roll_no
+            or (valid_rolls is not None and anchor.roll_no not in valid_rolls)
+        ):
+            continue
+        anchors[slot] = anchor
+        claims_by_roll.setdefault(anchor.roll_no, []).append(slot)
+
+    duplicate_rolls = {
+        roll_no for roll_no, claimed_slots in claims_by_roll.items() if len(claimed_slots) != 1
+    }
+    grouped: dict[str, list[_PageRecord]] = {}
+    already_unmatched = {record.source_index for record in unmatched}
+    for slot, pages in sorted(slots.items()):
+        anchor = anchors.get(slot)
+        if anchor is None:
+            reason = (
+                f"auto-detected {grouping_mode} order could not assign this sheet because page 1 "
+                "has no unique roster-valid bubbled roll"
+            )
+            for record in pages.values():
+                if reason not in record.review_flags:
+                    record.review_flags.append(reason)
+                if record.source_index not in already_unmatched:
+                    unmatched.append(record)
+                    already_unmatched.add(record.source_index)
+            continue
+
+        assert anchor.roll_no is not None
+        if anchor.roll_no in duplicate_rolls:
+            reason = (
+                f"duplicate page-1 ownership claim for roll {anchor.roll_no}; "
+                f"auto-detected {grouping_mode} order left every claimed sheet unmatched"
+            )
+            for record in pages.values():
+                if reason not in record.review_flags:
+                    record.review_flags.append(reason)
+                if record.source_index not in already_unmatched:
+                    unmatched.append(record)
+                    already_unmatched.add(record.source_index)
+            continue
+
+        if not _page_one_write_in_matches_bubbles(anchor):
+            anchor.review_flags.append(
+                f"auto-detected {grouping_mode} order used the unique page-1 bubbled roll "
+                f"{anchor.roll_no}; page-1 handwriting did not independently confirm ownership"
+            )
+        student_records = [anchor]
+        for page_index in range(2, num_pages + 1):
+            continuation = pages.get(page_index)
+            if continuation is None:
+                continue
+            positional = _positional_record(continuation, anchor, grouping_mode)
+            if not continuation.roll_no:
+                positional.review_flags.append(
+                    f"auto-detected {grouping_mode} order attached source "
+                    f"{continuation.source_index}; its handwritten roll was not independently readable"
+                )
+            student_records.append(positional)
+        grouped[anchor.roll_no] = student_records
+
+    return grouped, unmatched
 
 
 def _group_records_by_page_major(
@@ -1841,20 +2030,36 @@ def parse_exam_bundle(
                 }
             )
 
-    applied_grouping_mode = "identity" if grouping_mode == "auto" else grouping_mode
-    identity_grouped, identity_unmatched = _group_records_by_identity(
+    order_inference = _source_order_inference(
         page_records_for_bundle,
-        min_group_confidence,
-        page_one_index=int(manifest["roll_number_block"].get("page", 1)),
-        valid_rolls=valid_rolls,
-        program_by_roll=program_by_roll,
+        manifest,
+        total_source_pages,
     )
-    if applied_grouping_mode == "page-major":
+    applied_grouping_mode = (
+        str(order_inference["mode"])
+        if grouping_mode == "auto"
+        else grouping_mode
+    )
+    if grouping_mode == "auto" and applied_grouping_mode in {"page-major", "sheet-major"}:
+        grouped, unmatched = _group_records_by_inferred_order(
+            page_records_for_bundle,
+            manifest,
+            applied_grouping_mode,
+            total_source_pages=total_source_pages,
+            valid_rolls=valid_rolls,
+        )
+    elif applied_grouping_mode == "page-major":
         grouped, unmatched = _group_records_by_page_major(page_records_for_bundle, manifest, min_group_confidence)
     elif applied_grouping_mode == "sheet-major":
         grouped, unmatched = _group_records_by_sheet_major(page_records_for_bundle, manifest, min_group_confidence)
     else:
-        grouped, unmatched = identity_grouped, identity_unmatched
+        grouped, unmatched = _group_records_by_identity(
+            page_records_for_bundle,
+            min_group_confidence,
+            page_one_index=int(manifest["roll_number_block"].get("page", 1)),
+            valid_rolls=valid_rolls,
+            program_by_roll=program_by_roll,
+        )
         grouped, unmatched = _reconcile_exact_cross_page_roll_pairs(
             page_records_for_bundle,
             grouped,
@@ -1931,6 +2136,7 @@ def parse_exam_bundle(
         "mode": "multi_student_bundle",
         "requested_grouping_mode": grouping_mode,
         "grouping_mode": applied_grouping_mode,
+        "grouping_order_inference": order_inference,
         "detected_page_sequence": _page_sequence(page_records_for_bundle),
         "expected_pages": manifest["num_pages"],
         "status_counts": {
@@ -2058,7 +2264,8 @@ def build_parser() -> argparse.ArgumentParser:
         default="auto",
         choices=sorted(GROUPING_MODES),
         help=(
-            "auto uses exact roll identity (page-1 bubbles plus handwriting, then continuation handwriting); "
+            "auto uses source order only when detected page codes establish page-major or sheet-major order "
+            "with high confidence, otherwise it uses exact roll identity; "
             "page-major expects A1 B1 ... A2 B2 ...; sheet-major expects A1 A2 ... B1 B2 ..."
         ),
     )

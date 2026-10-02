@@ -22,9 +22,11 @@ from omr.models import AlignedPage, Student
 from omr.reader.handwriting import RollOcrResult
 from omr.workflows.batch import (
     _PageRecord,
+    _group_records_by_inferred_order,
     _group_records_by_identity,
     _reconcile_exact_cross_page_roll_pairs,
     _reconcile_roster,
+    _source_order_inference,
     parse_exam_bundle,
 )
 
@@ -130,6 +132,60 @@ def _cell_read(roll_no: str, selected_probability: float) -> dict:
             }
         },
     }
+
+
+def test_auto_order_inference_recovers_sheet_major_bundle_with_one_failed_page():
+    manifest = {"num_pages": 2}
+    records = []
+    valid_rolls = {f"20240{index:02d}" for index in range(1, 7)}
+    for index, roll_no in enumerate(sorted(valid_rolls), start=1):
+        page_one_source = index * 2 - 1
+        if page_one_source != 5:
+            records.append(_record(page_one_source, 1, roll_no, "high"))
+        records.append(_record(page_one_source + 1, 2, "", "low"))
+
+    inference = _source_order_inference(records, manifest, total_source_pages=12)
+    assert inference["mode"] == "sheet-major"
+    assert inference["best_score"] == 1.0
+    assert inference["matches"]["sheet-major"] == 11
+
+    grouped, unmatched = _group_records_by_inferred_order(
+        records,
+        manifest,
+        "sheet-major",
+        total_source_pages=12,
+        valid_rolls=valid_rolls,
+    )
+    assert len(grouped) == 5
+    assert all({page.aligned_page.page_index for page in pages} == {1, 2} for pages in grouped.values())
+    assert [page.source_index for page in unmatched] == [6]
+    assert all(
+        any("handwritten roll was not independently readable" in flag for flag in pages[1].review_flags)
+        for pages in grouped.values()
+    )
+
+
+def test_inferred_order_refuses_duplicate_page_one_roll_claims():
+    manifest = {"num_pages": 2}
+    records = []
+    rolls = ["2024001", "2024001", "2024003", "2024004"]
+    for index, roll_no in enumerate(rolls, start=1):
+        records.append(_record(index * 2 - 1, 1, roll_no, "high"))
+        records.append(_record(index * 2, 2, roll_no, "high"))
+
+    grouped, unmatched = _group_records_by_inferred_order(
+        records,
+        manifest,
+        "sheet-major",
+        total_source_pages=8,
+        valid_rolls=set(rolls),
+    )
+    assert set(grouped) == {"2024003", "2024004"}
+    assert {record.source_index for record in unmatched} == {1, 2, 3, 4}
+    assert all(
+        any("duplicate page-1 ownership claim" in flag for flag in record.review_flags)
+        for record in unmatched
+    )
 
 
 def test_path_a_near_neighbour_guard_holds_uncertain_automatic_attachment():

@@ -167,8 +167,11 @@ An MCQ answer key and roster are optional for extraction; without a key, MCQs
 are read but not scored. Existing files in `data/answer_keys/` may be loaded
 automatically, so check that any key belongs to this exam.
 
-Grouping defaults to `auto` with a `high` minimum identity confidence. Do not
-lower the threshold or force scanner order simply to make every page attach.
+Grouping defaults to `auto`. It uses scanner order only when detected template
+page codes establish page-major or sheet-major collation with at least 98%
+agreement and a clear margin over the alternative. Otherwise it falls back to
+identity evidence. Do not lower the identity threshold or force scanner order
+simply to make every page attach.
 Handwritten roll OCR is separate from written-answer OCR; this command does
 not enable it or install Tesseract's executable. If grouping needs that backend,
 configure it separately using the [batch instructions](../README.md#parse-a-multi-student-pdf).

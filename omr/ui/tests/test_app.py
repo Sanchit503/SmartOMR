@@ -6,7 +6,12 @@ import pytest
 
 from omr.io.csv import load_students
 from omr.ui import app
-from omr.ui.app import UPLOAD_READ_SIZE, _canonicalize_roster, parse_multipart_upload
+from omr.ui.app import (
+    UPLOAD_READ_SIZE,
+    _canonicalize_roster,
+    _grouping_order_notice,
+    parse_multipart_upload,
+)
 
 
 def _multipart_body(boundary: str, parts: list[tuple[str, str | None, bytes]]) -> bytes:
@@ -75,3 +80,20 @@ def test_professor_ui_refuses_to_process_without_roll_ocr(monkeypatch):
 
     with pytest.raises(RuntimeError, match="Roll-number OCR is required.*Tesseract missing"):
         app._require_ui_roll_ocr_backend()
+
+
+def test_grouping_order_notice_explains_guarded_source_pairing():
+    notice = _grouping_order_notice(
+        {
+            "grouping_order_inference": {
+                "mode": "sheet-major",
+                "matches": {"sheet-major": 323},
+                "observed_pages": 323,
+            }
+        }
+    )
+
+    assert "auto-detected sheet-major" in notice
+    assert "323/323 readable page codes matched" in notice
+    assert "unique, roster-valid bubbled roll" in notice
+    assert _grouping_order_notice({}) == ""

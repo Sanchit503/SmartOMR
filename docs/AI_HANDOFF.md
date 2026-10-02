@@ -567,10 +567,19 @@ The intended ownership rule requested by the user is:
 
 ### Actual Batch Path
 
-In the dirty local `workflows/batch.py`, `auto` maps directly to `identity`.
-It no longer automatically selects positional grouping from scanner order.
-Some older inference/similarity helpers remain in the file; follow call sites
-rather than assuming every helper is active.
+`auto` first measures whether source positions and detected template page codes
+establish a scanner collation pattern. It accepts page-major or sheet-major
+only with at least 98% agreement, at least eight readable pages, and a 0.15
+margin over the alternative. Source indices preserve an isolated alignment
+failure, so one unreadable page does not invalidate an otherwise consistent
+300-page run. If those gates fail, `auto` uses identity grouping and makes no
+assumption about arrival order.
+
+In inferred positional mode, page 1 must still have a unique, roster-valid
+bubbled roll. Scanner order selects only that anchor's continuation slots.
+Unreadable or contradictory continuation handwriting is retained as review
+evidence. Duplicate page-1 roll claims, invalid anchors, and page-code
+contradictions stay unmatched.
 
 `_page_identity` reads page-1 bubbles. When a roll OCR backend is configured,
 it also calls the write-in reader, preserves its payload, and flags unreadable,

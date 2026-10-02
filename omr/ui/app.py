@@ -571,6 +571,23 @@ def _is_grouping_only(state: dict[str, Any]) -> bool:
     return bool(isinstance(inputs, dict) and inputs.get("grouping_only"))
 
 
+def _grouping_order_notice(index: dict[str, Any]) -> str:
+    inference = index.get("grouping_order_inference")
+    if not isinstance(inference, dict) or inference.get("mode") not in {"page-major", "sheet-major"}:
+        return ""
+    mode = str(inference["mode"])
+    matches = (inference.get("matches") or {}).get(mode, "")
+    observed = inference.get("observed_pages", "")
+    return (
+        '<div class="band">'
+        f"<strong>Scanner order:</strong> auto-detected {html.escape(mode)} "
+        f"({html.escape(str(matches))}/{html.escape(str(observed))} readable page codes matched). "
+        "Continuation pages were paired by source slot only where page 1 had a unique, "
+        "roster-valid bubbled roll; ambiguous sheets remain in review."
+        "</div>"
+    )
+
+
 def _fmt_num(value: float | int | None) -> str:
     if value is None:
         return ""
@@ -2998,6 +3015,7 @@ class SmartOmrUiHandler(BaseHTTPRequestHandler):
 
         parse_dir = Path(str(state["parse_dir"]))
         index = _read_json(Path(str(state["parse_index_path"])))
+        grouping_order_notice = _grouping_order_notice(index)
         verified_by_roll: dict[str, dict[str, Any]] = {}
         verified_path = parse_dir / "verified_index.json"
         if verified_path.exists():
@@ -3036,6 +3054,7 @@ class SmartOmrUiHandler(BaseHTTPRequestHandler):
         <h1>{html.escape(state.get('exam_id',''))}</h1>
         <div class="grid">{metric_html}</div>
         {roll_ocr_warning}
+        {grouping_order_notice}
         <div class="actions band">
           <a class="button secondary" href="/runs/{html.escape(run_id)}/pages">Inspect Source Pages</a>
           {marks_action}
@@ -3281,6 +3300,9 @@ class SmartOmrUiHandler(BaseHTTPRequestHandler):
         grouping_only = _is_grouping_only(state)
         parse_dir = Path(str(state["parse_dir"]))
         index, _verified_path = load_or_initialize_verified_index(parse_dir)
+        parse_index_path = Path(str(state.get("parse_index_path") or ""))
+        parse_index = _read_json(parse_index_path) if parse_index_path.is_file() else {}
+        grouping_order_notice = _grouping_order_notice(parse_index)
         identity_resolution = load_identity_resolution(parse_dir)
         rows = []
         for student in index.get("students", []):
@@ -3388,6 +3410,7 @@ class SmartOmrUiHandler(BaseHTTPRequestHandler):
         body = f"""
         <h1>{review_title}</h1>
         <div class="actions band"><a class="button secondary" href="/runs/{html.escape(run_id)}">Back to Exam</a></div>
+        {grouping_order_notice}
         <datalist id="student-rolls">{roll_options}</datalist>
         {suggestion_html}
         <div class="section-title"><h2>Students Needing Review</h2></div>
