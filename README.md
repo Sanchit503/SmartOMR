@@ -35,8 +35,9 @@ The answer key and student roster are optional uploads. CSV/XLSX rosters are nor
 blank row, `Roll No.`/`Student Name` headers, `Lecture` in `Class Type`, and an email column whose
 header is blank.
 
-After inspection, **Run OCR & Grouping** starts the existing evaluation workflow separately.
-Only that step requires local roll-number OCR. Inspection does not require Tesseract.
+After inspection, **Read Rolls & Match Sheets** reads identities and creates student bundles
+in grouping-only mode. Grading runs only when selected for the run. Only the identity-reading
+step requires local roll-number OCR. Inspection does not require Tesseract.
 Run this preflight before evaluation:
 
 ```powershell
@@ -47,7 +48,19 @@ It must report `handwriting_ocr: ready`. On Windows, SmartOMR discovers the norm
 `C:\Program Files\Tesseract-OCR\tesseract.exe` installation automatically; a custom location can be
 set through `SMARTOMR_TESSERACT_CMD`.
 
-After processing, resolve unmatched pages and verify every student from the Review page. Check
+After matching, choose **Review Student Sheets** on the dashboard or Review page. The workspace
+has a searchable student queue, status filters, page thumbnails, zoom, and original/aligned/overlay
+views. It shows the current selected source pages and saved OCR evidence. **Open Current Preview
+PDF** assembles the current selection without approving it or rerunning OCR. **Open Verified PDF**
+is available after an explicit manual check.
+
+Use **Verify & Next** to approve the current selection and move through the filtered queue, or
+**Keep for Review & Next** to defer it. Incomplete sheets require explicit acknowledgement and
+remain ineligible for email. Duplicate ownership blocks verification. Corrections made in another
+tab invalidate a stale decision; refresh before approving the changed selection. Unsaved notes
+are preserved until you choose to discard them. Saved review changes synchronize across views.
+
+Resolve unmatched source pages and verify each student's selection before release. Check
 the `Missing Sheets` count against the roster before preparing email. Prepare and inspect the
 email queue using **Sheet Verification - no marks** when returning scanned answer sheets. Use
 **Evaluated Sheet + Marks** only after grading data has been checked and finalized. Run a dry run,

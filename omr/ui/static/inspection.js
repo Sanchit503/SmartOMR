@@ -18,6 +18,8 @@
   const listItems = new Map();
   const viewer = byId("viewer");
   const pageImage = byId("page-image");
+  const initialFilter = new URL(location.href).searchParams.get("page-filter");
+  if ([...byId("page-filter").options].some((option) => option.value === initialFilter)) byId("page-filter").value = initialFilter;
 
   function text(id, value) { byId(id).textContent = value; }
   function alertText(id, value) {

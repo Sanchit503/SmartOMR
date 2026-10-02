@@ -40,7 +40,7 @@ from omr.io.csv import load_answer_key, load_students
 from omr.models import AlignedPage
 from omr.reader.handwriting import build_roll_ocr_backend, save_roll_number_crop_sets
 from omr.reader.scan import align_scan_page, iter_scan_pages
-from omr.ui import identity_cache, inspection
+from omr.ui import identity_cache, inspection, student_view
 from omr.ui.inspection_view import inspection_body
 from omr.workflows.email import (
     EMAIL_LOG_CSV,
@@ -2123,7 +2123,7 @@ class SmartOmrUiHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:  # noqa: N802
         path = urllib.parse.urlparse(self.path).path
         if path in {"/", "/review-state.json"} or re.fullmatch(
-            r"/runs/[^/]+(?:/pages|/review|/email|/inspection.json|/review-state.json|/students/[^/]+)?", path
+            r"/runs/[^/]+(?:/pages|/review|/email|/inspection.json|/review-state.json|/students/[^/]+(?:/preview.pdf)?)?", path
         ):
             with self.store._review_lock:
                 self._handle_get()
@@ -2184,7 +2184,9 @@ class SmartOmrUiHandler(BaseHTTPRequestHandler):
                     else:
                         self._not_found("Page image is not available")
                 elif len(parts) == 4 and parts[2] == "students":
-                    self._page_student(parts[1], urllib.parse.unquote(parts[3]))
+                    self._page_student(parts[1], urllib.parse.unquote(parts[3]), query)
+                elif len(parts) == 5 and parts[2] == "students" and parts[4] == "preview.pdf":
+                    self._student_preview_pdf(parts[1], urllib.parse.unquote(parts[3]))
                 elif len(parts) == 3 and parts[2] == "review":
                     self._page_review(parts[1])
                 elif len(parts) == 3 and parts[2] == "email":
@@ -2446,14 +2448,28 @@ class SmartOmrUiHandler(BaseHTTPRequestHandler):
         state = self.store.read_state(run_id)
         parse_dir = Path(str(state.get("parse_dir") or ""))
         form = self._urlencoded_form()
+        if form.get("revision") and form["revision"] != self._review_revision(run_id):
+            message = "Review state changed. Refresh and check the current selected pages before saving."
+            if self.headers.get("Accept") == "application/json":
+                self._send_json({"error": message}, HTTPStatus.CONFLICT)
+            else:
+                self._bad_request(message)
+            return
+        current, _ = load_or_initialize_verified_index(parse_dir)
+        kind, search = student_view.queue_parameters(form)
+        next_roll = student_view.next_student(current, roll_no, kind, search)
         note = (form.get("note") or "").strip()
         if action == "verify":
+            target = next(student for student in current["students"] if str(student["roll_no"]) == roll_no)
+            conflicts = student_view.selection_conflicts(current, target)
+            if conflicts:
+                raise ValueError(" ".join(conflicts))
             verify_student(
                 parse_dir,
                 roll_no,
                 reviewer="professor-ui",
                 note=note or "Marked manually checked from UI.",
-                allow_missing=True,
+                allow_missing=form.get("workspace") != "1" or form.get("allow_missing") == "1",
             )
         elif action == "hold":
             hold_student(
@@ -2469,7 +2485,15 @@ class SmartOmrUiHandler(BaseHTTPRequestHandler):
                 reviewer="professor-ui",
                 reason=note or "Rejected from professor UI.",
             )
-        self._redirect(f"/runs/{run_id}/students/{urllib.parse.quote(roll_no)}")
+        advance = form.get("advance") == "1"
+        location = student_view.student_url(
+            run_id, next_roll if advance and next_roll else roll_no, kind, search,
+            saved=action, **({"finished": "1"} if advance and not next_roll else {}),
+        )
+        if self.headers.get("Accept") == "application/json":
+            self._send_json({"redirect_url": location, "saved": action})
+        else:
+            self._redirect(location)
 
     def _update_student_marks(self, run_id: str, roll_no: str) -> None:
         state = self.store.read_state(run_id)
@@ -3283,6 +3307,11 @@ class SmartOmrUiHandler(BaseHTTPRequestHandler):
         marks_heading = "" if grouping_only else "<th>Marks</th>"
         column_count = 6 if grouping_only else 7
         review_label = "Sheet Matching Review" if grouping_only else "Review Cases"
+        first_roll = student_view.next_student(verified_index, "", "unchecked", "") or student_view.next_student(verified_index, "", "all", "")
+        student_review_link = (
+            f'<a class="button" href="{html.escape(student_view.student_url(run_id, first_roll, "unchecked"))}">Review Student Sheets</a>'
+            if first_roll else ""
+        )
         student_rows_html = "".join(rows) or f'<tr><td colspan="{column_count}" class="empty">No students detected</td></tr>'
         body = f"""
         <h1>{html.escape(state.get('exam_id',''))}</h1>
@@ -3290,6 +3319,7 @@ class SmartOmrUiHandler(BaseHTTPRequestHandler):
         {roll_ocr_warning}
         {grouping_order_notice}
         <div class="actions band">
+          {student_review_link}
           <a class="button secondary" href="/runs/{html.escape(run_id)}/pages">Inspect Source Pages</a>
           {marks_action}
           <a class="button secondary" href="{review_link}">{review_label}</a>
@@ -3330,33 +3360,82 @@ class SmartOmrUiHandler(BaseHTTPRequestHandler):
             raise ValueError(f"student {roll_no} not found")
         return state, parse_dir, details, verified
 
-    def _page_student(self, run_id: str, roll_no: str) -> None:
+    def _student_page_views(self, state: dict[str, Any], parse_dir: Path, details: dict[str, Any],
+                            verified: dict[str, Any], expected: int) -> list[dict[str, Any]]:
+        page_base = parse_dir if verified else _resolve_output_path(details.get("details_path"), parse_dir).parent
+        selected = {int(page["page"]): page for page in selected_student_pages(verified or details)}
+        run_dir = self.store.run_dir(state["run_id"])
+        inventory_path = run_dir / inspection.INDEX_NAME
+        inventory = _read_json(inventory_path).get("pages", []) if inventory_path.is_file() else []
+        originals = {int(page["source_index"]): page for page in inventory}
+        scan_path = Path(str(state.get("inputs", {}).get("scan_path") or "")).resolve()
+        views = []
+        for number in sorted(set(range(1, expected + 1)) | set(selected)):
+            page = selected.get(number, {})
+            source = page.get("source_index")
+            view = {"page": number, "source_index": source, "origin": page.get("origin") or ("parser" if page else "Missing")}
+            for mode, key in (("aligned", "canonical_image_path"), ("overlay", "alignment_overlay_path"),
+                              ("sampling", "sampling_overlay_path")):
+                path = _resolve_output_path(page.get(key), page_base) if page.get(key) else None
+                view[mode] = _asset_url(path) if path and path.is_file() else None
+            original = originals.get(source, {}).get("original")
+            original_path = run_dir / original if original else None
+            source_record = next((row for row in details.get("source_pages", [])
+                                  if row.get("source_index") == source
+                                  and row.get("page_index") == number), {})
+            uploaded = (page.get("origin") == "parser" and source_record.get("source_path")
+                        and Path(source_record["source_path"]).resolve() != scan_path)
+            # Upload-local page numbers are not positions in the original batch.
+            if uploaded:
+                view.update(source_index=None, origin="uploaded")
+            view["original"] = (_asset_url(original_path) if original_path and original_path.is_file()
+                                and not uploaded else None)
+            cache_path = run_dir / "identity_preview" / f"source_{int(source or 0):04d}" / "evidence.json"
+            cached = _read_json(cache_path).get("page", {}) if not uploaded and cache_path.is_file() else {}
+            read = next((row for row in details.get("identity_reads", []) if row.get("source_index") == source
+                         and row.get("page_index") == number), {})
+            payload = cached.get("identity") or read.get("payload") or {}
+            written = payload.get("write_in_roll_read") or (payload if number != 1 else {})
+            view["evidence"] = {
+                "literal_roll": cached.get("literal_roll_no") or read.get("roll_no"),
+                "bubble_roll": payload.get("roll_no") if (cached.get("identity_kind") or read.get("kind")) == "bubbled" else None,
+                "written_roll": written.get("roll_no"),
+                "confidence": cached.get("confidence") or read.get("confidence"),
+                "detected_page": cached.get("sheet_page") or read.get("page_index"),
+                "flags": cached.get("review_flags") or [],
+            }
+            views.append(view)
+        return views
+
+    def _student_preview_pdf(self, run_id: str, roll_no: str) -> None:
+        _state, parse_dir, details, verified = self._student_details(run_id, roll_no)
+        page_base = parse_dir if verified else _resolve_output_path(details.get("details_path"), parse_dir).parent
+        image_paths = [_resolve_output_path(page.get("canonical_image_path"), page_base)
+                       for page in selected_student_pages(verified or details)]
+        if any(not page.get("canonical_image_path") for page in selected_student_pages(verified or details)):
+            raise ValueError("A selected page image is unavailable; inspect the source before previewing")
+        payload = student_view.preview_pdf(image_paths)
+        self.send_response(HTTPStatus.OK.value)
+        self.send_header("Content-Type", "application/pdf")
+        self.send_header("Content-Disposition", f'inline; filename="{_safe_id(roll_no)}_preview.pdf"')
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def _page_student(self, run_id: str, roll_no: str, query: dict[str, list[str]] | None = None) -> None:
         state, parse_dir, details, verified = self._student_details(run_id, roll_no)
+        index, _ = load_or_initialize_verified_index(parse_dir)
+        verified = next(row for row in index["students"] if str(row["roll_no"]) == roll_no)
+        parameters = {key: values[0] for key, values in (query or {}).items() if values}
+        kind, search = student_view.queue_parameters(parameters)
         grouping_only = _is_grouping_only(state)
         student = details.get("student", {})
         score, total = _score(details)
-        status = verified.get("status") if verified else details.get("status")
-        display_status = _professor_status(details.get("status"), status if verified else None)
         details_dir = _resolve_output_path(details.get("details_path"), parse_dir).parent
         selection_changed = _selection_changed(details, verified)
         feedback_disabled = 'disabled title="No original parser record for this student"' if details_dir == parse_dir else ""
-        current_pages = selected_student_pages(verified) if verified else list(details.get("pages", []))
-        pages = []
-        for page in current_pages:
-            page_no = page.get("page", page.get("page_index"))
-            page_base = parse_dir if verified else details_dir
-            for label, key in (
-                ("Aligned Page", "canonical_image_path"),
-                ("Alignment Overlay", "alignment_overlay_path"),
-                ("Sampling Overlay", "sampling_overlay_path"),
-            ):
-                if page.get(key):
-                    pages.append(
-                        f"""<figure>
-                          <figcaption>{html.escape(label)} {html.escape(str(page_no))}</figcaption>
-                          <a href="{_asset_url(page[key], page_base)}" target="_blank"><img class="sheet" src="{_asset_url(page[key], page_base)}" alt="{html.escape(label)}"></a>
-                        </figure>"""
-                    )
+        page_views = self._student_page_views(state, parse_dir, details, verified, int(index.get("expected_pages") or 0))
         answer_rows = []
         for response in details.get("mcq_responses", []):
             marks_display = (
@@ -3398,44 +3477,16 @@ class SmartOmrUiHandler(BaseHTTPRequestHandler):
         if verified and verified.get("status") == "verified":
             flags = [f"Missing sheet page {page}" for page in verified.get("missing_pages", [])]
         original_flags = details.get("review_flags", [])
-        missing_pages = list((verified or {}).get("missing_pages", []))
-        missing_note = (
-            f'<span class="muted">Missing page(s) {html.escape(", ".join(str(page) for page in missing_pages))}; '
-            "manual check will keep this warning.</span>"
-            if missing_pages
-            else ""
-        )
-        verify_action = (
-            f'<form method="post" action="/runs/{html.escape(run_id)}/students/{urllib.parse.quote(roll_no)}/verify">'
-            '<button type="submit">Mark Manually Checked</button></form>'
-            f"{missing_note}"
-        )
-        decision_actions = f"""
-        {verify_action}
-        <form method="post" action="/runs/{html.escape(run_id)}/students/{urllib.parse.quote(roll_no)}/hold"><button class="secondary" type="submit">Keep Needs Review</button></form>
-        <form method="post" action="/runs/{html.escape(run_id)}/students/{urllib.parse.quote(roll_no)}/reject"><button class="secondary" type="submit">Reject Grouping</button></form>
-        """
         if verified and verified.get("status") == "verified" and verified.get("verified_sheet_pdf_path"):
             pdf_link = (
-                f'<a class="button secondary" href="{_asset_url(verified["verified_sheet_pdf_path"], parse_dir)}">'
+                f'<a href="{_asset_url(verified["verified_sheet_pdf_path"], parse_dir)}" target="_blank" rel="noopener">'
                 "Open Verified PDF</a>"
             )
         elif selection_changed:
             pdf_link = '<span class="muted">Current PDF pending verification</span>'
         else:
-            pdf_link = (
-                f'<a class="button secondary" href="{_asset_url(details.get("sheet_pdf_path"), details_dir)}">'
-                "Open Student PDF</a>"
-            )
-        source_rows = "".join(
-            "<tr>"
-            f'<td><a href="/runs/{html.escape(run_id)}/pages?page={html.escape(str(page.get("source_index") or ""))}">Source {html.escape(str(page.get("source_index") or ""))}</a></td>'
-            f"<td>{html.escape(str(page.get('page', page.get('page_index')) or ''))}</td>"
-            f"<td>{html.escape(str(page.get('origin') or 'parser'))}</td>"
-            "</tr>"
-            for page in current_pages
-        )
-        marks_metric = "" if grouping_only else f'<div class="metric"><span>Marks</span><strong>{_marks_label(details, verified)}</strong></div>'
+            pdf_link = '<span class="muted">Not yet manually checked</span>'
+        marks_metric = "" if grouping_only else f'<span>Marks: {html.escape(_marks_label(details, verified))}</span>'
         answers_section = "" if grouping_only else (
             '<p class="review">Page selection changed. Original marks are not current.</p>' if selection_changed else f"""
             <div class="section-title"><h2>Answers And Marks</h2></div>
@@ -3459,41 +3510,7 @@ class SmartOmrUiHandler(BaseHTTPRequestHandler):
                 </div>
         """
         replacement_button = "Upload And Reprocess Sheet" if grouping_only else "Upload And Re-evaluate"
-        body = f"""
-        <h1>Student {html.escape(str(student.get('roll_no') or roll_no))}</h1>
-        <div class="grid">
-          <div class="metric"><span>Name</span><strong>{html.escape(str(student.get('name') or ''))}</strong></div>
-          <div class="metric"><span>Email</span><strong>{html.escape(str(student.get('email') or ''))}</strong></div>
-          {marks_metric}
-          <div class="metric"><span>Status</span><strong>{_badge(display_status)}</strong></div>
-        </div>
-        <div class="actions band toolbar">
-          <div class="actions">{decision_actions}</div>
-          <div class="actions">
-            <a class="button secondary" href="/runs/{html.escape(run_id)}">Back to Exam</a>
-            <a class="button secondary" href="/runs/{html.escape(run_id)}/review">Review Sheets</a>
-            {pdf_link}
-          </div>
-        </div>
-        <div class="student-layout">
-          <section>
-            <div class="section-title"><h2>Full Sheet Images</h2></div>
-            <div class="pages">{''.join(pages) or '<p class="empty">No page images found</p>'}</div>
-            {answers_section}
-          </section>
-          <aside class="side-stack">
-            <section class="band">
-              <h2>Review Flags</h2>
-              <div>{'<br>'.join(html.escape(str(flag)) for flag in flags) if flags else '<span class="muted">No review flags.</span>'}</div>
-            </section>
-            <section class="band">
-              <h2>Current Source Pages</h2>
-              <table><thead><tr><th>Source</th><th>Sheet Page</th><th>Selection</th></tr></thead>
-              <tbody>{source_rows or '<tr><td colspan="3">No selected pages</td></tr>'}</tbody></table>
-            </section>
-            <section class="band">
-              <h2>Review Operations</h2>
-              <div class="operation-grid">
+        operations = f"""<div class="operation-grid">
                 {edit_marks_operation}
                 <div class="operation">
                   <h3>Roll OCR Training Feedback</h3>
@@ -3528,19 +3545,22 @@ class SmartOmrUiHandler(BaseHTTPRequestHandler):
                     <p><button type="submit">{replacement_button}</button></p>
                   </form>
                 </div>
-              </div>
-            </section>
-            <section class="band">
-              <details><summary>Original Parser Observations</summary>
-              <p>{'<br>'.join(html.escape(str(flag)) for flag in original_flags) or 'No original flags.'}</p>
-              <table><thead><tr><th>Source</th><th>Page</th><th>Used</th></tr></thead><tbody>
-              {''.join(f"<tr><td>{html.escape(str(src.get('source_index')))}</td><td>{html.escape(str(src.get('page_index')))}</td><td>{html.escape(str(src.get('used')))}</td></tr>" for src in details.get('source_pages', []))}
-              </tbody></table></details>
-            </section>
-          </aside>
-        </div>
-        """
-        self._send_html("Student Detail", body)
+              </div>"""
+        original = f"""
+        <p>{'<br>'.join(html.escape(str(flag)) for flag in original_flags) or 'No original flags.'}</p>
+        <table><thead><tr><th>Source</th><th>Page</th><th>Used</th></tr></thead><tbody>
+        {''.join(f"<tr><td>{html.escape(str(src.get('source_index')))}</td><td>{html.escape(str(src.get('page_index')))}</td><td>{html.escape(str(src.get('used')))}</td></tr>" for src in details.get('source_pages', []))}
+        </tbody></table>"""
+        current_student = {**verified, "student_name": verified.get("student_name") or student.get("name"),
+                           "student_email": verified.get("student_email") or student.get("email")}
+        body = student_view.workspace_body(
+            state=state, student=current_student, index=index, summary=_review_summary(index), page_views=page_views, flags=flags,
+            conflicts=student_view.selection_conflicts(index, verified), revision=self._review_revision(run_id),
+            kind=kind, search=search, pdf_link=pdf_link, operations=operations, answers=answers_section,
+            original=original, marks=marks_metric, saved=parameters.get("saved", ""),
+            finished=parameters.get("finished") == "1",
+        )
+        self._send_html("Student Review", body)
 
     def _page_review(self, run_id: str) -> None:
         state = self.store.read_state(run_id)
@@ -3565,7 +3585,7 @@ class SmartOmrUiHandler(BaseHTTPRequestHandler):
             marks_cell = "" if grouping_only else f"<td>{_marks_label(student, student)}</td>"
             rows.append(
                 "<tr>"
-                f"<td><a href=\"/runs/{html.escape(run_id)}/students/{urllib.parse.quote(roll)}\">{html.escape(roll)}</a></td>"
+                f'<td><a href="{html.escape(student_view.student_url(run_id, roll, "unchecked"))}">{html.escape(roll)}</a></td>'
                 f"{marks_cell}"
                 f"<td>{_badge(status)}</td>"
                 f"<td>{html.escape(missing)}</td>"
@@ -3659,11 +3679,16 @@ class SmartOmrUiHandler(BaseHTTPRequestHandler):
         review_column_count = 6 if grouping_only else 7
         review_rows_html = "".join(rows) or f'<tr><td colspan="{review_column_count}" class="empty">No student review cases</td></tr>'
         review_title = "Sheet Matching Review" if grouping_only else "Review Cases"
+        first_roll = student_view.next_student(index, "", "unchecked", "") or student_view.next_student(index, "", "all", "")
+        student_review_link = (
+            f'<a class="button" href="{html.escape(student_view.student_url(run_id, first_roll, "unchecked"))}">Review Student Sheets</a>'
+            if first_roll else ""
+        )
         body = f"""
         <h1>{review_title}</h1>
         {_review_metrics(_review_summary(index))}
         <div class="actions band"><a class="button secondary" href="/runs/{html.escape(run_id)}">Back to Exam</a>
-        <a class="button secondary" href="/runs/{html.escape(run_id)}/pages">Inspect Source Pages</a></div>
+        <a class="button secondary" href="/runs/{html.escape(run_id)}/pages">Inspect Source Pages</a>{student_review_link}</div>
         {grouping_order_notice}
         <datalist id="student-rolls">{roll_options}</datalist>
         {suggestion_html}
