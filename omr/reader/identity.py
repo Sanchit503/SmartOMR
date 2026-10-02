@@ -6,7 +6,7 @@ ambiguous.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import numpy as np
 from PIL import Image, ImageOps
@@ -18,6 +18,16 @@ from omr.grading.mcq import (
     DEFAULT_FILL_THRESHOLD,
     DEFAULT_INK_FLOOR,
     DEFAULT_MIN_MARGIN,
+)
+from omr.identity_evidence import (
+    BLOCK,
+    BUBBLE_ROLL_UNREADABLE,
+    FAINT_BUBBLE,
+    PROGRAM_INFERRED_FROM_GRID,
+    PROGRAM_SELECTOR_AMBIGUOUS,
+    PROGRAM_SELECTOR_BLANK,
+    WARN,
+    evidence,
 )
 
 from omr.models import RollRead
@@ -127,6 +137,48 @@ def _roll_confidence(roll_no: str | None, flags: list[str]) -> str:
     if flags:
         return "medium"
     return "high"
+
+
+def _selector_state(ratios: dict[str, object]) -> str:
+    raw = ratios.get("program_selector")
+    if not isinstance(raw, dict):
+        return "unavailable"
+    signals = [value for value in raw.values() if isinstance(value, dict)]
+    filled = [signal for signal in signals if float(signal.get("fill") or 0.0) >= DEFAULT_FILL_THRESHOLD]
+    if len(filled) == 1:
+        return "clear"
+    if len(filled) > 1:
+        return "ambiguous"
+    marked = [
+        signal
+        for signal in signals
+        if float(signal.get("fill") or 0.0) >= DEFAULT_AMBIGUOUS_FLOOR
+        or float(signal.get("ink") or 0.0) >= DEFAULT_INK_FLOOR
+    ]
+    return "ambiguous" if marked else "blank"
+
+
+def _with_structured_evidence(read: RollRead) -> RollRead:
+    items: list[dict[str, object]] = []
+    selector_state = _selector_state(read.ratios)
+    if selector_state == "blank":
+        items.append(evidence(PROGRAM_SELECTOR_BLANK, WARN, selector_state=selector_state))
+        if read.roll_no and read.program:
+            items.append(
+                evidence(
+                    PROGRAM_INFERRED_FROM_GRID,
+                    WARN,
+                    program=read.program,
+                    roll_no=read.roll_no,
+                )
+            )
+    elif selector_state == "ambiguous":
+        items.append(evidence(PROGRAM_SELECTOR_AMBIGUOUS, WARN, selector_state=selector_state))
+    if read.roll_no is None:
+        items.append(evidence(BUBBLE_ROLL_UNREADABLE, BLOCK))
+    elif read.confidence == "medium":
+        items.append(evidence(FAINT_BUBBLE, WARN, roll_no=read.roll_no))
+    return replace(read, evidence_flags=items)
 
 
 def _cv2():
@@ -524,33 +576,33 @@ def read_roll_number(gray: np.ndarray, manifest: dict, dpi: float) -> RollRead:
     """Read roll bubbles, retrying a faint-pencil contrast variant when needed."""
     initial = _read_roll_number_once(gray, manifest, dpi)
     if initial.confidence != "low":
-        return initial
+        return _with_structured_evidence(initial)
 
     enhanced = _enhance_faint_pencil(gray)
     if np.array_equal(enhanced, np.asarray(gray, dtype=np.uint8)):
-        return initial
+        return _with_structured_evidence(initial)
     retry = _read_roll_number_once(enhanced, manifest, dpi)
     if not retry.roll_no or retry.confidence == "low":
-        return initial
+        return _with_structured_evidence(initial)
     if initial.roll_no and initial.roll_no != retry.roll_no:
         flags = list(initial.review_flags)
         flags.append(
             f"faint-pencil contrast retry read {retry.roll_no}, conflicting with the original roll {initial.roll_no}"
         )
-        return RollRead(
+        return _with_structured_evidence(RollRead(
             program=initial.program,
             roll_no=initial.roll_no,
             confidence="low",
             ratios=initial.ratios,
             review_flags=flags,
-        )
+        ))
 
     flags = list(retry.review_flags)
     flags.append("faint-pencil contrast normalization recovered this roll; review before release")
-    return RollRead(
+    return _with_structured_evidence(RollRead(
         program=retry.program,
         roll_no=retry.roll_no,
         confidence="medium",
         ratios=retry.ratios,
         review_flags=flags,
-    )
+    ))

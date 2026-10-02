@@ -301,6 +301,7 @@ Output is written under `data/parsed/<exam_id>/students/<roll_no>/`:
 
 ```text
 parse_index.json                         batch summary
+identity_resolution.json                non-mutating Path B/C shadow proposals and evidence
 review_report.csv                        spreadsheet-friendly review queue
 review_report.html                       local browser review report
 students/<roll_no>/student.json          full result for one student
@@ -340,6 +341,15 @@ The parser output remains unchanged. The verifier starts parser-ready students a
 `pending_verification`, flagged students as `needs_review` or `missing_pages`, and only explicit
 human approval changes a student to `verified`.
 
+When `identity_resolution.json` contains candidates, the UI Review page shows **Suggested Identity
+Matches** before the ordinary unmatched-page table. Each proposal includes both full pages,
+individual digit crops, per-cell probabilities, one-digit roster neighbours, and structured
+evidence codes. A reviewer can approve the proposed roll, assign the pages to a different known
+roster roll, or reject the proposal. These actions update only `verified_index.json`; they never
+rewrite `parse_index.json`, and an approved assignment remains in `needs_review` until the rebuilt
+student sheet is separately verified. Email eligibility therefore cannot be restored by accepting
+an identity suggestion alone.
+
 Useful commands:
 
 ```bash
@@ -367,6 +377,21 @@ python -m omr.workflows.review assign-page \
 ```
 
 Later email/grading automation must use `verified_index.json`, not raw `parse_index.json`.
+
+For blind validation of the identity policy, first fill the generated blind page labels, then run:
+
+```bash
+python -m omr.datasets.evaluate_identity_resolution \
+  --labels-csv data/benchmarks/<name>/page_labels_blind.csv \
+  --resolution data/parsed/<exam_id>/identity_resolution.json \
+  --output-dir data/benchmarks/<name>/identity_evaluation \
+  --split held_out
+```
+
+The report includes current grouping accuracy, Path B/C suggestion precision, false shadow
+auto-attachments, and correctly suggested pages that the parser left unmatched. Paths B and C
+remain review-only until an independent held-out benchmark has enough coverage and reports zero
+false shadow auto-attachments.
 
 ## Grade written answers manually
 

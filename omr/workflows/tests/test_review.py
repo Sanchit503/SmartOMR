@@ -9,10 +9,12 @@ from PIL import Image
 
 from omr.workflows.review import (
     assign_unmatched_page,
+    decide_identity_suggestion,
     initialize_verification_index,
     reject_student,
     verify_student,
 )
+from omr.workflows.identity_resolution import resolution_digest
 
 
 def _write_page(path: Path, shade: int) -> None:
@@ -120,6 +122,66 @@ def _write_parsed_batch(tmp_path: Path) -> Path:
     return parsed_dir
 
 
+def _write_identity_suggestion(parsed_dir: Path, *, blocked: bool = False) -> str:
+    candidate_id = "path-b-2024002-source-3"
+    resolution = {
+        "schema_version": 1,
+        "policy_version": "test-policy",
+        "mode": "shadow_only",
+        "candidates": [
+            {
+                "candidate_id": candidate_id,
+                "tier": "suggested",
+                "path": "B",
+                "reason_code": "ANCHOR_VIA_PAGE2",
+                "roll_no": "2024002",
+                "program": "BTECH",
+                "sheet_page": 2,
+                "page_one_source_index": 4,
+                "continuation_source_index": 3,
+                "source_indices": [4, 3],
+                "page_one": {
+                    "source_index": 4,
+                    "sheet_page": 1,
+                    "page_image_path": "students/2024002/pages/page_1.png",
+                    "bubble_roll": "2024002",
+                    "cell_roll": "2024002",
+                    "cell_min_probability": 0.96,
+                    "cell_probabilities": [],
+                    "cell_crop_paths": [],
+                },
+                "continuation": {
+                    "source_index": 3,
+                    "sheet_page": 2,
+                    "page_image_path": "unmatched_pages/source_0003/pages/page_2.png",
+                    "cell_roll": "2024002",
+                    "cell_min_probability": 0.94,
+                    "cell_probabilities": [],
+                    "cell_crop_paths": [],
+                    "selector_state": "clear",
+                },
+                "near_neighbours": [],
+                "evidence_flags": [],
+                "blocked": blocked,
+                "shadow_auto_eligible": not blocked,
+                "automatic_attachment_enabled": False,
+                "validation_gate": "disabled_pending_blind_labels",
+            }
+        ],
+    }
+    resolution["digest"] = resolution_digest(resolution)
+    (parsed_dir / "identity_resolution.json").write_text(json.dumps(resolution), encoding="utf-8")
+    parse_path = parsed_dir / "parse_index.json"
+    parse_index = json.loads(parse_path.read_text(encoding="utf-8"))
+    parse_index["identity_resolution_path"] = "identity_resolution.json"
+    parse_index["identity_resolution"] = {
+        "digest": resolution["digest"],
+        "suggested_candidates": 1,
+    }
+    parse_path.write_text(json.dumps(parse_index), encoding="utf-8")
+    return candidate_id
+
+
 def test_initialize_verification_index_writes_reports(tmp_path: Path):
     parsed_dir = _write_parsed_batch(tmp_path)
 
@@ -205,3 +267,149 @@ def test_assign_unmatched_page_then_verify_student(tmp_path: Path):
     assert verified["eligible_for_email"] is True
     with pymupdf.open(parsed_dir / verified["verified_sheet_pdf_path"]) as doc:
         assert len(doc) == 2
+
+
+def test_approve_identity_suggestion_rebuilds_review_bundle_without_changing_parse_index(tmp_path: Path):
+    parsed_dir = _write_parsed_batch(tmp_path)
+    candidate_id = _write_identity_suggestion(parsed_dir)
+    original_parse_index = (parsed_dir / "parse_index.json").read_bytes()
+    initialize_verification_index(parsed_dir, force=True)
+
+    index, _index_path = decide_identity_suggestion(
+        parsed_dir,
+        candidate_id,
+        action="approve",
+        reviewer="TA",
+        note="Compared both full pages and all seven digit cells.",
+    )
+
+    student = next(item for item in index["students"] if item["roll_no"] == "2024002")
+    unmatched = next(item for item in index["unmatched_pages"] if item["source_index"] == 3)
+    assert student["status"] == "needs_review"
+    assert student["eligible_for_email"] is False
+    assert student["pages_found"] == [1, 2]
+    assert student["source_indices"] == [3, 4]
+    assert student["verified_sheet_pdf_path"] is None
+    assert unmatched["status"] == "assigned"
+    assert unmatched["assigned_to_roll_no"] == "2024002"
+    assert index["identity_suggestion_decisions"][0]["suggestion_action"] == "approve"
+    assert (parsed_dir / "parse_index.json").read_bytes() == original_parse_index
+
+    index, _index_path = verify_student(
+        parsed_dir,
+        "2024002",
+        reviewer="TA",
+        note="Verified the rebuilt two-page sheet.",
+    )
+    verified = next(item for item in index["students"] if item["roll_no"] == "2024002")
+    assert verified["eligible_for_email"] is True
+    with pymupdf.open(parsed_dir / verified["verified_sheet_pdf_path"]) as doc:
+        assert len(doc) == 2
+
+
+def test_reject_identity_suggestion_records_audit_without_moving_pages(tmp_path: Path):
+    parsed_dir = _write_parsed_batch(tmp_path)
+    candidate_id = _write_identity_suggestion(parsed_dir, blocked=True)
+    initialize_verification_index(parsed_dir, force=True)
+
+    index, _index_path = decide_identity_suggestion(
+        parsed_dir,
+        candidate_id,
+        action="reject",
+        reviewer="TA",
+        note="The handwriting does not match the proposed roll.",
+    )
+
+    student = next(item for item in index["students"] if item["roll_no"] == "2024002")
+    unmatched = next(item for item in index["unmatched_pages"] if item["source_index"] == 3)
+    assert student["pages_found"] == [1]
+    assert student["manual_pages"] == []
+    assert unmatched["status"] == "needs_review"
+    assert index["identity_suggestion_decisions"][0]["candidate_was_blocked"] is True
+    assert index["identity_suggestion_decisions"][0]["suggestion_action"] == "reject"
+
+
+def test_identity_suggestion_cannot_be_decided_twice(tmp_path: Path):
+    parsed_dir = _write_parsed_batch(tmp_path)
+    candidate_id = _write_identity_suggestion(parsed_dir)
+    initialize_verification_index(parsed_dir, force=True)
+    decide_identity_suggestion(
+        parsed_dir,
+        candidate_id,
+        action="reject",
+        reviewer="TA",
+        note="Rejected once.",
+    )
+
+    try:
+        decide_identity_suggestion(
+            parsed_dir,
+            candidate_id,
+            action="approve",
+            reviewer="TA",
+            note="Attempted second decision.",
+        )
+    except ValueError as exc:
+        assert "already has a recorded decision" in str(exc)
+    else:
+        raise AssertionError("a second identity-suggestion decision must be rejected")
+
+
+def test_identity_suggestion_can_be_assigned_to_a_different_known_roster_roll(tmp_path: Path):
+    parsed_dir = _write_parsed_batch(tmp_path)
+    parse_path = parsed_dir / "parse_index.json"
+    parse_index = json.loads(parse_path.read_text(encoding="utf-8"))
+    parse_index["roster_reconciliation"] = {
+        "missing_students": [
+            {
+                "roll_no": "2024003",
+                "program": "BTECH",
+                "student_name": "Student 3",
+                "student_email": "2024003@example.edu",
+            }
+        ]
+    }
+    parse_path.write_text(json.dumps(parse_index), encoding="utf-8")
+    candidate_id = _write_identity_suggestion(parsed_dir)
+    initialize_verification_index(parsed_dir, force=True)
+
+    index, _index_path = decide_identity_suggestion(
+        parsed_dir,
+        candidate_id,
+        action="assign",
+        assigned_roll_no="2024003",
+        reviewer="TA",
+        note="Both full-page handwritten rolls read 2024003.",
+    )
+
+    target = next(item for item in index["students"] if item["roll_no"] == "2024003")
+    old_owner = next(item for item in index["students"] if item["roll_no"] == "2024002")
+    assert target["pages_found"] == [1, 2]
+    assert target["source_indices"] == [3, 4]
+    assert target["eligible_for_email"] is False
+    assert old_owner["pages_found"] == []
+    assert old_owner["missing_pages"] == [1, 2]
+    decision = index["identity_suggestion_decisions"][0]
+    assert decision["suggestion_action"] == "assign"
+    assert decision["proposed_roll_no"] == "2024002"
+    assert decision["resolved_roll_no"] == "2024003"
+
+
+def test_identity_suggestion_rejects_manual_assignment_outside_known_roster(tmp_path: Path):
+    parsed_dir = _write_parsed_batch(tmp_path)
+    candidate_id = _write_identity_suggestion(parsed_dir)
+    initialize_verification_index(parsed_dir, force=True)
+
+    try:
+        decide_identity_suggestion(
+            parsed_dir,
+            candidate_id,
+            action="assign",
+            assigned_roll_no="2024999",
+            reviewer="TA",
+            note="Attempting an unknown roll.",
+        )
+    except ValueError as exc:
+        assert "not present in the review roster" in str(exc)
+    else:
+        raise AssertionError("manual identity assignment must be limited to the known roster")

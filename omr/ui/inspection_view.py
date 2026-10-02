@@ -49,7 +49,21 @@ def inspection_body(state: dict) -> str:
             <label class="visually-hidden" for="page-search">Search source page</label>
             <div class="search-field">{_icon('search')}<input id="page-search" type="search" placeholder="Page number" autocomplete="off"></div>
             <label class="visually-hidden" for="page-filter">Page status</label>
-            <select id="page-filter"><option value="all">All pages</option><option value="aligned">Aligned</option><option value="needs_review">Needs inspection</option><option value="failed">Failed</option><option value="waiting">Waiting / processing</option></select>
+            <select id="page-filter">
+              <option value="all">All pages</option>
+              <optgroup label="Scan inspection">
+                <option value="aligned">Aligned</option>
+                <option value="needs_review">Needs inspection</option>
+                <option value="failed">Failed</option>
+                <option value="waiting">Waiting / processing</option>
+              </optgroup>
+              <optgroup label="Roll preview">
+                <option value="identity_review">Identity needs review</option>
+                <option value="identity_undetected">Roll not detected</option>
+                <option value="identity_detected">Identity detected</option>
+                <option value="identity_unavailable">Identity unavailable</option>
+              </optgroup>
+            </select>
           </div>
           <div id="page-list" class="source-list" aria-label="Page list"></div>
           <div id="no-pages" class="empty" hidden>No matching pages</div>
@@ -99,6 +113,16 @@ def inspection_body(state: dict) -> str:
           </dl>
           <h3>Observations</h3>
           <ul id="observations" class="observations"><li>Inspection pending</li></ul>
+          <h3>Roll preview</h3>
+          <dl class="evidence-list roll-preview">
+            <div><dt>Literal roll</dt><dd id="identity-roll">Not previewed</dd></div>
+            <div><dt>Program</dt><dd id="identity-program">-</dd></div>
+            <div><dt>Confidence</dt><dd id="identity-confidence">-</dd></div>
+            <div><dt>Roster match</dt><dd id="identity-roster">-</dd></div>
+            <div><dt>Read from</dt><dd id="identity-kind">-</dd></div>
+          </dl>
+          <div id="identity-cells" class="identity-cells" aria-label="Roll digit evidence"></div>
+          <ul id="identity-observations" class="observations identity-observations"><li>Run Preview Roll Detection to inspect identity evidence.</li></ul>
           <form id="page-index-form" class="page-index-form" method="post" hidden>
             <h3>Correct sheet page</h3>
             <p>Use this only after visually checking the page. Corner and orientation alignment will run again.</p>

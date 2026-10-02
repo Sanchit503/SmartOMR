@@ -1,112 +1,113 @@
-"""Build a non-mutating evidence-tier report from an identity preview."""
+"""Run the production identity resolver in non-mutating shadow mode."""
 from __future__ import annotations
 
 import argparse
 import json
-import math
-from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any
 
-
-def _read(page: dict[str, Any]) -> dict[str, Any]:
-    identity = page.get("identity") if isinstance(page.get("identity"), dict) else {}
-    value = identity.get("write_in_roll_read")
-    return value if isinstance(value, dict) else identity
+from omr.io.csv import load_students
+from omr.workflows.identity_resolution import resolve_identity_proposals, resolution_digest
 
 
-def _cell_metrics(read: dict[str, Any]) -> tuple[str | None, float, float]:
-    program = str(read.get("program") or "").upper()
-    results = read.get("ocr_results") if isinstance(read.get("ocr_results"), dict) else {}
-    payload = results.get(program) if program else None
-    cells = payload.get("cells") if isinstance(payload, dict) else None
-    if not isinstance(cells, dict):
-        return None, 0.0, 0.0
-    roll = str(cells.get("text") or "") or None
-    try:
-        minimum = float(cells.get("confidence") or 0.0)
-    except (TypeError, ValueError):
-        minimum = 0.0
-    entries = cells.get("raw", {}).get("cells", []) if isinstance(cells.get("raw"), dict) else []
-    values = []
-    for entry in entries:
-        try:
-            values.append(float(entry["raw"]["top_probability"]))
-        except (KeyError, TypeError, ValueError):
-            pass
-    geometric_mean = math.exp(sum(math.log(max(value, 1e-6)) for value in values) / len(values)) if values else minimum
-    return roll, minimum, geometric_mean
+def _read(path: Path | None) -> dict[str, Any]:
+    if path is None or not path.is_file():
+        return {}
+    return json.loads(path.read_text(encoding="utf-8"))
 
 
-def _blank_selector(read: dict[str, Any]) -> bool:
-    flags = read.get("review_flags") if isinstance(read.get("review_flags"), list) else []
-    return any("continuation program selector is blank" in str(flag).lower() for flag in flags)
+def _resolve_optional_path(value: object, base: Path) -> Path | None:
+    if not value:
+        return None
+    path = Path(str(value))
+    if path.is_absolute():
+        return path
+    for candidate in (base / path, Path.cwd() / path):
+        if candidate.exists():
+            return candidate
+    return base / path
 
 
-def build(preview_path: Path, output_path: Path) -> dict[str, int]:
-    preview = json.loads(preview_path.read_text(encoding="utf-8"))
-    pages = [page for page in preview.get("pages", []) if isinstance(page, dict)]
-    anchors: dict[str, list[dict[str, Any]]] = defaultdict(list)
-    for page in pages:
-        if page.get("sheet_page") != 1:
+def _current_assignments(parse_index: dict[str, Any]) -> dict[int, str]:
+    assignments: dict[int, str] = {}
+    for student in parse_index.get("students", []):
+        roll_no = str(student.get("roll_no") or "")
+        for page in student.get("pages", []):
+            source_index = page.get("source_index")
+            if roll_no and source_index is not None:
+                assignments[int(source_index)] = roll_no
+    return assignments
+
+
+def build(
+    preview_path: Path,
+    output_path: Path,
+    *,
+    students_path: Path | None = None,
+    parse_index_path: Path | None = None,
+) -> dict[str, int]:
+    preview_path = preview_path.resolve()
+    run_dir = preview_path.parent.parent
+    state = _read(run_dir / "run_state.json")
+    inputs = state.get("inputs") if isinstance(state.get("inputs"), dict) else {}
+    students_path = students_path or _resolve_optional_path(inputs.get("students_path"), run_dir)
+    parse_index_path = parse_index_path or _resolve_optional_path(state.get("parse_index_path"), run_dir)
+
+    students = load_students(students_path) if students_path and students_path.is_file() else None
+    parse_index = _read(parse_index_path)
+    assignments = _current_assignments(parse_index)
+    inspection = _read(run_dir / "inspection" / "index.json")
+    aligned_paths = {
+        int(page.get("source_index") or 0): str(page.get("aligned") or "")
+        for page in inspection.get("pages", [])
+        if isinstance(page, dict)
+    }
+
+    preview = _read(preview_path)
+    pages = []
+    for row in preview.get("pages", []):
+        if not isinstance(row, dict) or not row.get("sheet_page"):
             continue
-        identity = page.get("identity") if isinstance(page.get("identity"), dict) else {}
-        bubble_roll = str(page.get("literal_roll_no") or "")
-        read = _read(page)
-        cell_roll, minimum, geometric_mean = _cell_metrics(read)
-        if bubble_roll and cell_roll == bubble_roll and minimum >= 0.30 and geometric_mean >= 0.55:
-            anchors[bubble_roll].append(page)
+        copied = dict(row)
+        source_index = int(copied.get("source_index") or 0)
+        copied["page_image_path"] = aligned_paths.get(source_index, "")
+        copied["current_roll"] = assignments.get(source_index)
+        pages.append(copied)
 
-    unique_anchors = {roll: claims[0] for roll, claims in anchors.items() if len(claims) == 1}
-    rows: list[dict[str, Any]] = []
-    counts: Counter[str] = Counter()
-    claimed_slots: Counter[str] = Counter()
-    for page in pages:
-        source = int(page.get("source_index") or 0)
-        page_number = int(page.get("sheet_page") or 0)
-        read = _read(page)
-        program = str(read.get("program") or page.get("program") or "").upper()
-        cell_roll, minimum, geometric_mean = _cell_metrics(read)
-        tier = "unmatched"
-        reason = "NO_VALID_CELL_ROLL"
-        anchor_source = None
-        if page_number == 1:
-            claims = anchors.get(str(page.get("literal_roll_no") or ""), [])
-            if len(claims) == 1 and claims[0] is page:
-                tier, reason = "auto_attached", "PATH_A_BUBBLE_PLUS_CELLS"
-            elif cell_roll:
-                tier, reason = "suggested", "PAGE1_CONTRADICTORY_OR_SINGLE_SOURCE"
-        elif cell_roll and minimum >= 0.30:
-            anchor = unique_anchors.get(cell_roll)
-            btech_blank = _blank_selector(read) and program == "BTECH"
-            program_ok = anchor is not None and (
-                str(anchor.get("program") or "").upper() == program or btech_blank
-            )
-            if program_ok:
-                claimed_slots[cell_roll] += 1
-                tier, reason, anchor_source = "auto_attached", "PAGE2_EXACT_VERIFIED_ANCHOR", anchor.get("source_index")
-            else:
-                tier, reason = "suggested", "PAGE2_LITERAL_WITHOUT_VERIFIED_ANCHOR"
-        counts[tier] += 1
-        rows.append({"source_index": source, "sheet_page": page_number, "tier": tier, "reason": reason, "literal_cell_roll": cell_roll or "", "program": program, "cell_min_probability": round(minimum, 6), "cell_geometric_mean": round(geometric_mean, 6), "anchor_source_index": anchor_source or ""})
-
-    for row in rows:
-        if row["tier"] == "auto_attached" and row["sheet_page"] > 1 and claimed_slots[row["literal_cell_roll"]] > 1:
-            counts["auto_attached"] -= 1
-            counts["suggested"] += 1
-            row["tier"] = "suggested"
-            row["reason"] = "DUPLICATE_PAGE_SLOT"
+    payload = resolve_identity_proposals(
+        pages,
+        valid_rolls=set(students) if students else None,
+        program_by_roll={roll: student.program for roll, student in (students or {}).items()},
+        current_assignments=assignments,
+    )
+    payload["source_preview_path"] = str(preview_path)
+    payload["source_parse_index_path"] = str(parse_index_path) if parse_index_path else None
+    payload["roster_path"] = str(students_path) if students_path else None
+    payload["digest"] = resolution_digest(payload)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_text(json.dumps({"counts": dict(counts), "pages": rows}, indent=2), encoding="utf-8")
-    return dict(counts)
+    output_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    return dict(payload["counts"])
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--preview", type=Path, required=True)
     parser.add_argument("--out", type=Path, required=True)
+    parser.add_argument("--students", type=Path)
+    parser.add_argument("--parse-index", type=Path)
     args = parser.parse_args()
-    print(json.dumps(build(args.preview, args.out), indent=2, sort_keys=True))
+    print(
+        json.dumps(
+            build(
+                args.preview,
+                args.out,
+                students_path=args.students,
+                parse_index_path=args.parse_index,
+            ),
+            indent=2,
+            sort_keys=True,
+        )
+    )
 
 
 if __name__ == "__main__":

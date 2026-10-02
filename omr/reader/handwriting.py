@@ -12,7 +12,7 @@ import re
 import json
 import hashlib
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Protocol
 
@@ -22,6 +22,19 @@ from PIL import Image, ImageOps
 from omr.contracts.geometry import mm_to_px, px_per_mm
 from omr.grading.bubbles import ink_density, student_mark_fill_ratio
 from omr.grading.mcq import DEFAULT_AMBIGUOUS_FLOOR, DEFAULT_FILL_THRESHOLD, DEFAULT_INK_FLOOR
+from omr.identity_evidence import (
+    BLOCK,
+    CELL_ROLL_UNREADABLE,
+    EMPTY_FIELD,
+    INFO,
+    LOW_CELL_CONFIDENCE,
+    PROGRAM_SELECTOR_AMBIGUOUS,
+    PROGRAM_SELECTOR_BLANK,
+    ROLL_NOT_IN_ROSTER,
+    STRIP_DISAGREES,
+    WARN,
+    evidence,
+)
 from omr.models import HandwrittenRollRead
 from omr.reader.enhancement import enhance_faint_ink
 
@@ -673,7 +686,14 @@ def read_continuation_roll_number(
     )
     if selector_signals:
         read.ocr_results.setdefault("_program_selector", {"signals": selector_signals})
-    return read
+    return replace(
+        read,
+        evidence_flags=_structured_handwritten_evidence(
+            read,
+            selector_signals=selector_signals,
+            valid_rolls=valid_rolls,
+        ),
+    )
 
 
 def read_write_in_roll_number(
@@ -688,7 +708,7 @@ def read_write_in_roll_number(
     valid_rolls: set[str] | None = None,
 ) -> HandwrittenRollRead:
     """Read a manifest-declared write-in roll field on any page."""
-    return _read_write_in_roll_number(
+    read = _read_write_in_roll_number(
         _gray_array(image),
         manifest,
         dpi,
@@ -699,6 +719,10 @@ def read_write_in_roll_number(
         ocr_backend=ocr_backend,
         padding_mm=padding_mm,
         valid_rolls=valid_rolls,
+    )
+    return replace(
+        read,
+        evidence_flags=_structured_handwritten_evidence(read, valid_rolls=valid_rolls),
     )
 
 
@@ -862,6 +886,82 @@ def _read_write_in_roll_number(
         ocr_results=ocr_results,
         review_flags=review_flags,
     )
+
+
+def _selector_state_from_signals(signals: dict[str, dict[str, float]] | None) -> str:
+    values = list((signals or {}).values())
+    if not values:
+        return "unavailable"
+    filled = [signal for signal in values if float(signal.get("fill") or 0.0) >= DEFAULT_FILL_THRESHOLD]
+    if len(filled) == 1:
+        return "clear"
+    if len(filled) > 1:
+        return "ambiguous"
+    marked = [
+        signal
+        for signal in values
+        if float(signal.get("fill") or 0.0) >= DEFAULT_AMBIGUOUS_FLOOR
+        or float(signal.get("ink") or 0.0) >= DEFAULT_INK_FLOOR
+    ]
+    return "ambiguous" if marked else "blank"
+
+
+def _structured_handwritten_evidence(
+    read: HandwrittenRollRead,
+    *,
+    selector_signals: dict[str, dict[str, float]] | None = None,
+    valid_rolls: set[str] | None = None,
+) -> list[dict[str, object]]:
+    items: list[dict[str, object]] = []
+    for program, payload in read.ocr_results.items():
+        if str(program).startswith("_") or not isinstance(payload, dict):
+            continue
+        cells = payload.get("cells")
+        strip = payload.get("strip")
+        cells = cells if isinstance(cells, dict) else {}
+        strip = strip if isinstance(strip, dict) else {}
+        cell_raw = cells.get("raw") if isinstance(cells.get("raw"), dict) else {}
+        cell_roll = normalize_handwritten_roll_text(str(cells.get("text") or ""), program=program)
+        strip_roll = normalize_handwritten_roll_text(str(strip.get("text") or ""), program=program)
+        if bool(cell_raw.get("empty_field")):
+            items.append(evidence(EMPTY_FIELD, BLOCK, program=program))
+        if cell_roll and strip_roll and cell_roll != strip_roll:
+            items.append(
+                evidence(
+                    STRIP_DISAGREES,
+                    INFO,
+                    program=program,
+                    cell_roll=cell_roll,
+                    strip_roll=strip_roll,
+                )
+            )
+        try:
+            cell_confidence = float(cells.get("confidence") or 0.0)
+        except (TypeError, ValueError):
+            cell_confidence = 0.0
+        if cell_roll and cell_confidence < 0.80:
+            items.append(
+                evidence(
+                    LOW_CELL_CONFIDENCE,
+                    WARN,
+                    program=program,
+                    roll_no=cell_roll,
+                    confidence=round(cell_confidence, 6),
+                    threshold=0.80,
+                )
+            )
+        if not cell_roll and not bool(cell_raw.get("empty_field")):
+            items.append(evidence(CELL_ROLL_UNREADABLE, BLOCK, program=program))
+
+    selector_state = _selector_state_from_signals(selector_signals)
+    if selector_state == "blank":
+        severity = WARN if read.program == "BTECH" else BLOCK
+        items.append(evidence(PROGRAM_SELECTOR_BLANK, severity, program=read.program or ""))
+    elif selector_state == "ambiguous":
+        items.append(evidence(PROGRAM_SELECTOR_AMBIGUOUS, BLOCK, program=read.program or ""))
+    if read.roll_no and valid_rolls is not None and read.roll_no not in valid_rolls:
+        items.append(evidence(ROLL_NOT_IN_ROSTER, BLOCK, roll_no=read.roll_no))
+    return items
 
 
 def _roster_suggestion_from_cell_probabilities(

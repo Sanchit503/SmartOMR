@@ -93,6 +93,12 @@ main:has(#inspection) { max-width: none; padding: 0; }
 .page-index-form label { color: #59645f; font-size: 11px; }
 #inspection #manual-page-index { width: 58px; padding: 5px; text-align: center; }
 #inspection .page-index-form button { min-height: 36px; padding: 6px 10px; }
+.identity-cells { display: grid; grid-template-columns: repeat(auto-fit, minmax(54px, 1fr)); gap: 6px; margin: 8px 0 12px; }
+.identity-cell { margin: 0; min-width: 0; border: 1px solid #e0e5e2; background: #f7f9f8; padding: 5px; text-align: center; }
+.identity-cell img { display: block; width: 100%; aspect-ratio: 1 / 1; object-fit: contain; background: #fff; margin-bottom: 4px; }
+.identity-cell strong, .identity-cell small { display: block; overflow-wrap: anywhere; }
+.identity-cell small { color: #66706b; font-size: 10px; margin-top: 2px; }
+.identity-observations { margin-bottom: 14px; }
 .source-metadata { margin-top: 26px; border-top: 1px solid #e5eae6; }
 .source-metadata details { font-size: 11px; color: #7a837d; }
 .source-metadata summary { cursor: pointer; }

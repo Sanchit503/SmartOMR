@@ -22,7 +22,7 @@ from omr.reader.quality import AlignmentQualityReport
 from omr.ui import app, inspection
 from omr.ui.app import RunStore, UiConfig, UploadedFile
 from omr.workflows.review import assign_unmatched_page, initialize_verification_index, verify_student
-from omr.workflows.tests.test_review import _write_parsed_batch
+from omr.workflows.tests.test_review import _write_identity_suggestion, _write_parsed_batch
 
 
 @pytest.fixture
@@ -250,6 +250,7 @@ def test_http_inventory_assets_and_error_routes(tmp_path, generated, monkeypatch
         base = f"{url}/runs/{state['run_id']}"
         body, _ = get(base + "/pages")
         assert b"Detected sheet page" in body and b"Run OCR &amp; Grouping" in body
+        assert b"Identity needs review" in body and b"Roll preview" in body
         payload, headers = get(base + "/inspection.json")
         index = json.loads(payload)
         assert index["total"] == 2 and index["can_identity_preview"]
@@ -257,6 +258,15 @@ def test_http_inventory_assets_and_error_routes(tmp_path, generated, monkeypatch
         assert headers["Cache-Control"] == "no-store"
         image, _ = get(base + "/pages/1/original")
         assert Image.open(io.BytesIO(image)).size == (8, 12)
+        identity_crop = store.run_dir(state["run_id"]) / "identity_preview" / "source_0001" / "cell.png"
+        identity_crop.parent.mkdir(parents=True, exist_ok=True)
+        Image.new("L", (9, 9), 255).save(identity_crop)
+        crop_url = base + "/identity-asset?path=" + urllib.parse.quote(
+            "identity_preview/source_0001/cell.png"
+        )
+        crop, headers = get(crop_url)
+        assert Image.open(io.BytesIO(crop)).size == (9, 9)
+        assert headers["Content-Type"] == "image/png"
         report, headers = get(base + "/pages/1/report")
         assert json.loads(report)["score"] == .98
         assert headers["Content-Type"] == "application/json"
@@ -342,6 +352,31 @@ def test_student_view_uses_current_manual_selection_and_verified_pdf(tmp_path):
         assert b"Regrading required" in body
 
 
+def test_review_page_shows_identity_evidence_and_records_rejection(tmp_path):
+    parsed_dir = _write_parsed_batch(tmp_path)
+    candidate_id = _write_identity_suggestion(parsed_dir)
+    initialize_verification_index(parsed_dir, force=True)
+    store = RunStore(UiConfig(tmp_path))
+    app._write_json(store.state_path("suggestion-test"), {
+        "run_id": "suggestion-test", "exam_id": "EXAM_REVIEW", "status": "completed",
+        "parse_dir": str(parsed_dir), "parse_index_path": str(parsed_dir / "parse_index.json"),
+    })
+
+    with server(store) as url:
+        review_url = url + "/runs/suggestion-test/review"
+        body, _ = get(review_url)
+        assert b"Suggested Identity Matches" in body
+        assert b"2024002" in body
+        assert b"Path B" in body
+        assert b"Approve 2024002" in body
+        body, _ = post(
+            url + f"/runs/suggestion-test/suggestions/{candidate_id}/reject",
+            {"note": "The second-page handwriting belongs to another student."},
+        )
+        assert b"Decision: reject" in body
+        assert b"The second-page handwriting belongs to another student." in body
+
+
 @pytest.mark.parametrize("parser,verified,expected", [
     ("ready", None, "PENDING_VERIFICATION"),
     ("ready", "pending_verification", "PENDING_VERIFICATION"),
@@ -368,6 +403,10 @@ def test_evaluation_is_explicit_and_does_not_reset_completed_run(tmp_path, gener
         store.start_run(state["run_id"], evaluate=True)
     fake_pipeline(monkeypatch)
     store._run_inspection(state["run_id"])
+    preview_path = store.run_dir(state["run_id"]) / "identity_preview" / "index.json"
+    preview_path.parent.mkdir(parents=True, exist_ok=True)
+    preview_path.write_text(json.dumps({"status": "completed", "pages": []}), encoding="utf-8")
+    store.write_state(state["run_id"], identity_preview_path=str(preview_path))
     calls = []
     monkeypatch.setattr(store, "_run_batch", lambda run_id: calls.append(run_id))
     store.start_run(state["run_id"], evaluate=True)

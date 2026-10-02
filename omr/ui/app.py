@@ -59,9 +59,11 @@ from omr.workflows.batch import (
 )
 from omr.workflows.review import (
     assign_unmatched_page,
+    decide_identity_suggestion,
     hold_student,
     ignore_unmatched_page,
     initialize_verification_index,
+    load_identity_resolution,
     load_or_initialize_verified_index,
     reject_student,
     selected_student_pages,
@@ -432,6 +434,8 @@ def _html_page(title: str, body: str, *, refresh_seconds: int | None = None) -> 
     button:hover, .button:hover {{ background: var(--primary-dark); border-color: var(--primary-dark); text-decoration: none; }}
     .button.secondary, button.secondary {{ background: #fff; color: var(--primary); }}
     .button.secondary:hover, button.secondary:hover {{ background: #eef5ff; border-color: var(--primary); }}
+    button.danger {{ background: #fff; color: var(--danger); border-color: #f0aaa5; }}
+    button.danger:hover {{ background: #fff1f0; color: #8f1c13; border-color: var(--danger); }}
     .actions {{ display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }}
     .toolbar {{ justify-content: space-between; }}
     .badge {{ display: inline-block; border-radius: 999px; padding: 2px 8px; font-size: 12px; font-weight: 700; }}
@@ -458,7 +462,29 @@ def _html_page(title: str, body: str, *, refresh_seconds: int | None = None) -> 
     .empty {{ color: var(--muted); text-align: center; padding: 20px; }}
     .section-title {{ display: flex; justify-content: space-between; gap: 12px; align-items: center; margin: 20px 0 10px; }}
     .section-title h2 {{ margin: 0; }}
+    .suggestion {{ background: var(--panel); border: 1px solid var(--border); border-radius: 6px; padding: 16px; margin-bottom: 16px; }}
+    .suggestion h3, .suggestion h4 {{ margin: 0 0 10px; }}
+    .suggestion h4 {{ font-size: 13px; margin-top: 16px; }}
+    .suggestion-heading {{ display: flex; justify-content: space-between; gap: 16px; align-items: start; }}
+    .suggestion-heading p {{ margin: 4px 0 0; }}
+    .suggestion-pages {{ display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; margin-top: 14px; }}
+    .suggestion-page {{ min-width: 0; border-top: 1px solid var(--soft-border); padding-top: 12px; }}
+    .suggestion-sheet {{ max-height: 680px; object-fit: contain; border: 1px solid var(--soft-border); }}
+    .evidence-summary {{ min-height: 38px; overflow-wrap: anywhere; }}
+    .digit-strip {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(76px, 1fr)); gap: 8px; }}
+    .digit-cell {{ min-width: 0; padding: 6px; text-align: center; }}
+    .digit-cell img {{ width: 100%; aspect-ratio: 1 / 1; object-fit: contain; display: block; background: #fff; }}
+    .digit-cell span {{ display: block; margin-top: 5px; font-size: 12px; font-weight: 700; }}
+    .digit-cell small {{ display: block; margin-top: 3px; color: var(--muted); overflow-wrap: anywhere; }}
+    .digit-missing {{ display: grid !important; place-items: center; aspect-ratio: 1 / 1; background: #f8fafc; color: var(--muted); font-weight: 400 !important; }}
+    .source-evidence {{ margin: 10px 0 0; padding-left: 18px; }}
+    .source-evidence li {{ margin: 5px 0; }}
+    .suggestion-actions {{ display: grid; grid-template-columns: repeat(3, minmax(220px, 1fr)); gap: 12px; margin-top: 16px; }}
+    .suggestion-actions form {{ border-top: 1px solid var(--soft-border); padding-top: 12px; }}
+    .suggestion-actions input {{ margin-bottom: 8px; }}
+    .decision-record {{ display: flex; flex-wrap: wrap; gap: 12px; margin-top: 16px; padding: 12px; border: 1px solid var(--soft-border); background: #f8fafc; }}
     @media (max-width: 1040px) {{ .student-layout, .split {{ grid-template-columns: 1fr; }} }}
+    @media (max-width: 820px) {{ .suggestion-pages, .suggestion-actions {{ grid-template-columns: 1fr; }} .suggestion-heading {{ flex-direction: column; }} }}
   </style>
 </head>
 <body>
@@ -545,6 +571,226 @@ def _fmt_num(value: float | int | None) -> str:
         return ""
     value = float(value)
     return str(int(value)) if value.is_integer() else f"{value:.2f}".rstrip("0").rstrip(".")
+
+
+def _identity_roll_digits(roll_no: str, program: str) -> str:
+    if program == "PHD" and roll_no.startswith("PHD"):
+        return roll_no[3:]
+    if program == "MTECH" and roll_no.startswith("MT"):
+        return roll_no[2:]
+    return roll_no
+
+
+def _identity_probability(value: object) -> str:
+    try:
+        return f"{float(value) * 100:.1f}%"
+    except (TypeError, ValueError):
+        return "unavailable"
+
+
+def _render_identity_cells(page: dict[str, Any], roll_no: str, program: str, parse_dir: Path) -> str:
+    crop_paths = list(page.get("cell_crop_paths") or [])
+    probabilities = list(page.get("cell_probabilities") or [])
+    digits = _identity_roll_digits(roll_no, program)
+    count = max(len(crop_paths), len(probabilities), len(digits))
+    if not count:
+        return '<p class="muted">No individual digit artifacts were recorded.</p>'
+    cells = []
+    for position in range(count):
+        digit = digits[position] if position < len(digits) else "?"
+        row = probabilities[position] if position < len(probabilities) else {}
+        selected_probability = row.get(digit) if isinstance(row, dict) else None
+        ranked = sorted(
+            (
+                (str(label), float(probability))
+                for label, probability in row.items()
+                if isinstance(probability, (int, float))
+            ),
+            key=lambda item: item[1],
+            reverse=True,
+        )[:2] if isinstance(row, dict) else []
+        ranked_text = ", ".join(
+            f"{label} {_identity_probability(probability)}"
+            for label, probability in ranked
+        )
+        crop = crop_paths[position] if position < len(crop_paths) else None
+        crop_html = (
+            f'<a href="{_asset_url(crop, parse_dir)}"><img src="{_asset_url(crop, parse_dir)}" '
+            f'alt="Digit {position + 1} crop"></a>'
+            if crop
+            else '<span class="digit-missing">No crop</span>'
+        )
+        cells.append(
+            '<figure class="digit-cell">'
+            f'<figcaption>Digit {position + 1}: <strong>{html.escape(digit)}</strong></figcaption>'
+            f'{crop_html}'
+            f'<span>P({html.escape(digit)}) {html.escape(_identity_probability(selected_probability))}</span>'
+            f'<small>{html.escape(ranked_text or "No probability vector")}</small>'
+            '</figure>'
+        )
+    return f'<div class="digit-strip">{"".join(cells)}</div>'
+
+
+def _render_identity_page(
+    title: str,
+    page: dict[str, Any],
+    roll_no: str,
+    program: str,
+    parse_dir: Path,
+) -> str:
+    image_path = page.get("page_image_path")
+    image = (
+        f'<a href="{_asset_url(image_path, parse_dir)}"><img class="sheet suggestion-sheet" '
+        f'src="{_asset_url(image_path, parse_dir)}" alt="{html.escape(title)}"></a>'
+        if image_path
+        else '<p class="empty">No page image artifact</p>'
+    )
+    summary = (
+        f'Bubble: {html.escape(str(page.get("bubble_roll") or "not available"))} | '
+        f'Cells: {html.escape(str(page.get("cell_roll") or "unreadable"))} | '
+        f'Min cell confidence: {html.escape(_identity_probability(page.get("cell_min_probability")))} | '
+        f'Selector: {html.escape(str(page.get("selector_state") or "unavailable"))}'
+    )
+    source_flags = "".join(
+        '<li>'
+        f'{_badge(str(flag.get("severity") or "info"))} '
+        f'<span class="mono">{html.escape(str(flag.get("code") or ""))}</span>: '
+        f'{html.escape(str(flag.get("message") or ""))}'
+        '</li>'
+        for flag in page.get("evidence_flags", [])
+        if isinstance(flag, dict)
+    )
+    return f"""
+    <section class="suggestion-page">
+      <h3>{html.escape(title)}</h3>
+      <p class="mono evidence-summary">{summary}</p>
+      {image}
+      <h4>Digit Evidence</h4>
+      {_render_identity_cells(page, roll_no, program, parse_dir)}
+      <ul class="source-evidence">{source_flags or '<li class="muted">No source-level evidence flags</li>'}</ul>
+    </section>
+    """
+
+
+def _render_identity_suggestions(
+    run_id: str,
+    parse_dir: Path,
+    index: dict[str, Any],
+    resolution: dict[str, Any],
+) -> str:
+    candidates = list(resolution.get("candidates") or [])
+    if not candidates:
+        return """
+        <div class="section-title"><h2>Suggested Identity Matches</h2></div>
+        <section class="band"><p class="empty">No identity suggestions were generated.</p></section>
+        """
+    decisions = {
+        str(decision.get("candidate_id") or ""): decision
+        for decision in index.get("identity_suggestion_decisions", [])
+    }
+    articles = []
+    for candidate in candidates:
+        candidate_id = str(candidate.get("candidate_id") or "")
+        roll_no = str(candidate.get("roll_no") or "")
+        program = str(candidate.get("program") or "")
+        decision = decisions.get(candidate_id)
+        blocked = bool(candidate.get("blocked"))
+        state_badge = _badge("blocked" if blocked else "suggested")
+        auto_badge = _badge("shadow eligible" if candidate.get("shadow_auto_eligible") else "human decision")
+        evidence_rows = []
+        for flag in candidate.get("evidence_flags", []):
+            metadata = flag.get("metadata") if isinstance(flag, dict) else None
+            metadata_text = json.dumps(metadata, sort_keys=True) if metadata else ""
+            evidence_rows.append(
+                "<tr>"
+                f"<td>{_badge(str(flag.get('severity') or 'info'))}</td>"
+                f"<td class=\"mono\">{html.escape(str(flag.get('code') or ''))}</td>"
+                f"<td>{html.escape(str(flag.get('message') or ''))}</td>"
+                f"<td class=\"mono flags\">{html.escape(metadata_text)}</td>"
+                "</tr>"
+            )
+        neighbour_rows = []
+        for neighbour in candidate.get("near_neighbours", []):
+            neighbour_rows.append(
+                "<tr>"
+                f"<td>{html.escape(str(neighbour.get('roll_no') or ''))}</td>"
+                f"<td>{html.escape(str(neighbour.get('differing_position') or ''))}</td>"
+                f"<td>{html.escape(str(neighbour.get('selected_digit') or ''))} / {html.escape(str(neighbour.get('neighbour_digit') or ''))}</td>"
+                f"<td>{html.escape(_identity_probability(neighbour.get('minimum_selected_probability')))}</td>"
+                f"<td>{html.escape(_identity_probability(neighbour.get('minimum_pairwise_support')))}</td>"
+                f"<td>{html.escape('yes' if neighbour.get('open_slot') else 'no')}</td>"
+                "</tr>"
+            )
+        if decision:
+            actions = (
+                '<div class="decision-record">'
+                f'<strong>Decision: {html.escape(str(decision.get("suggestion_action") or "recorded"))}</strong>'
+                f'<span>Resolved roll: {html.escape(str(decision.get("resolved_roll_no") or "none"))}</span>'
+                f'<span>Reviewer: {html.escape(str(decision.get("reviewer") or ""))}</span>'
+                f'<span>Note: {html.escape(str(decision.get("note") or ""))}</span>'
+                '</div>'
+            )
+        else:
+            action_base = (
+                f'/runs/{html.escape(run_id)}/suggestions/'
+                f'{urllib.parse.quote(candidate_id)}/'
+            )
+            actions = f"""
+            <div class="suggestion-actions">
+              <form method="post" action="{action_base}approve">
+                <label>Approval note</label>
+                <input name="note" required placeholder="What you checked on both pages">
+                <button type="submit">Approve {html.escape(roll_no)}</button>
+              </form>
+              <form method="post" action="{action_base}assign">
+                <label>Correct roster roll</label>
+                <input name="roll_no" list="student-rolls" required placeholder="Roll number">
+                <label>Assignment note</label>
+                <input name="note" required placeholder="Why these pages belong to this roll">
+                <button class="secondary" type="submit">Assign Different Roll</button>
+              </form>
+              <form method="post" action="{action_base}reject">
+                <label>Rejection note</label>
+                <input name="note" required placeholder="Why this proposal is wrong">
+                <button class="danger" type="submit">Reject Proposal</button>
+              </form>
+            </div>
+            """
+        articles.append(
+            f"""
+            <article class="suggestion">
+              <div class="suggestion-heading">
+                <div>
+                  <h3>{html.escape(roll_no)} <span class="muted">{html.escape(program)}</span></h3>
+                  <p class="mono">Path {html.escape(str(candidate.get('path') or ''))} | page 1 source {html.escape(str(candidate.get('page_one_source_index') or ''))} | page {html.escape(str(candidate.get('sheet_page') or ''))} source {html.escape(str(candidate.get('continuation_source_index') or ''))}</p>
+                </div>
+                <div class="actions">{state_badge}{auto_badge}</div>
+              </div>
+              <div class="suggestion-pages">
+                {_render_identity_page('Page 1 anchor', dict(candidate.get('page_one') or {}), roll_no, program, parse_dir)}
+                {_render_identity_page(f"Continuation page {candidate.get('sheet_page') or ''}", dict(candidate.get('continuation') or {}), roll_no, program, parse_dir)}
+              </div>
+              <h4>Structured Evidence</h4>
+              <table><thead><tr><th>Severity</th><th>Code</th><th>Meaning</th><th>Measurements</th></tr></thead>
+              <tbody>{''.join(evidence_rows) or '<tr><td colspan="4" class="empty">No warning or blocking evidence</td></tr>'}</tbody></table>
+              <h4>One-Digit Roster Neighbours</h4>
+              <table><thead><tr><th>Roll</th><th>Position</th><th>Digits</th><th>Selected P</th><th>Pairwise Support</th><th>Open Slot</th></tr></thead>
+              <tbody>{''.join(neighbour_rows) or '<tr><td colspan="6" class="empty">No one-digit roster neighbour</td></tr>'}</tbody></table>
+              {actions}
+            </article>
+            """
+        )
+    counts = resolution.get("counts") or {}
+    summary = (
+        f'{len(candidates)} proposal(s); '
+        f'{int(counts.get("shadow_auto_eligible") or 0)} meet the shadow threshold; '
+        f'{int(counts.get("blocked_suggestions") or 0)} contain blocking evidence.'
+    )
+    return f"""
+    <div class="section-title"><h2>Suggested Identity Matches</h2></div>
+    <p class="muted">{html.escape(summary)}</p>
+    {''.join(articles)}
+    """
 
 
 def _load_roster_rows(path: Path | None) -> dict[str, dict[str, str]]:
@@ -1756,6 +2002,8 @@ class SmartOmrUiHandler(BaseHTTPRequestHandler):
                     self._send_html("Source Pages", inspection_body(state))
                 elif len(parts) == 3 and parts[2] == "inspection.json":
                     self._inspection_json(parts[1])
+                elif len(parts) == 3 and parts[2] == "identity-asset":
+                    self._identity_asset(parts[1], query)
                 elif len(parts) == 5 and parts[2] == "pages":
                     image_path = inspection.inspection_asset(
                         self.store.run_dir(parts[1]),
@@ -1820,6 +2068,12 @@ class SmartOmrUiHandler(BaseHTTPRequestHandler):
                     self._replace_student_page(parts[1], urllib.parse.unquote(parts[3]))
                 elif len(parts) == 5 and parts[2] == "unmatched" and parts[4] in {"assign", "ignore"}:
                     self._unmatched_decision(parts[1], int(parts[3]), parts[4])
+                elif len(parts) == 5 and parts[2] == "suggestions" and parts[4] in {"approve", "assign", "reject"}:
+                    self._identity_suggestion_decision(
+                        parts[1],
+                        urllib.parse.unquote(parts[3]),
+                        parts[4],
+                    )
                 elif len(parts) == 4 and parts[2] == "email" and parts[3] == "prepare":
                     self._prepare_email(parts[1])
                 elif len(parts) == 4 and parts[2] == "email" and parts[3] == "send":
@@ -1918,6 +2172,20 @@ class SmartOmrUiHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(payload)))
         self.end_headers()
         self.wfile.write(payload)
+
+    def _identity_asset(self, run_id: str, query: dict[str, list[str]]) -> None:
+        relative = str((query.get("path") or [""])[0]).strip()
+        if not relative:
+            self._not_found("Identity evidence image is not available")
+            return
+        run_dir = self.store.run_dir(run_id).resolve()
+        preview_root = (run_dir / "identity_preview").resolve()
+        path = (run_dir / relative).resolve()
+        if not path.is_relative_to(preview_root) or not path.is_file():
+            self._not_found("Identity evidence image is not available")
+            return
+        content_type = mimetypes.guess_type(str(path))[0] or "application/octet-stream"
+        self._send_file(path, content_type)
 
     def _assign_page_index(self, run_id: str, source_index: int) -> None:
         form = self._urlencoded_form()
@@ -2320,6 +2588,21 @@ class SmartOmrUiHandler(BaseHTTPRequestHandler):
                 reviewer="professor-ui",
                 reason=note or "Ignored as a stray/duplicate page from professor UI.",
             )
+        self._redirect(f"/runs/{run_id}/review")
+
+    def _identity_suggestion_decision(self, run_id: str, candidate_id: str, action: str) -> None:
+        state = self.store.read_state(run_id)
+        parse_dir = Path(str(state.get("parse_dir") or ""))
+        form = self._urlencoded_form()
+        note = (form.get("note") or "").strip()
+        decide_identity_suggestion(
+            parse_dir,
+            candidate_id,
+            action=action,
+            assigned_roll_no=(form.get("roll_no") or "").strip().upper() or None,
+            reviewer="professor-ui",
+            note=note,
+        )
         self._redirect(f"/runs/{run_id}/review")
 
     def _urlencoded_form(self) -> dict[str, str]:
@@ -2964,6 +3247,7 @@ class SmartOmrUiHandler(BaseHTTPRequestHandler):
         state = self.store.read_state(run_id)
         parse_dir = Path(str(state["parse_dir"]))
         index, _verified_path = load_or_initialize_verified_index(parse_dir)
+        identity_resolution = load_identity_resolution(parse_dir)
         rows = []
         for student in index.get("students", []):
             status = str(student.get("status") or "needs_review")
@@ -3042,14 +3326,31 @@ class SmartOmrUiHandler(BaseHTTPRequestHandler):
                 f"<td>{html.escape(str(student.get('program') or ''))}</td>"
                 "</tr>"
             )
-        roll_options = "".join(
-            f'<option value="{html.escape(str(student.get("roll_no") or ""))}">'
+        known_rolls = {
+            str(student.get("roll_no") or "")
             for student in index.get("students", [])
+            if student.get("roll_no")
+        }
+        known_rolls.update(
+            str(student.get("roll_no") or "")
+            for student in reconciliation.get("missing_students", [])
+            if student.get("roll_no")
+        )
+        roll_options = "".join(
+            f'<option value="{html.escape(roll)}">'
+            for roll in sorted(known_rolls)
+        )
+        suggestion_html = _render_identity_suggestions(
+            run_id,
+            parse_dir,
+            index,
+            identity_resolution,
         )
         body = f"""
         <h1>Review Cases</h1>
         <div class="actions band"><a class="button secondary" href="/runs/{html.escape(run_id)}">Back to Exam</a></div>
         <datalist id="student-rolls">{roll_options}</datalist>
+        {suggestion_html}
         <div class="section-title"><h2>Students Needing Review</h2></div>
         <table><thead><tr><th>Roll No</th><th>Marks</th><th>Status</th><th>Missing Pages</th><th>Flags</th><th>Parser Notes</th><th>Latest Decision</th></tr></thead>
         <tbody>{''.join(rows) or '<tr><td colspan="7" class="empty">No student review cases</td></tr>'}</tbody></table>

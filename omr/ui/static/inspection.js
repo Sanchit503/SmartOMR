@@ -9,6 +9,7 @@
   let view = "original";
   let zoom = 1;
   let currentImage = "";
+  let identityRows = new Map();
   const listItems = new Map();
   const viewer = byId("viewer");
   const pageImage = byId("page-image");
@@ -20,12 +21,92 @@
     element.textContent = value || "";
   }
   function score(value) { return Number.isFinite(value) ? value.toFixed(3) : "-"; }
+  function identityRow(sourceIndex) { return identityRows.get(Number(sourceIndex)) || null; }
+  function identityDetected(row) { return row && ["detected", "detected_with_caution"].includes(row.status); }
+  function identityMatchesFilter(row, filter) {
+    if (filter === "identity_review") return row?.status === "needs_review";
+    if (filter === "identity_undetected") return row && !row.literal_roll_no && row.status !== "unavailable";
+    if (filter === "identity_detected") return identityDetected(row);
+    if (filter === "identity_unavailable") return row?.status === "unavailable";
+    return null;
+  }
+
+  function selectedRead(row) {
+    const identity = row?.identity || {};
+    const read = identity.write_in_roll_read || identity;
+    const program = String(row?.program || read.program || "").toUpperCase();
+    const result = read.ocr_results?.[program] || {};
+    const cells = result.cells || {};
+    const entries = Array.isArray(cells.raw?.cells) ? cells.raw.cells : [];
+    const paths = Array.isArray(read.cell_crop_paths?.[program])
+      ? read.cell_crop_paths[program]
+      : Array.isArray(result.cell_crop_paths) ? result.cell_crop_paths : [];
+    return { entries, paths };
+  }
+
+  function identityAsset(path) {
+    return `${base}/identity-asset?path=${encodeURIComponent(path)}`;
+  }
+
+  function renderIdentity(row) {
+    const hasPreview = inventory.identity_preview?.status === "completed";
+    const state = !hasPreview ? "Not previewed" : row?.status === "detected_with_caution"
+      ? "Detected with observations" : row?.status ? names[row.status] || row.status.replaceAll("_", " ") : "Not available";
+    text("identity-state", state);
+    text("identity-roll", row?.literal_roll_no || (hasPreview ? "Not detected" : "Not previewed"));
+    text("identity-program", row?.program || "-");
+    text("identity-confidence", row?.confidence || "-");
+    text("identity-roster", row ? (row.roster_member ? "Yes" : row.literal_roll_no ? "No" : "-") : "-");
+    text("identity-kind", row?.identity_kind || "-");
+
+    const container = byId("identity-cells");
+    container.replaceChildren();
+    const read = selectedRead(row);
+    const rollDigits = String(row?.literal_roll_no || "").replace(/\D/g, "");
+    const count = Math.max(read.entries.length, read.paths.length);
+    for (let index = 0; index < count; index++) {
+      const entry = read.entries[index] || {};
+      const raw = entry.raw || {};
+      const digit = String(entry.text ?? rollDigits[index] ?? "?");
+      const probability = Number(raw.top_probability ?? entry.confidence);
+      const figure = document.createElement("figure");
+      figure.className = "identity-cell";
+      if (read.paths[index]) {
+        const img = document.createElement("img");
+        img.src = identityAsset(read.paths[index]);
+        img.alt = `Digit ${index + 1} crop`;
+        figure.append(img);
+      }
+      const label = document.createElement("strong");
+      label.textContent = `${index + 1}: ${digit}`;
+      figure.append(label);
+      const detail = document.createElement("small");
+      detail.textContent = Number.isFinite(probability) ? `P ${probability.toFixed(3)}` : "P -";
+      figure.append(detail);
+      container.append(figure);
+    }
+
+    const observations = [];
+    if (row?.reason) observations.push(row.reason);
+    for (const flag of row?.review_flags || []) observations.push(String(flag));
+    const identity = row?.identity || {};
+    const readPayload = identity.write_in_roll_read || identity;
+    for (const flag of [...(identity.evidence_flags || []), ...(readPayload.evidence_flags || [])]) {
+      if (!flag || typeof flag !== "object") continue;
+      observations.push(`${flag.code || "IDENTITY"}: ${flag.message || "Identity evidence requires review"}`);
+    }
+    if (!observations.length) observations.push(hasPreview ? "No identity review flags" : "Run Preview Roll Detection to inspect identity evidence.");
+    byId("identity-observations").replaceChildren(...observations.map((value) => {
+      const li = document.createElement("li"); li.textContent = value; return li;
+    }));
+  }
 
   function renderList() {
     const filter = byId("page-filter").value;
     const search = byId("page-search").value.trim();
     let visible = 0;
     for (const page of inventory.pages) {
+      const identity = identityRow(page.source_index);
       let button = listItems.get(page.source_index);
       if (!button) {
         button = document.createElement("button");
@@ -38,14 +119,16 @@
         listItems.set(page.source_index, button);
       }
       button.querySelector("strong").textContent = `Source ${String(page.source_index).padStart(3, "0")}`;
-      button.querySelector("small").textContent = page.page_index ? `Sheet page ${page.page_index}` : names[page.status];
+      const identityLabel = identity?.literal_roll_no || (identity?.status === "needs_review" ? "identity review" : "");
+      button.querySelector("small").textContent = `${page.page_index ? `Sheet page ${page.page_index}` : names[page.status]}${identityLabel ? ` | ${identityLabel}` : ""}`;
       button.querySelector("i").className = `status-dot ${page.status}`;
       button.setAttribute("aria-label", `Source page ${page.source_index}, ${names[page.status]}`);
       if (page.source_index === selected) button.setAttribute("aria-current", "page");
       else button.removeAttribute("aria-current");
+      const identityFilter = identityMatchesFilter(identity, filter);
       button.hidden = !(
-        (!search || String(page.source_index).includes(search)) &&
-        (filter === "all" || filter === page.status || (filter === "waiting" && ["pending", "processing"].includes(page.status)))
+        (!search || String(page.source_index).includes(search) || String(identity?.literal_roll_no || "").includes(search.toUpperCase())) &&
+        (filter === "all" || filter === page.status || (filter === "waiting" && ["pending", "processing"].includes(page.status)) || identityFilter === true)
       );
       if (!button.hidden) visible++;
     }
@@ -85,7 +168,7 @@
     text("alignment-score", score(page.alignment_confidence));
     text("page-code-score", score(page.page_mark_confidence));
     text("quality-score", score(quality.score));
-    text("identity-state", inventory.evaluated ? "See student review" : ["queued", "running"].includes(inventory.run_status) ? "Evaluation running" : "Not evaluated");
+    renderIdentity(identityRow(page.source_index));
     for (const key of ["geometry", "local", "image"]) {
       const status = quality.metrics?.[`${key}_quality`]?.status;
       text(`${key}-status`, status === "ready" ? "Pass" : status ? status.replaceAll("_", " ") : "Not measured");
@@ -167,11 +250,12 @@
       alertText("run-error", inventory.run_error || inventory.error);
       alertText("connection-error", "");
       const preview = inventory.identity_preview;
+      identityRows = new Map((preview?.pages || []).map((row) => [Number(row.source_index), row]));
       const previewSummary = byId("identity-preview-summary");
       if (preview?.status === "completed") {
         const counts = preview.counts || {};
         previewSummary.hidden = false;
-        previewSummary.textContent = `Roll preview: ${counts.detected || 0} literal rolls detected (${counts.detected_with_caution || 0} with quality observations), ${counts.needs_review || 0} identity reads need review, ${counts.undetected || 0} not detected. Review identity issues before starting evaluation.`;
+        previewSummary.textContent = `Roll preview: ${counts.detected || 0} literal rolls detected (${counts.detected_with_caution || 0} with quality observations); ${counts.needs_review || 0} identity reads need review, including ${counts.undetected || 0} with no literal roll; ${counts.unavailable || 0} unavailable. Use the Roll preview filters and select a source page to inspect its evidence before matching sheets.`;
       } else if (inventory.run_status === "identity_previewing") {
         previewSummary.hidden = false;
         previewSummary.textContent = inventory.stage || "Reading rolls from inspected pages";

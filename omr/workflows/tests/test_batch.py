@@ -10,6 +10,14 @@ from PIL import Image, ImageDraw
 from omr.contracts.geometry import mm_to_px, px_per_mm
 from omr.generator.config import ExamConfig, WrittenQuestionConfig
 from omr.generator.generate import generate_exam
+from omr.identity_evidence import (
+    BLOCK,
+    NEAR_NEIGHBOUR_HOLD,
+    PROGRAM_INFERRED_FROM_GRID,
+    PROGRAM_SELECTOR_BLANK,
+    WARN,
+    evidence,
+)
 from omr.models import AlignedPage, Student
 from omr.reader.handwriting import RollOcrResult
 from omr.workflows.batch import (
@@ -89,6 +97,77 @@ def _record(source_index: int, page_index: int, roll_no: str, confidence: str) -
         identity_payload={},
         review_flags=[],
     )
+
+
+def _cell_read(roll_no: str, selected_probability: float) -> dict:
+    entries = []
+    for digit in roll_no:
+        probabilities = {str(value): 0.0 for value in range(10)}
+        probabilities[digit] = selected_probability
+        if digit == roll_no[-1]:
+            probabilities["3"] = max(probabilities["3"], 1.0 - selected_probability)
+        entries.append(
+            {
+                "text": digit,
+                "confidence": selected_probability,
+                "raw": {
+                    "top_probability": selected_probability,
+                    "class_probabilities": probabilities,
+                },
+            }
+        )
+    return {
+        "program": "BTECH",
+        "roll_no": roll_no,
+        "confidence": "high",
+        "ocr_results": {
+            "BTECH": {
+                "cells": {
+                    "text": roll_no,
+                    "confidence": selected_probability,
+                    "raw": {"cells": entries},
+                }
+            }
+        },
+    }
+
+
+def test_path_a_near_neighbour_guard_holds_uncertain_automatic_attachment():
+    page_one = _record(1, 1, "2023478", "high")
+    page_one.identity_payload = {"write_in_roll_read": _cell_read("2023478", 0.95)}
+    page_two = _record(2, 2, "2023478", "high")
+    page_two.identity_payload = _cell_read("2023478", 0.84)
+
+    grouped, unmatched = _group_records_by_identity(
+        [page_one, page_two],
+        "high",
+        valid_rolls={"2023478", "2023473"},
+        program_by_roll={"2023478": "BTECH", "2023473": "BTECH"},
+    )
+
+    assert [record.source_index for record in grouped["2023478"]] == [1]
+    assert [record.source_index for record in unmatched] == [2]
+    assert any(
+        flag.get("code") == NEAR_NEIGHBOUR_HOLD
+        for flag in page_two.identity_payload["evidence_flags"]
+    )
+
+
+def test_path_a_near_neighbour_guard_accepts_strong_automatic_attachment():
+    page_one = _record(1, 1, "2023478", "high")
+    page_one.identity_payload = {"write_in_roll_read": _cell_read("2023478", 0.95)}
+    page_two = _record(2, 2, "2023478", "high")
+    page_two.identity_payload = _cell_read("2023478", 0.90)
+
+    grouped, unmatched = _group_records_by_identity(
+        [page_one, page_two],
+        "high",
+        valid_rolls={"2023478", "2023473"},
+        program_by_roll={"2023478": "BTECH", "2023473": "BTECH"},
+    )
+
+    assert [record.source_index for record in grouped["2023478"]] == [1, 2]
+    assert unmatched == []
 
 
 def test_exact_cross_page_roll_pair_is_recovered_only_with_roster_match():
@@ -214,7 +293,11 @@ def test_exact_cross_page_recovery_refuses_blank_mtech_selector():
     }
     page_two = _record(47, 2, "MT25007", "medium")
     page_two.program = "MTECH"
-    page_two.review_flags.append("page 2 continuation program selector is blank")
+    page_two.identity_payload = {
+        "evidence_flags": [
+            evidence(PROGRAM_SELECTOR_BLANK, BLOCK, program="MTECH"),
+        ]
+    }
 
     grouped, unmatched = _group_records_by_identity(
         [page_one, page_two], "high", valid_rolls={"MT25007"}
@@ -306,9 +389,14 @@ def test_batch_consumes_inspected_alignment_without_realigning(tmp_path: Path, m
 def test_clear_inferred_program_roll_creates_reviewable_page_one_group():
     page_one = _record(11, 1, "2023011", "low")
     page_one.identity_payload = {
-        "review_flags": [
-            "program selector is blank",
-            "program inferred as BTECH from completed digit grid",
+        "evidence_flags": [
+            evidence(PROGRAM_SELECTOR_BLANK, WARN, selector_state="blank"),
+            evidence(
+                PROGRAM_INFERRED_FROM_GRID,
+                WARN,
+                program="BTECH",
+                roll_no="2023011",
+            ),
         ]
     }
 
@@ -582,7 +670,9 @@ def test_page_one_write_in_conflict_blocks_continuation_attachment(tmp_path: Pat
     manifest = result["manifest"]
     pages = _render_pages(result["pdf_path"])
     _fill_btech_roll(pages[1], manifest, "2024587")
+    _write_btech_roll_boxes(pages[1], manifest, 1, "2024999")
     _fill_continuation_program(pages[2], manifest, "BTECH")
+    _write_btech_roll_boxes(pages[2], manifest, 2, "2024587")
     bundle_path = tmp_path / "anchor_conflict_bundle.pdf"
     pages[2].save(bundle_path, save_all=True, append_images=[pages[1]], resolution=DPI)
 
@@ -915,12 +1005,19 @@ def _assert_random_order_identity_grouping(
     }
     for student in students.values():
         _fill_btech_roll(student["pages"][1], manifest, student["roll"])
+        _write_btech_roll_boxes(student["pages"][1], manifest, 1, student["roll"])
         for page_index in range(2, expected_pages + 1):
             _fill_continuation_program(
                 student["pages"][page_index],
                 manifest,
                 "BTECH",
                 page_index=page_index,
+            )
+            _write_btech_roll_boxes(
+                student["pages"][page_index],
+                manifest,
+                page_index,
+                student["roll"],
             )
 
     source_rolls = {

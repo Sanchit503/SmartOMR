@@ -14,7 +14,7 @@ import json
 import sys
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 
 import numpy as np
 from PIL import Image
@@ -23,6 +23,16 @@ from omr.contracts import load_manifest
 from omr.contracts.geometry import MM_PER_INCH, mm_to_px, px_per_mm
 from omr.grading.mcq import read_mcq_responses
 from omr.io.csv import load_answer_key, load_students, normalize_roll
+from omr.identity_evidence import (
+    BLOCK,
+    PROGRAM_INFERRED_FROM_GRID,
+    PROGRAM_SELECTOR_BLANK,
+    SOURCES_CONTRADICT,
+    evidence,
+    evidence_codes,
+    has_blocking_evidence,
+    merge_evidence,
+)
 from omr.models import AlignedPage, Student
 from omr.reader.digit_model import extract_digit_feature
 from omr.reader.handwriting import (
@@ -52,6 +62,12 @@ from omr.workflows.parse import (
     _written_payload,
 )
 from omr.reader.written_ocr import WrittenOcrBackend, build_written_ocr_backend, read_written_answer_texts
+from omr.workflows.identity_resolution import (
+    near_neighbour_guard,
+    page_evidence,
+    resolve_identity_proposals,
+    resolution_digest,
+)
 
 
 CONFIDENCE_RANK = {"low": 0, "medium": 1, "high": 2}
@@ -199,7 +215,12 @@ def _page_identity(
                 selected_program=roll.program,
                 valid_rolls=valid_rolls,
             )
-            payload["write_in_roll_read"] = asdict(write_in)
+            write_in_payload = asdict(write_in)
+            payload["write_in_roll_read"] = write_in_payload
+            payload["evidence_flags"] = merge_evidence(
+                payload.get("evidence_flags"),
+                write_in_payload.get("evidence_flags"),
+            )
             write_roll_no = normalize_roll(write_in.roll_no or "") if write_in.roll_no else None
             if not write_roll_no:
                 flags.append(
@@ -213,6 +234,17 @@ def _page_identity(
                 )
             elif roll_no and roll_no != write_roll_no:
                 flags.append(f"page-1 write-in roll {write_roll_no} conflicts with bubbled roll {roll_no}")
+                payload["evidence_flags"] = merge_evidence(
+                    payload.get("evidence_flags"),
+                    [
+                        evidence(
+                            SOURCES_CONTRADICT,
+                            BLOCK,
+                            bubble_roll=roll_no,
+                            cell_roll=write_roll_no,
+                        )
+                    ],
+                )
             if not roll_no and write_roll_no:
                 return "write_in", write_roll_no, write_in.program, write_in.confidence, payload, flags
         return "bubbled", roll_no, roll.program, roll.confidence, payload, flags
@@ -232,6 +264,67 @@ def _page_identity(
 
 def _strong_enough(confidence: str, minimum: str) -> bool:
     return CONFIDENCE_RANK.get(confidence, 0) >= CONFIDENCE_RANK[minimum]
+
+
+def _identity_evidence(payload: dict[str, Any] | None) -> list[dict[str, Any]]:
+    if not isinstance(payload, dict):
+        return []
+    nested = payload.get("write_in_roll_read")
+    return merge_evidence(
+        payload.get("evidence_flags") if isinstance(payload.get("evidence_flags"), list) else [],
+        nested.get("evidence_flags") if isinstance(nested, dict) and isinstance(nested.get("evidence_flags"), list) else [],
+    )
+
+
+def _record_page_evidence(record: _PageRecord) -> dict[str, Any]:
+    return page_evidence(
+        {
+            "source_index": record.source_index,
+            "sheet_page": record.aligned_page.page_index,
+            "identity_kind": record.identity_kind,
+            "literal_roll_no": record.roll_no,
+            "program": record.program,
+            "confidence": record.confidence,
+            "identity": record.identity_payload or {},
+        }
+    )
+
+
+def _path_a_near_neighbour_evidence(
+    anchor: _PageRecord,
+    continuation: _PageRecord,
+    *,
+    valid_rolls: set[str] | None,
+    program_by_roll: Mapping[str, str] | None,
+) -> list[dict[str, Any]]:
+    if not valid_rolls or not anchor.roll_no or not anchor.program:
+        return []
+    anchor_page = _record_page_evidence(anchor)
+    continuation_page = _record_page_evidence(continuation)
+    _neighbours, flags = near_neighbour_guard(
+        anchor.roll_no,
+        anchor.program,
+        [
+            ("page1_cells", anchor_page["cell_probabilities"]),
+            (f"page{continuation.aligned_page.page_index}_cells", continuation_page["cell_probabilities"]),
+        ],
+        valid_rolls=valid_rolls,
+        program_by_roll=program_by_roll,
+        sheet_page=continuation.aligned_page.page_index,
+    )
+    return flags
+
+
+def _add_record_identity_evidence(record: _PageRecord, flags: list[dict[str, Any]]) -> None:
+    if not flags:
+        return
+    payload = dict(record.identity_payload or {})
+    payload["evidence_flags"] = merge_evidence(payload.get("evidence_flags"), flags)
+    record.identity_payload = payload
+    for flag in flags:
+        message = f"{flag.get('code')}: {flag.get('message')}"
+        if message not in record.review_flags:
+            record.review_flags.append(message)
 
 
 def _page_one_write_in_matches_bubbles(record: _PageRecord) -> bool:
@@ -324,23 +417,18 @@ def _is_clear_program_inferred_anchor(record: _PageRecord, valid_rolls: set[str]
         return False
     if valid_rolls is None or record.roll_no not in valid_rolls:
         return False
-    payload = record.identity_payload or {}
-    flags = [str(flag) for flag in payload.get("review_flags", [])]
-    if not any(flag.startswith("program inferred as ") for flag in flags):
-        return False
-    allowed = (
-        "program selector is blank",
-        "program selector is faint/ambiguous:",
-        "program inferred as ",
+    structured = _identity_evidence(record.identity_payload)
+    codes = evidence_codes(structured)
+    return (
+        PROGRAM_SELECTOR_BLANK in codes
+        and PROGRAM_INFERRED_FROM_GRID in codes
+        and not has_blocking_evidence(structured)
     )
-    return all(flag.startswith(allowed) for flag in flags)
 
 
 def _has_blank_continuation_selector(record: _PageRecord) -> bool:
     """Return whether a continuation page has no marked program selector."""
-    payload = record.identity_payload or {}
-    flags = [*record.review_flags, *[str(flag) for flag in payload.get("review_flags", [])]]
-    return any("continuation program selector is blank" in flag.lower() for flag in flags)
+    return PROGRAM_SELECTOR_BLANK in evidence_codes(_identity_evidence(record.identity_payload))
 
 
 def _continuation_program_matches_anchor(record: _PageRecord, anchor_program: str | None) -> bool:
@@ -376,12 +464,14 @@ def _group_records_by_identity(
     min_group_confidence: str,
     page_one_index: int = 1,
     valid_rolls: set[str] | None = None,
+    program_by_roll: Mapping[str, str] | None = None,
 ) -> tuple[dict[str, list[_PageRecord]], list[_PageRecord]]:
     grouped: dict[str, list[_PageRecord]] = {}
     unmatched: list[_PageRecord] = []
 
     verified_anchor_rolls: set[str] = set()
     verified_anchor_programs: dict[str, str | None] = {}
+    verified_anchor_records: dict[str, _PageRecord] = {}
     ordered = sorted(records, key=lambda item: item.source_index)
     anchor_claims: dict[str, list[_PageRecord]] = {}
     for record in ordered:
@@ -412,6 +502,7 @@ def _group_records_by_identity(
         if _page_one_write_in_matches_bubbles(record):
             verified_anchor_rolls.add(roll_no)
             verified_anchor_programs[roll_no] = record.program
+            verified_anchor_records[roll_no] = record
 
     continuation_claims: dict[tuple[str, int], list[_PageRecord]] = {}
     for record in ordered:
@@ -433,6 +524,16 @@ def _group_records_by_identity(
                 f"continuation page program {record.program or 'unreadable'} does not match "
                 f"the verified page-1 program {anchor_program or 'unreadable'}"
             )
+            unmatched.append(record)
+            continue
+        guard_flags = _path_a_near_neighbour_evidence(
+            verified_anchor_records[record.roll_no],
+            record,
+            valid_rolls=valid_rolls,
+            program_by_roll=program_by_roll,
+        )
+        if has_blocking_evidence(guard_flags):
+            _add_record_identity_evidence(record, guard_flags)
             unmatched.append(record)
             continue
         continuation_claims.setdefault(
@@ -458,6 +559,7 @@ def _reconcile_exact_cross_page_roll_pairs(
     *,
     page_one_index: int,
     valid_rolls: set[str] | None,
+    program_by_roll: Mapping[str, str] | None = None,
 ) -> tuple[dict[str, list[_PageRecord]], list[_PageRecord]]:
     """Recover medium-confidence continuations from independently verified anchors.
 
@@ -506,6 +608,16 @@ def _reconcile_exact_cross_page_roll_pairs(
             or not _continuation_program_matches_anchor(continuation, anchor.program)
             or continuation.source_index in recovered_sources
         ):
+            continue
+
+        guard_flags = _path_a_near_neighbour_evidence(
+            anchor,
+            continuation,
+            valid_rolls=valid_rolls,
+            program_by_roll=program_by_roll,
+        )
+        if has_blocking_evidence(guard_flags):
+            _add_record_identity_evidence(continuation, guard_flags)
             continue
 
         if anchor.source_index in unmatched_by_source:
@@ -1636,6 +1748,7 @@ def parse_exam_bundle(
 
     students = load_students(students_path) if students_path else None
     valid_rolls = set(students) if students else None
+    program_by_roll = {roll_no: student.program for roll_no, student in (students or {}).items()}
     default_marks = float(manifest["exam"].get("marks_per_mcq", 1.0))
     answer_key = load_answer_key(answer_key_path, default_marks=default_marks) if answer_key_path else None
     _validate_numerical_answer_key(manifest, answer_key)
@@ -1734,6 +1847,7 @@ def parse_exam_bundle(
         min_group_confidence,
         page_one_index=int(manifest["roll_number_block"].get("page", 1)),
         valid_rolls=valid_rolls,
+        program_by_roll=program_by_roll,
     )
     if applied_grouping_mode == "page-major":
         grouped, unmatched = _group_records_by_page_major(page_records_for_bundle, manifest, min_group_confidence)
@@ -1747,7 +1861,39 @@ def parse_exam_bundle(
             unmatched,
             page_one_index=int(manifest["roll_number_block"].get("page", 1)),
             valid_rolls=valid_rolls,
+            program_by_roll=program_by_roll,
         )
+
+    current_assignments = {
+        record.source_index: roll_no
+        for roll_no, records in grouped.items()
+        for record in records
+    }
+    resolution_pages = []
+    for record in page_records_for_bundle:
+        identity_dir = root / "_page_identity" / f"source_{record.source_index:04d}"
+        resolution_pages.append(
+            {
+                "source_index": record.source_index,
+                "sheet_page": record.aligned_page.page_index,
+                "identity_kind": record.identity_kind,
+                "literal_roll_no": record.roll_no,
+                "program": record.program,
+                "confidence": record.confidence,
+                "identity": _relative_identity_payload(record.identity_payload, root),
+                "page_image_path": _json_path(identity_dir / "aligned_image.png", root),
+                "current_roll": current_assignments.get(record.source_index),
+            }
+        )
+    identity_resolution = resolve_identity_proposals(
+        resolution_pages,
+        valid_rolls=valid_rolls,
+        program_by_roll=program_by_roll,
+        current_assignments=current_assignments,
+    )
+    identity_resolution["digest"] = resolution_digest(identity_resolution)
+    identity_resolution_path = root / "identity_resolution.json"
+    identity_resolution_path.write_text(json.dumps(identity_resolution, indent=2), encoding="utf-8")
 
     student_results: list[dict[str, Any]] = []
     grouped_students = sorted(grouped.items())
@@ -1795,6 +1941,13 @@ def parse_exam_bundle(
             "roster_missing": int(roster_reconciliation["missing_count"]) if roster_reconciliation else 0,
         },
         "roster_reconciliation": roster_reconciliation,
+        "identity_resolution_path": _json_path(identity_resolution_path, root),
+        "identity_resolution": {
+            "policy_version": identity_resolution["policy_version"],
+            "mode": identity_resolution["mode"],
+            "digest": identity_resolution["digest"],
+            "counts": identity_resolution["counts"],
+        },
         "students": [
             {
                 "roll_no": result["student"]["roll_no"],

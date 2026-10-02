@@ -42,8 +42,9 @@ class RollRead:
     program: str | None
     roll_no: str | None
     confidence: str
-    ratios: dict[str, dict[str, float]]
+    ratios: dict[str, object]
     review_flags: list[str]
+    evidence_flags: list[dict[str, object]] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -58,7 +59,7 @@ class HandwrittenRollRead:
     cell_crop_paths: dict[str, list[str]]
     ocr_results: dict[str, dict[str, object]]
     review_flags: list[str]
-    evidence_flags: list[dict[str, str]] = field(default_factory=list)
+    evidence_flags: list[dict[str, object]] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
