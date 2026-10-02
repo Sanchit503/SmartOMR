@@ -21,6 +21,7 @@ from omr.generator.generate import generate_exam
 from omr.reader.quality import AlignmentQualityReport
 from omr.ui import app, inspection
 from omr.ui.app import RunStore, UiConfig, UploadedFile
+from omr.ui.tests.test_app import _multipart_body
 from omr.workflows.review import assign_unmatched_page, initialize_verification_index, verify_student
 from omr.workflows.tests.test_review import _write_identity_suggestion, _write_parsed_batch
 
@@ -87,6 +88,93 @@ def fake_pipeline(monkeypatch):
         Image.fromarray(image).save(path)
         return path
     monkeypatch.setattr(inspection, "save_alignment_overlay", overlay)
+
+
+def test_http_upload_starts_inspection_without_a_second_request(tmp_path, generated, monkeypatch):
+    store = RunStore(UiConfig(tmp_path / "data"))
+    fake_pipeline(monkeypatch)
+    started, release = threading.Event(), threading.Event()
+
+    def align(image, manifest, dpi, source_index):
+        started.set()
+        assert release.wait(timeout=10), "Upload must return while inspection is running"
+        return fake_alignment(image, manifest, dpi, source_index)
+
+    monkeypatch.setattr(inspection, "align_scan_page", align)
+    monkeypatch.setattr(app, "_require_ui_roll_ocr_backend", lambda: pytest.fail("Upload must not start OCR"))
+    monkeypatch.setattr(app, "parse_exam_bundle", lambda **kwargs: pytest.fail("Upload must not group or grade"))
+    boundary = "smartomr-auto-inspection"
+    body = _multipart_body(boundary, [
+        ("manifest", "manifest.json", generated["manifest_path"].read_bytes()),
+        ("scan_pdf", "scan.pdf", generated["pdf_path"].read_bytes()),
+        ("grouping_only", None, b"1"),
+    ])
+
+    try:
+        with server(store) as url:
+            request = urllib.request.Request(
+                url + "/runs",
+                data=body,
+                headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+                method="POST",
+            )
+            with urllib.request.urlopen(request, timeout=10) as response:
+                assert response.status == 200
+                assert "/pages" in response.url
+                assert b"Scan inspection" in response.read()
+            assert started.wait(timeout=5)
+            state = store.list_runs()[0]
+            assert state["status"] == "inspecting"
+            assert store._worker.is_alive()
+            assert Path(state["inputs"]["scan_path"]).is_file()
+            assert Path(state["inputs"]["manifest_path"]).is_file()
+    finally:
+        release.set()
+        if store._worker:
+            store._worker.join(timeout=10)
+
+    assert not store._worker.is_alive()
+    assert store.read_state(state["run_id"])["status"] == "inspected"
+    assert store.inspection_index(state["run_id"])["processed"] == 2
+
+
+def test_http_upload_start_failure_keeps_a_resumable_run(tmp_path, generated, monkeypatch):
+    store = RunStore(UiConfig(tmp_path / "data"))
+    start_run = store.start_run
+
+    def fail_start(run_id, **kwargs):
+        raise RuntimeError("Worker could not start")
+
+    monkeypatch.setattr(store, "start_run", fail_start)
+    boundary = "smartomr-inspection-start-failure"
+    body = _multipart_body(boundary, [
+        ("manifest", "manifest.json", generated["manifest_path"].read_bytes()),
+        ("scan_pdf", "scan.pdf", generated["pdf_path"].read_bytes()),
+        ("grouping_only", None, b"1"),
+    ])
+    with server(store) as url:
+        request = urllib.request.Request(
+            url + "/runs",
+            data=body,
+            headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+            method="POST",
+        )
+        with urllib.request.urlopen(request, timeout=10) as response:
+            assert response.status == 200
+            assert "/pages" in response.url
+        state = store.list_runs()[0]
+        assert state["status"] == "inspection_interrupted"
+        assert "Worker could not start" in state["error"]
+        index, _ = get(f"{url}/runs/{state['run_id']}/inspection.json")
+        assert json.loads(index)["can_inspect"]
+
+    monkeypatch.setattr(store, "start_run", start_run)
+    fake_pipeline(monkeypatch)
+    store.start_run(state["run_id"])
+    store._worker.join(timeout=10)
+    resumed = store.read_state(state["run_id"])
+    assert resumed["status"] == "inspected"
+    assert resumed["error"] is None
 
 
 def test_300_page_inventory_and_worker_never_drop_failures(tmp_path, generated, monkeypatch):
@@ -249,13 +337,13 @@ def test_http_inventory_assets_and_error_routes(tmp_path, generated, monkeypatch
     with server(store) as url:
         base = f"{url}/runs/{state['run_id']}"
         body, _ = get(base + "/pages")
-        assert b"Detected sheet page" in body and b"Run OCR, Grouping &amp; Grading" in body
+        assert b"Detected sheet page" in body and b"Read Rolls, Match &amp; Grade" in body
         assert f'/runs/{state["run_id"]}/review'.encode() in body
-        assert b"Identity needs review" in body and b"Roll preview" in body
+        assert b"Identity needs review" in body and b"Roll evidence" in body
         payload, headers = get(base + "/inspection.json")
         index = json.loads(payload)
         assert index["total"] == 2 and index["can_identity_preview"]
-        assert not index["can_evaluate"]
+        assert index["can_evaluate"]
         assert headers["Cache-Control"] == "no-store"
         image, _ = get(base + "/pages/1/original")
         assert Image.open(io.BytesIO(image)).size == (8, 12)
@@ -410,9 +498,9 @@ def test_grouping_only_inspection_uses_matching_labels():
         "exam_id": "EXAM_REVIEW",
         "inputs": {"scan_path": "scan.pdf", "grouping_only": True},
     })
-    assert "Match &amp; Segregate Sheets" in body
+    assert "Read Rolls &amp; Match Sheets" in body
     assert "Sheet Matching Review" in body
-    assert "Grouping &amp; Grading" not in body
+    assert "Read Rolls, Match &amp; Grade" not in body
 
 
 def test_review_page_shows_identity_evidence_and_records_rejection(tmp_path):
@@ -466,10 +554,6 @@ def test_evaluation_is_explicit_and_does_not_reset_completed_run(tmp_path, gener
         store.start_run(state["run_id"], evaluate=True)
     fake_pipeline(monkeypatch)
     store._run_inspection(state["run_id"])
-    preview_path = store.run_dir(state["run_id"]) / "identity_preview" / "index.json"
-    preview_path.parent.mkdir(parents=True, exist_ok=True)
-    preview_path.write_text(json.dumps({"status": "completed", "pages": []}), encoding="utf-8")
-    store.write_state(state["run_id"], identity_preview_path=str(preview_path))
     calls = []
     monkeypatch.setattr(store, "_run_batch", lambda run_id: calls.append(run_id))
     store.start_run(state["run_id"], evaluate=True)
@@ -478,6 +562,18 @@ def test_evaluation_is_explicit_and_does_not_reset_completed_run(tmp_path, gener
     store.write_state(state["run_id"], status="completed", parse_index_path="already-reviewed.json")
     with pytest.raises(ValueError, match="reviews are preserved"):
         store.start_run(state["run_id"], evaluate=True)
+
+
+def test_http_matching_redirect_preserves_completion_navigation(tmp_path, generated, monkeypatch):
+    store = RunStore(UiConfig(tmp_path / "data"))
+    state = create(store, generated)
+    calls = []
+    monkeypatch.setattr(store, "start_run", lambda run_id, **options: calls.append((run_id, options)))
+    with server(store) as url:
+        request = urllib.request.Request(f"{url}/runs/{state['run_id']}/evaluate", data=b"", method="POST")
+        with urllib.request.urlopen(request, timeout=10) as response:
+            assert response.url.endswith("/pages?matching=1")
+    assert calls == [(state["run_id"], {"evaluate": True})]
 
 
 def test_render_failure_preserves_inventory_and_later_pages(tmp_path, generated, monkeypatch):
@@ -537,3 +633,147 @@ def test_artifact_endpoint_does_not_expose_source_code(tmp_path):
         with pytest.raises(urllib.error.HTTPError) as error:
             get(url + app._asset_url(Path(app.__file__)))
         assert error.value.code == 404
+
+
+def _fake_identity_reader(calls):
+    def read(aligned, manifest, dpi, identity_dir, backend, valid_rolls):
+        calls.append(aligned.source_index)
+        crop = identity_dir / "digit.png"
+        crop.parent.mkdir(parents=True, exist_ok=True)
+        Image.new("L", (8, 8), 200).save(crop)
+        return (
+            "bubbled" if aligned.page_index == 1 else "handwritten", "2024001", "BTECH", "high",
+            {"crop_paths": {"BTECH": str(crop)}, "cell_crop_paths": {"BTECH": [str(crop)]}}, [],
+        )
+    return read
+
+
+def test_matching_reuses_preview_identity_evidence_without_repeating_ocr(tmp_path, generated, monkeypatch):
+    store = RunStore(UiConfig(tmp_path / "data"))
+    state = create(store, generated)
+    fake_pipeline(monkeypatch)
+    store._run_inspection(state["run_id"])
+    backend_state = {"provider": "fake", "enabled": True, "provenance": {"model": "v1"}}
+    monkeypatch.setattr(app, "_require_ui_roll_ocr_backend", lambda: (object(), backend_state))
+    calls = []
+    monkeypatch.setattr(app, "_page_identity", _fake_identity_reader(calls))
+    store._run_identity_preview(state["run_id"])
+    assert calls == [1, 2]
+    captured = {}
+
+    def parse(**kwargs):
+        captured.update(kwargs)
+        output = kwargs["output_root"] / "UI_TEST"
+        output.mkdir(parents=True)
+        index_path = output / "parse_index.json"
+        app._write_json(index_path, {"exam_id": "UI_TEST", "expected_pages": 2, "students": [],
+                                    "unmatched_pages": [], "page_errors": [], "status_counts": {}})
+        return [], index_path
+
+    monkeypatch.setattr(app, "parse_exam_bundle", parse)
+    store._run_batch(state["run_id"])
+    assert calls == [1, 2]
+    assert set(captured["precomputed_identities"]) == {1, 2}
+    assert Path(captured["precomputed_identities"][1]["identity"]["crop_paths"]["BTECH"]).is_absolute()
+    assert store.read_state(state["run_id"])["status"] == "completed"
+    preview = app._read_json(Path(store.read_state(state["run_id"])["identity_preview_path"]))
+    assert preview["cache_hits"] == 2
+    assert preview["ocr_pages"] == 0
+
+    with server(store) as url:
+        payload, _ = get(f"{url}/runs/{state['run_id']}/inspection.json?source=2")
+        compact = json.loads(payload)["identity_preview"]
+        assert compact["counts"] == preview["counts"]
+        assert "identity" not in compact["pages"][0]
+        assert compact["pages"][1]["identity"]["cell_crop_paths"]
+    assert app._read_json(Path(store.read_state(state["run_id"])["identity_preview_path"])) == preview
+
+
+def test_roll_preview_resumes_saved_pages_after_an_ocr_failure(tmp_path, generated, monkeypatch):
+    store = RunStore(UiConfig(tmp_path / "data"))
+    state = create(store, generated)
+    fake_pipeline(monkeypatch)
+    store._run_inspection(state["run_id"])
+    monkeypatch.setattr(app, "_require_ui_roll_ocr_backend", lambda: (object(), {"provider": "fake"}))
+    calls = []
+    read = _fake_identity_reader(calls)
+
+    def failing_read(aligned, *args):
+        if aligned.source_index == 2:
+            raise RuntimeError("OCR interrupted")
+        return read(aligned, *args)
+
+    monkeypatch.setattr(app, "_page_identity", failing_read)
+    store._run_identity_preview(state["run_id"])
+    assert store.read_state(state["run_id"])["status"] == "identity_preview_failed"
+    assert calls == [1]
+    monkeypatch.setattr(app, "_page_identity", read)
+    store._run_identity_preview(state["run_id"])
+    assert calls == [1, 2]
+    assert store.read_state(state["run_id"])["status"] == "identity_previewed"
+
+
+def test_source_view_assignment_moves_a_grouped_page_and_updates_viewer(tmp_path, generated, monkeypatch):
+    parsed_dir = _write_parsed_batch(tmp_path)
+    store = RunStore(UiConfig(tmp_path / "data"))
+    state = create(store, generated)
+    fake_pipeline(monkeypatch)
+    store._run_inspection(state["run_id"])
+    store.write_state(state["run_id"], status="completed", parse_dir=str(parsed_dir),
+                      parse_index_path=str(parsed_dir / "parse_index.json"))
+    with server(store) as url:
+        base = f"{url}/runs/{state['run_id']}"
+        body, _ = get(base + "/pages")
+        assert b"Correct Ownership" in body and b"Next Unresolved" in body
+        request = urllib.request.Request(
+            base + "/pages/2/assign",
+            data=urllib.parse.urlencode({"roll_no": "2024002", "page_index": "2", "note": "Read roll visually"}).encode(),
+            headers={"Accept": "application/json"}, method="POST",
+        )
+        with urllib.request.urlopen(request, timeout=10) as response:
+            assert json.load(response)["saved"]
+        payload, _ = get(base + "/inspection.json")
+        index = json.loads(payload)
+        assert index["pages"][1]["assignment"]["roll_no"] == "2024002"
+        assert index["can_assign"]
+        assert not index["can_identity_preview"]
+        verify_student(parsed_dir, "2024002", reviewer="test", note="Checked both sheets")
+        payload, _ = get(base + "/inspection.json")
+        assert json.loads(payload)["pages"][1]["assignment"]["status"] == "verified"
+
+
+def test_roll_preview_unavailable_pages_are_not_counted_as_missing_rolls():
+    preview = {"pages": [{"source_index": 1, "status": "unavailable"},
+                         {"source_index": 2, "confidence": "low", "literal_roll_no": None}]}
+    app._refresh_identity_preview_counts(preview)
+    assert preview["counts"]["undetected"] == 1
+    assert preview["counts"]["unavailable"] == 1
+
+
+def test_manually_created_roster_student_has_dashboard_and_sheet_detail(tmp_path, generated, monkeypatch):
+    parsed_dir = _write_parsed_batch(tmp_path)
+    parse_path = parsed_dir / "parse_index.json"
+    parsed = app._read_json(parse_path)
+    parsed["roster_reconciliation"] = {"roster_total": 3, "missing_count": 1, "missing_students": [{
+        "roll_no": "2024003", "program": "BTECH", "student_name": "Manual Student",
+        "student_email": "third@example.edu",
+    }]}
+    app._write_json(parse_path, parsed)
+    store = RunStore(UiConfig(tmp_path / "data"))
+    state = create(store, generated)
+    fake_pipeline(monkeypatch)
+    store._run_inspection(state["run_id"])
+    store.write_state(state["run_id"], status="completed", parse_dir=str(parsed_dir),
+                      parse_index_path=str(parse_path), inputs={**state["inputs"], "grouping_only": True})
+    store.assign_source(state["run_id"], 3, "2024003", page_index=2, note="Visually checked the roll")
+    store.assign_source(state["run_id"], 4, "2024003", page_index=1, note="Visually checked first page")
+    with server(store) as url:
+        base = f"{url}/runs/{state['run_id']}"
+        body, _ = get(base)
+        assert b"Manual Student" in body and b"2024003" in body
+        body, _ = get(base + "/students/2024003")
+        assert b"Manual Student" in body and b"third@example.edu" in body
+        assert b"Current PDF pending verification" in body
+        post(base + "/students/2024003/verify", {"note": "Checked both pages"})
+        body, _ = get(base + "/students/2024003")
+        assert b"Open Verified PDF" in body

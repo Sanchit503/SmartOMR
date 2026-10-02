@@ -78,16 +78,27 @@ time; wait for it before uploading another run. A batch evaluation is not resuma
 a new run if an interrupted batch already wrote artifacts. Existing review output is never reset
 by clicking evaluation twice.
 
-After inspection completes, `Run OCR & Grouping` explicitly starts the existing evaluation
-pipeline. Alignment warnings/failures remain visible for inspection; this action does not approve
-those pages or send mail. PDF decoding/alignment currently runs again in evaluation because its
-identity workflow has a separate artifact contract. This extra pass is a known time/disk cost,
-not a performance improvement. Inspect before committing to a long evaluation.
+After inspection completes, use `Read Rolls & Match Sheets` for a grouping-only run, or
+`Read Rolls, Match & Grade` when grading is requested. This single action reads roll evidence,
+matches sheets, writes student bundles, and opens the review dashboard when finished. Inspection's
+saved aligned images are reused; the matching pass does not decode and align the PDF again.
+Alignment warnings/failures remain visible. Matching does not approve sheets or send mail.
+
+`Read Rolls Only` is optional. Its evidence is shared with matching, so using it first does not
+require another OCR pass. Each completed page's evidence and digit crops are saved independently.
+Unchanged pages can be reused after an interrupted OCR read. Cache validation includes the scan,
+manifest, roster, model provenance, DPI, reader code, detected sheet-page number, aligned-image
+hash, and evidence assets. Changed inputs or missing assets require a fresh read. Legacy previews
+without the per-page cache require one fresh OCR pass.
+
+The viewer shows separate progress for reading rolls, matching inspected pages, and writing student
+bundles. Roll evidence becomes visible while processing, rather than only at the end. This avoids
+duplicate OCR but does not make CPU model inference or artifact generation instantaneous.
 
 ## Evaluation Prerequisite
 
-Only evaluation requires local Tesseract roll-number OCR. It refuses to evaluate instead of silently
-falling back when that backend is unavailable. Before evaluation, run:
+Roll reading and matching require the configured local roll-number OCR backend. Processing refuses
+to silently continue when that backend is unavailable. Before processing, run:
 
 ```powershell
 .\.venv\Scripts\python.exe -m omr.health --check-handwriting-ocr
@@ -96,8 +107,9 @@ falling back when that backend is unavailable. Before evaluation, run:
 On page 1, SmartOMR independently reads the bubbled roll grid and the written roll boxes. A
 confident disagreement is marked `needs_review`; unreadable or low-confidence page-1 OCR is also
 reviewed because the bubbled identity was not independently confirmed. Continuation-page written
-roll OCR uses the same backend for grouping. The run dashboard must show
-`Roll OCR: local_tesseract`.
+roll OCR uses the same backend for grouping. The dashboard records the selected provider and model
+provenance. The deployed fine-tuned ResNet probability ensemble requires its manifest and all
+checkpoint files locally; cloning the source alone does not provide those model artifacts.
 
 ## Output
 
@@ -114,6 +126,8 @@ inputs/                         uploaded files
 inspection/index.json          all source pages, input hashes, progress, quality and errors
 inspection/source_0001/         immutable per-attempt original/aligned/overlay images
 inspection/source_0001/*/quality.json   full per-page alignment measurements
+identity_preview/index.json     live per-page roll evidence and cache hit counts
+identity_preview/source_0001/evidence.json   validated per-page OCR cache
 parsed/<exam_id>/parse_index.json
 parsed/<exam_id>/email_release/email_skipped.csv
 parsed/<exam_id>/students/<roll_no>/student.json
@@ -130,8 +144,8 @@ run_state.json
 Exam runs
   -> upload PDF + matching manifest (roster and answer key optional)
   -> inspect every source page and alignment failures
-  -> explicitly run OCR & grouping
-  -> open Student Review
+  -> Read Rolls & Match Sheets (or Read Rolls, Match & Grade)
+  -> automatically open Student Review after processing
   -> compare detected students with Roster and Missing Sheets counts
   -> open Review Cases
   -> assign unmatched pages to a roll or ignore confirmed duplicates/stray pages
@@ -143,9 +157,36 @@ Exam runs
   -> inspect previews, dry-run, and real-send one test message before releasing the batch
 ```
 
-A student cannot be verified while an expected page is missing. Roster students with no detected
-sheet remain visible in the review page and are written to `email_skipped.csv`; they never silently
-disappear from the release count.
+The UI permits marking an incomplete selection manually checked, but retains its missing-page
+warning and excludes it from email eligibility. The terminal workflow requires `--allow-missing`
+for this. Roster students with no detected sheet remain visible in the review page and are written
+to `email_skipped.csv`; they never silently disappear from the release count.
+
+From Review Cases, click an unmatched source-page number to open its image and roll evidence.
+The viewer also has `Unmatched pages`, `Student needs review`, and `Manually checked` filters.
+In `Correct Ownership`, choose a complete roll, the sheet-page number, and a review note, then
+save. The target can be an existing student or a missing roster student. This supports every
+sheet-page slot in the manifest, including three- and four-page sheets.
+
+Moving a page removes it from its previous student and revokes affected verification. Replacing
+an occupied sheet-page slot requires the explicit checkbox; the displaced page returns to review
+instead of disappearing. Use `Open Student Sheet` to check the complete selection and verify it.
+`Next Unresolved` advances to another source page whose owner has not been verified or ignored.
+Saved assignments do not restart OCR or grouping. No email is released by these controls.
+
+The dashboard, exam list, review page and viewer use current verification counts, not the original
+parser counts. Manually checked, pending verification, needs review and unmatched are distinct.
+Resolved unmatched entries remain in the audit index but are removed from the actionable list.
+Original OCR evidence and parser observations remain explicitly labelled as historical evidence.
+
+Open review views check for changes every three seconds and on returning to the tab. Clean views
+refresh automatically; forms with unsaved edits show an update notice instead of overwriting input.
+The page viewer refreshes current ownership in place and protects an edited assignment form.
+These refreshes read saved state only: they do not repeat OCR, alignment, grouping or grading.
+Older runs can retain recovered rolls in their original missing-roster list; current UI counts and
+lists exclude those duplicates without rewriting the saved review. Current source-page numbers
+link directly to the ownership viewer. `Roll OCR Training Feedback` is separate from ownership
+correction and is disabled for students created solely from manual review.
 
 The student UI separates parsing from verification. Parser `ready` is displayed as
 `PENDING_VERIFICATION`, not `AUTO_GRADED`. Rejected and missing-page decisions stay distinct.

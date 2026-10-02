@@ -5,12 +5,15 @@ import json
 from pathlib import Path
 
 import pymupdf
+import pytest
 from PIL import Image
 
 from omr.workflows.review import (
+    assign_source_page,
     assign_unmatched_page,
     decide_identity_suggestion,
     initialize_verification_index,
+    selected_student_pages,
     reject_student,
     verify_student,
 )
@@ -180,6 +183,85 @@ def _write_identity_suggestion(parsed_dir: Path, *, blocked: bool = False) -> st
     }
     parse_path.write_text(json.dumps(parse_index), encoding="utf-8")
     return candidate_id
+
+
+def test_assign_source_moves_ownership_and_revokes_previous_verification(tmp_path):
+    parsed_dir = _write_parsed_batch(tmp_path)
+    verify_student(parsed_dir, "2024001", reviewer="test", note="Initial check")
+    index, _ = assign_source_page(parsed_dir, 2, "2024002", reviewer="test", note="Corrected written roll")
+    first, second = index["students"]
+    assert first["source_indices"] == [1]
+    assert first["missing_pages"] == [2]
+    assert not first["eligible_for_email"] and first["verified_sheet_pdf_path"] is None
+    assert [page["source_index"] for page in selected_student_pages(second)] == [4, 2]
+    assert not second["eligible_for_email"]
+    index, _ = verify_student(parsed_dir, "2024002", reviewer="test", note="Checked new pairing")
+    pdf = parsed_dir / "verified" / "students" / "2024002" / "sheet.pdf"
+    with pymupdf.open(pdf) as doc:
+        assert len(doc) == 2
+        pix = doc[1].get_pixmap(colorspace=pymupdf.csGRAY)
+        assert abs(pix.pixel(pix.width // 2, pix.height // 2)[0] - 218) <= 2
+
+
+def test_assign_source_requires_explicit_replacement_and_preserves_displaced_page(tmp_path):
+    parsed_dir = _write_parsed_batch(tmp_path)
+    index, path = initialize_verification_index(parsed_dir)
+    original = path.read_bytes()
+    with pytest.raises(ValueError, match="Replace existing page"):
+        assign_source_page(parsed_dir, 3, "2024001", reviewer="test", note="Replacement")
+    assert path.read_bytes() == original
+    index, _ = assign_source_page(parsed_dir, 3, "2024001", replace_existing=True,
+                                 reviewer="test", note="Checked replacement")
+    first = index["students"][0]
+    assert [page["source_index"] for page in selected_student_pages(first)] == [1, 3]
+    displaced = next(page for page in index["unmatched_pages"] if page["source_index"] == 2)
+    assert displaced["status"] == "needs_review"
+    assert displaced["pages"][0]["canonical_image_path"]
+    assert not first["eligible_for_email"]
+
+
+def test_assign_source_can_create_missing_roster_student_without_inventing_identity(tmp_path):
+    parsed_dir = _write_parsed_batch(tmp_path)
+    path = parsed_dir / "parse_index.json"
+    raw = json.loads(path.read_text())
+    raw["roster_reconciliation"] = {
+        "roster_total": 3, "detected_roster_students": 2, "missing_count": 1,
+        "missing_students": [{"roll_no": "2024003", "student_name": "Missing Student",
+                              "student_email": "third@example.edu", "program": "BTECH"}],
+    }
+    path.write_text(json.dumps(raw), encoding="utf-8")
+    with pytest.raises(ValueError, match="review roster"):
+        assign_source_page(parsed_dir, 3, "2024999", reviewer="test", note="Unknown roll")
+    index, _ = assign_source_page(parsed_dir, 3, "2024003", reviewer="test", note="Read page two")
+    student = next(row for row in index["students"] if row["roll_no"] == "2024003")
+    assert student["student_email"] == "third@example.edu"
+    assert student["missing_pages"] == [1]
+    assert index["roster_reconciliation"]["missing_count"] == 0
+    assert not student["eligible_for_email"]
+
+
+@pytest.mark.parametrize("num_pages", [3, 4])
+def test_manual_assignment_supports_three_and_four_page_sheets(tmp_path, num_pages):
+    parsed_dir = _write_parsed_batch(tmp_path)
+    path = parsed_dir / "parse_index.json"
+    raw = json.loads(path.read_text())
+    raw["expected_pages"] = num_pages
+    for page_no in range(3, num_pages + 1):
+        source = page_no + 2
+        image = parsed_dir / "unmatched_pages" / f"source_{source:04d}" / "pages" / f"page_{page_no}.png"
+        _write_page(image, 100 + page_no)
+        raw["unmatched_pages"].append({"source_index": source, "page_index": page_no, "status": "needs_review",
+                                       "pages": [{"page_index": page_no, "source_index": source,
+                                                  "canonical_image_path": str(image)}], "review_flags": []})
+    path.write_text(json.dumps(raw), encoding="utf-8")
+    assign_source_page(parsed_dir, 3, "2024002", reviewer="test", note="Page two confirmed")
+    for page_no in range(3, num_pages + 1):
+        assign_source_page(parsed_dir, page_no + 2, "2024002", reviewer="test", note="Continuation confirmed")
+    index, _ = verify_student(parsed_dir, "2024002", reviewer="test", note="All pages inspected")
+    student = next(row for row in index["students"] if row["roll_no"] == "2024002")
+    assert student["missing_pages"] == []
+    with pymupdf.open(parsed_dir / "verified" / "students" / "2024002" / "sheet.pdf") as doc:
+        assert len(doc) == num_pages
 
 
 def test_initialize_verification_index_writes_reports(tmp_path: Path):

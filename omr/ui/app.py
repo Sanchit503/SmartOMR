@@ -7,6 +7,7 @@ student-wise marks, and open full-sheet overlays without requiring a database.
 from __future__ import annotations
 
 import csv
+import hashlib
 import html
 import json
 import mimetypes
@@ -39,7 +40,7 @@ from omr.io.csv import load_answer_key, load_students
 from omr.models import AlignedPage
 from omr.reader.handwriting import build_roll_ocr_backend, save_roll_number_crop_sets
 from omr.reader.scan import align_scan_page, iter_scan_pages
-from omr.ui import inspection
+from omr.ui import identity_cache, inspection
 from omr.ui.inspection_view import inspection_body
 from omr.workflows.email import (
     EMAIL_LOG_CSV,
@@ -52,13 +53,12 @@ from omr.workflows.batch import (
     _PageRecord,
     _mcq_answer_summary,
     _page_identity,
-    _relative_identity_payload,
     _write_review_reports,
     _write_student_group,
     parse_exam_bundle,
 )
 from omr.workflows.review import (
-    assign_unmatched_page,
+    assign_source_page,
     decide_identity_suggestion,
     hold_student,
     ignore_unmatched_page,
@@ -100,7 +100,7 @@ def _safe_id(value: str) -> str:
 
 
 def _read_json(path: Path) -> dict[str, Any]:
-    return json.loads(path.read_text(encoding="utf-8"))
+    return inspection.read_json(path)
 
 
 def _write_json(path: Path, payload: dict[str, Any]) -> None:
@@ -401,7 +401,7 @@ def _html_page(title: str, body: str, *, refresh_seconds: int | None = None) -> 
     .metric {{ background: var(--panel); border: 1px solid var(--border); border-radius: 6px; padding: 12px 14px; min-height: 56px; }}
     .metric span {{ display: block; font-size: 12px; color: var(--muted); margin-bottom: 6px; }}
     .metric strong {{ display: block; font-size: 20px; line-height: 1.2; overflow-wrap: anywhere; }}
-    table {{ width: 100%; border-collapse: separate; border-spacing: 0; background: var(--panel); border: 1px solid var(--border); border-radius: 6px; overflow: hidden; }}
+    table {{ display: block; width: 100%; max-width: 100%; overflow-x: auto; border-collapse: separate; border-spacing: 0; background: var(--panel); border: 1px solid var(--border); border-radius: 6px; }}
     th, td {{ padding: 10px 12px; border-bottom: 1px solid #edf0f5; text-align: left; vertical-align: top; font-size: 13px; }}
     th {{ background: #eef2f7; color: #344054; font-size: 12px; white-space: nowrap; font-weight: 800; }}
     tr:last-child td {{ border-bottom: 0; }}
@@ -483,8 +483,11 @@ def _html_page(title: str, body: str, *, refresh_seconds: int | None = None) -> 
     .suggestion-actions form {{ border-top: 1px solid var(--soft-border); padding-top: 12px; }}
     .suggestion-actions input {{ margin-bottom: 8px; }}
     .decision-record {{ display: flex; flex-wrap: wrap; gap: 12px; margin-top: 16px; padding: 12px; border: 1px solid var(--soft-border); background: #f8fafc; }}
+    .review-sync {{ position: fixed; bottom: 16px; left: 16px; right: 16px; z-index: 30; background: #fff7df; border: 1px solid #d6a651; padding: 12px; }}
+    .review-sync[hidden] {{ display: none; }}
     @media (max-width: 1040px) {{ .student-layout, .split {{ grid-template-columns: 1fr; }} }}
     @media (max-width: 820px) {{ .suggestion-pages, .suggestion-actions {{ grid-template-columns: 1fr; }} .suggestion-heading {{ flex-direction: column; }} }}
+    @media (max-width: 600px) {{ header {{ flex-wrap: wrap; gap: 12px; padding: 12px; }} main {{ padding: 12px; }} .pages {{ grid-template-columns: minmax(0, 1fr); }} }}
   </style>
 </head>
 <body>
@@ -504,7 +507,7 @@ def _badge(value: str | None) -> str:
     text = html.escape(str(value or ""))
     lowered = text.lower()
     cls = "neutral"
-    if lowered in {"ready", "verified", "auto_graded", "auto graded", "correct"}:
+    if lowered in {"ready", "verified", "manually_checked", "auto_graded", "auto graded", "correct"}:
         cls = "ready"
     elif "review" in lowered or "pending" in lowered or "missing" in lowered:
         cls = "review"
@@ -531,6 +534,21 @@ def _professor_status(parser_status: str | None, verified_status: str | None = N
     return str(parser_status or "NEEDS_REVIEW")
 
 
+def _review_created_details(student: dict[str, Any], parse_dir: Path) -> dict[str, Any]:
+    return {
+        **student,
+        "student": {
+            "roll_no": student["roll_no"], "program": student.get("program"),
+            "name": student.get("student_name") or "", "email": student.get("student_email") or "",
+        },
+        "details_path": str(parse_dir / "verified_index.json"),
+        "source_pages": [
+            {"source_index": page["source_index"], "page_index": page["page"], "used": True}
+            for page in selected_student_pages(student)
+        ],
+    }
+
+
 def _score(student: dict[str, Any]) -> tuple[float | None, float | None]:
     if student.get("manual_score_override") is not None:
         return float(student.get("manual_score_override") or 0.0), float(
@@ -553,7 +571,7 @@ def _score(student: dict[str, Any]) -> tuple[float | None, float | None]:
 
 
 def _marks_label(details: dict[str, Any], verified: dict[str, Any] | None = None) -> str:
-    if verified and verified.get("manual_pages"):
+    if _selection_changed(details, verified):
         return "Regrading required"
     if not any(details.get(key) is not None for key in ("mcq_score", "numerical_score")):
         return "Not graded"
@@ -564,6 +582,56 @@ def _marks_label(details: dict[str, Any], verified: dict[str, Any] | None = None
         return "Grading incomplete"
     score, total = _score(details)
     return f"{_fmt_num(score)} / {_fmt_num(total)}"
+
+
+def _selection_changed(details: dict[str, Any], verified: dict[str, Any] | None) -> bool:
+    if not verified:
+        return False
+    if verified.get("manual_pages"):
+        return True
+    moved = any(decision.get("action") == "move_page_to_identity_suggestion"
+                for decision in verified.get("decision_log", []))
+    if moved and not verified.get("sheet_pdf_path"):
+        return True
+    if "pages" not in details:
+        return False
+    def sources(pages: list[dict[str, Any]]) -> set[tuple[Any, Any]]:
+        return {(page.get("page", page.get("page_index")), page.get("source_index")) for page in pages}
+    return sources(details["pages"]) != sources(selected_student_pages(verified))
+
+
+def _missing_roster_students(index: dict[str, Any]) -> list[dict[str, Any]]:
+    known = {str(student.get("roll_no")) for student in index.get("students", [])}
+    return [student for student in (index.get("roster_reconciliation") or {}).get("missing_students", [])
+            if str(student.get("roll_no")) not in known]
+
+
+def _review_summary(index: dict[str, Any]) -> dict[str, int]:
+    students = index.get("students", [])
+    selected_sources = {page.get("source_index") for student in students for page in selected_student_pages(student)}
+    return {
+        "students": len(students),
+        "verified": sum(student.get("status") == "verified" for student in students),
+        "pending_verification": sum(student.get("status") == "pending_verification" for student in students),
+        "needs_review": sum(student.get("status") not in {"verified", "pending_verification"} for student in students),
+        "eligible_for_email": sum(bool(student.get("eligible_for_email")) for student in students),
+        "assigned_pages": len(selected_sources),
+        "unmatched_pages": sum(page.get("status") == "needs_review" and page.get("source_index") not in selected_sources
+                               for page in index.get("unmatched_pages", [])),
+        "page_errors": sum(page.get("status") != "ignored" and page.get("source_index") not in selected_sources
+                           for page in index.get("page_errors", [])),
+        "roster_missing": len(_missing_roster_students(index)),
+    }
+
+
+def _review_metrics(summary: dict[str, Any]) -> str:
+    return '<div class="grid">' + "".join(
+        f'<div class="metric"><span>{label}</span><strong>{summary.get(key, 0)}</strong></div>'
+        for label, key in (("Students", "students"), ("Manually Checked", "verified"),
+                           ("Pending Verification", "pending_verification"), ("Needs Review", "needs_review"),
+                           ("Assigned Pages", "assigned_pages"), ("Unmatched Pages", "unmatched_pages"),
+                           ("Unreadable Pages", "page_errors"), ("Missing Sheets", "roster_missing"))
+    ) + '</div>'
 
 
 def _is_grouping_only(state: dict[str, Any]) -> bool:
@@ -919,7 +987,7 @@ def _refresh_identity_preview_counts(preview: dict[str, Any]) -> None:
         "detected": sum(row.get("status") in {"detected", "detected_with_caution"} for row in rows),
         "detected_with_caution": sum(row.get("status") == "detected_with_caution" for row in rows),
         "needs_review": sum(row.get("status") == "needs_review" for row in rows),
-        "undetected": sum(not row.get("literal_roll_no") for row in rows),
+        "undetected": sum(not row.get("literal_roll_no") and row.get("status") != "unavailable" for row in rows),
         "unavailable": sum(row.get("status") == "unavailable" for row in rows),
     }
 
@@ -1549,6 +1617,7 @@ class RunStore:
         self.config = config
         self.config.runs_dir.mkdir(parents=True, exist_ok=True)
         self._state_lock = threading.RLock()
+        self._review_lock = threading.RLock()
         self._worker_lock = threading.Lock()
         self._worker: threading.Thread | None = None
         for state in self.list_runs():
@@ -1720,14 +1789,12 @@ class RunStore:
                     index["counts"]["aligned"] + index["counts"]["needs_review"]
                 ):
                     raise ValueError("Complete page inspection with at least one aligned page before evaluation.")
-                preview_path = Path(str(state.get("identity_preview_path") or ""))
-                if not preview_path.is_file():
-                    raise ValueError("Preview roll detection before evaluation so page identities can be reviewed.")
             target = self._run_batch if evaluate else self._run_inspection
             self.write_state(
                 run_id,
                 status="queued" if evaluate else "inspecting",
                 stage="Queued",
+                progress=None,
             )
             self._worker = threading.Thread(target=target, args=(run_id,), daemon=True)
             self._worker.start()
@@ -1745,6 +1812,15 @@ class RunStore:
             self._worker = threading.Thread(target=self._run_identity_preview, args=(run_id,), daemon=True)
             self._worker.start()
 
+    def assign_source(self, run_id: str, source_index: int, roll_no: str, **options: Any) -> None:
+        with self._worker_lock, self._state_lock:
+            if self._worker and self._worker.is_alive():
+                raise ValueError("Wait for matching to finish before correcting page ownership.")
+            state = self.read_state(run_id)
+            if not state.get("parse_index_path"):
+                raise ValueError("Match sheets before assigning page ownership.")
+            assign_source_page(state["parse_dir"], source_index, roll_no, reviewer="professor-ui", **options)
+
     def restart_evaluation(self, run_id: str) -> None:
         """Archive prior evaluation output and reuse immutable inspection artifacts."""
         with self._worker_lock:
@@ -1755,9 +1831,6 @@ class RunStore:
             parsed_root = run_dir / "parsed"
             if not state.get("parse_index_path") or not parsed_root.is_dir():
                 raise ValueError("There is no completed evaluation to re-run.")
-            preview_path = Path(str(state.get("identity_preview_path") or ""))
-            if not preview_path.is_file():
-                raise ValueError("Refresh the roll detection preview before re-running evaluation.")
             archive_root = run_dir / "history"
             archive_root.mkdir(parents=True, exist_ok=True)
             archive_name = "parsed_" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
@@ -1837,55 +1910,78 @@ class RunStore:
                 error=index["error"],
             )
 
+    def _read_identity_pages(self, run_id: str, backend: object, backend_state: dict,
+                             pages: dict[int, AlignedPage], unavailable: dict[int, str]) -> dict[int, dict]:
+        state = self.read_state(run_id)
+        inputs = state["inputs"]
+        run_dir = self.run_dir(run_id)
+        manifest = load_manifest(inputs["manifest_path"])
+        students = load_students(inputs["students_path"]) if inputs.get("students_path") else None
+        valid_rolls = set(students) if students else None
+        inventory = self.inspection_index(run_id)
+        dpi = float(inventory["dpi"])
+        context = identity_cache.identity_context(inputs, backend_state, dpi)
+        preview_path = run_dir / "identity_preview" / "index.json"
+        preview = {
+            "version": 2, "status": "running", "created_at": _now(),
+            "context": context, "policy": "literal identity evidence; ownership requires matching and review",
+            "counts": {}, "pages": [], "cache_hits": 0, "ocr_pages": 0,
+        }
+        inspection.write_json_atomic(preview_path, preview)
+        self.write_state(run_id, identity_preview_path=str(preview_path), roll_ocr=backend_state)
+        identities = {}
+        for record in inventory["pages"]:
+            source_index = int(record["source_index"])
+            aligned = pages.get(source_index)
+            if aligned is None:
+                row = {"source_index": source_index, "status": "unavailable",
+                       "reason": unavailable.get(source_index)}
+            else:
+                image_hash = inspection.fingerprint(run_dir / record["aligned"])
+                row = identity_cache.load_page_evidence(
+                    run_dir, source_index, aligned.page_index, image_hash, context,
+                )
+                if row is None:
+                    kind, roll_no, program, confidence, payload, flags = _page_identity(
+                        aligned, manifest, dpi,
+                        run_dir / "identity_preview" / f"source_{source_index:04d}", backend, valid_rolls,
+                    )
+                    row = {
+                        "source_index": source_index, "sheet_page": aligned.page_index,
+                        "identity_kind": kind, "literal_roll_no": roll_no, "program": program,
+                        "confidence": confidence, "roster_member": bool(valid_rolls and roll_no in valid_rolls),
+                        "status": _identity_preview_status(roll_no, confidence, flags),
+                        "review_flags": flags, "identity": identity_cache.relative_evidence(payload, run_dir),
+                    }
+                    identity_cache.save_page_evidence(run_dir, row, image_hash, context)
+                    preview["ocr_pages"] += 1
+                else:
+                    preview["cache_hits"] += 1
+                identities[source_index] = {
+                    **row, "identity": identity_cache.absolute_evidence(row.get("identity"), run_dir),
+                }
+            preview["pages"].append(row)
+            _refresh_identity_preview_counts(preview)
+            inspection.write_json_atomic(preview_path, preview)
+            self.write_state(
+                run_id, stage=f"Reading rolls: {source_index}/{inventory['total']}",
+                progress={"phase": "reading_rolls", "processed": source_index, "total": inventory["total"],
+                          "reused": preview["cache_hits"], "ocr_pages": preview["ocr_pages"]},
+            )
+        preview["status"] = "completed"
+        inspection.write_json_atomic(preview_path, preview)
+        return identities
+
     def _run_identity_preview(self, run_id: str) -> None:
         """Produce review evidence only; this cannot assign page ownership."""
         try:
             state = self.read_state(run_id)
-            inputs = state["inputs"]
             run_dir = self.run_dir(run_id)
-            manifest = load_manifest(inputs["manifest_path"])
-            students = load_students(inputs["students_path"]) if inputs.get("students_path") else None
-            valid_rolls = set(students) if students else None
             backend, backend_state = _require_ui_roll_ocr_backend()
             self.write_state(run_id, roll_ocr=backend_state, stage="Loading inspected pages for roll preview")
             pages, unavailable = _load_inspected_pages(run_dir)
-            total = len(pages) + len(unavailable)
-            rows: list[dict[str, Any]] = []
-            preview_root = run_dir / "identity_preview"
-            for source_index in range(1, total + 1):
-                aligned = pages.get(source_index)
-                if aligned is None:
-                    rows.append({"source_index": source_index, "status": "unavailable", "reason": unavailable.get(source_index)})
-                    continue
-                identity_dir = preview_root / f"source_{source_index:04d}"
-                kind, roll_no, program, confidence, payload, flags = _page_identity(
-                    aligned, manifest, 200.0, identity_dir, backend, valid_rolls,
-                )
-                status = _identity_preview_status(roll_no, confidence, flags)
-                rows.append({
-                    "source_index": source_index,
-                    "sheet_page": aligned.page_index,
-                    "identity_kind": kind,
-                    "literal_roll_no": roll_no,
-                    "program": program,
-                    "confidence": confidence,
-                    "roster_member": bool(valid_rolls is not None and roll_no in valid_rolls),
-                    "status": status,
-                    "review_flags": flags,
-                    "identity": _relative_identity_payload(payload, run_dir),
-                })
-                self.write_state(run_id, stage=f"Previewing roll detection: {source_index}/{total}")
-            preview = {
-                "version": 1,
-                "status": "completed",
-                "created_at": _now(),
-                "policy": "preview-only; literal identity reads do not group pages or change roster records",
-                "counts": {},
-                "pages": rows,
-            }
-            _refresh_identity_preview_counts(preview)
-            preview_path = preview_root / "index.json"
-            _write_json(preview_path, preview)
+            self._read_identity_pages(run_id, backend, backend_state, pages, unavailable)
+            preview_path = run_dir / "identity_preview" / "index.json"
             existing_evaluation = bool(state.get("parse_index_path"))
             self.write_state(
                 run_id,
@@ -1914,6 +2010,10 @@ class RunStore:
             self.write_state(run_id, roll_ocr=roll_ocr_state)
             self.write_state(run_id, stage="Loading inspected aligned pages")
             prealigned_pages, prealignment_errors = _load_inspected_pages(run_dir)
+            precomputed_identities = self._read_identity_pages(
+                run_id, roll_ocr_backend, roll_ocr_state, prealigned_pages, prealignment_errors,
+            )
+            self.write_state(run_id, stage="Matching sheets from saved roll evidence")
 
             def update_progress(progress: dict[str, Any]) -> None:
                 phase = str(progress.get("phase") or "")
@@ -1921,7 +2021,7 @@ class RunStore:
                 total = int(progress.get("total") or 0)
                 errors = int(progress.get("errors") or 0)
                 if phase == "reading_pages":
-                    stage = f"Reading inspected page {processed}/{total}" if total else f"Reading page {processed}"
+                    stage = f"Matching inspected page {processed}/{total}" if total else f"Matching page {processed}"
                 else:
                     stage = f"Writing student bundle {processed}/{total}" if total else "Writing student bundles"
                 if errors:
@@ -1942,6 +2042,7 @@ class RunStore:
                 progress_callback=update_progress,
                 prealigned_pages=prealigned_pages,
                 prealignment_errors=prealignment_errors,
+                precomputed_identities=precomputed_identities,
             )
             parse_dir = index_path.parent
             self.write_state(run_id, stage="Preparing review dashboard")
@@ -1982,10 +2083,28 @@ class SmartOmrUiHandler(BaseHTTPRequestHandler):
     def log_message(self, format: str, *args: Any) -> None:  # noqa: A003
         sys.stderr.write("SmartOMR UI: " + (format % args) + "\n")
 
+    def _send_json(self, payload: dict[str, Any], status: HTTPStatus = HTTPStatus.OK) -> None:
+        data = json.dumps(payload).encode("utf-8")
+        self.send_response(status.value)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
     def _send_html(self, title: str, body: str, *, status: HTTPStatus = HTTPStatus.OK, refresh: int | None = None) -> None:
+        if getattr(self, "_view_revision", None):
+            endpoint, revision = self._view_revision
+            body += (
+                f'<div id="review-sync" data-endpoint="{html.escape(endpoint)}" data-revision="{revision}" '
+                'class="review-sync" role="status" hidden><span></span> '
+                '<button type="button" class="secondary">Refresh</button></div>'
+                '<script src="/static/review_sync.js" defer></script>'
+            )
         payload = _html_page(title, body, refresh_seconds=refresh)
         self.send_response(status.value)
         self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
         self.send_header("Content-Length", str(len(payload)))
         self.end_headers()
         self.wfile.write(payload)
@@ -2002,12 +2121,29 @@ class SmartOmrUiHandler(BaseHTTPRequestHandler):
         self._send_html("Bad Request", f"<h1>Bad Request</h1><p>{html.escape(message)}</p>", status=HTTPStatus.BAD_REQUEST)
 
     def do_GET(self) -> None:  # noqa: N802
+        path = urllib.parse.urlparse(self.path).path
+        if path in {"/", "/review-state.json"} or re.fullmatch(
+            r"/runs/[^/]+(?:/pages|/review|/email|/inspection.json|/review-state.json|/students/[^/]+)?", path
+        ):
+            with self.store._review_lock:
+                self._handle_get()
+        else:
+            self._handle_get()
+
+    def _handle_get(self) -> None:
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
         query = urllib.parse.parse_qs(parsed.query)
+        self._view_revision = None
         try:
+            if path == "/" or re.fullmatch(r"/runs/[^/]+(?:/review|/email|/students/[^/]+)?", path):
+                run_id = path.split("/")[2] if path.startswith("/runs/") else None
+                endpoint = f"/runs/{run_id}/review-state.json" if run_id else "/review-state.json"
+                self._view_revision = (endpoint, self._review_revision(run_id))
             if path == "/":
                 self._page_runs()
+            elif path == "/review-state.json":
+                self._send_json({"revision": self._review_revision()})
             elif path == "/new":
                 self._page_new()
             elif path == "/generate":
@@ -2025,7 +2161,13 @@ class SmartOmrUiHandler(BaseHTTPRequestHandler):
                     self.store.inspection_index(parts[1])
                     self._send_html("Source Pages", inspection_body(state))
                 elif len(parts) == 3 and parts[2] == "inspection.json":
-                    self._inspection_json(parts[1])
+                    self._inspection_json(parts[1], query)
+                elif len(parts) == 3 and parts[2] == "review-state.json":
+                    state = self.store.read_state(parts[1])
+                    index = self._current_review(state)
+                    self._send_json({"revision": self._review_revision(parts[1]),
+                                     "summary": _review_summary(index) if index is not None else {},
+                                     "status": state.get("status")})
                 elif len(parts) == 3 and parts[2] == "identity-asset":
                     self._identity_asset(parts[1], query)
                 elif len(parts) == 5 and parts[2] == "pages":
@@ -2060,6 +2202,13 @@ class SmartOmrUiHandler(BaseHTTPRequestHandler):
             self._send_html("Error", body, status=HTTPStatus.INTERNAL_SERVER_ERROR)
 
     def do_POST(self) -> None:  # noqa: N802
+        if re.search(r"/(students/|unmatched/|suggestions/|pages/\d+/assign|email/prepare)", self.path):
+            with self.store._review_lock:
+                self._handle_post()
+        else:
+            self._handle_post()
+
+    def _handle_post(self) -> None:
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
         try:
@@ -2071,15 +2220,17 @@ class SmartOmrUiHandler(BaseHTTPRequestHandler):
                 parts = [part for part in path.split("/") if part]
                 if len(parts) == 3 and parts[2] in {"inspect", "evaluate"}:
                     self.store.start_run(parts[1], evaluate=parts[2] == "evaluate")
-                    self._redirect(f"/runs/{parts[1]}/pages")
+                    self._redirect(f"/runs/{parts[1]}/pages" + ("?matching=1" if parts[2] == "evaluate" else ""))
                 elif len(parts) == 3 and parts[2] == "identity-preview":
                     self.store.start_identity_preview(parts[1])
                     self._redirect(f"/runs/{parts[1]}/pages")
                 elif len(parts) == 3 and parts[2] == "re-evaluate":
                     self.store.restart_evaluation(parts[1])
-                    self._redirect(f"/runs/{parts[1]}/pages")
+                    self._redirect(f"/runs/{parts[1]}/pages?matching=1")
                 elif len(parts) == 5 and parts[2] == "pages" and parts[4] == "page-index":
                     self._assign_page_index(parts[1], int(parts[3]))
+                elif len(parts) == 5 and parts[2] == "pages" and parts[4] == "assign":
+                    self._assign_source_page(parts[1], int(parts[3]))
                 elif len(parts) == 5 and parts[2] == "students" and parts[4] in {"verify", "hold", "reject"}:
                     self._student_decision(parts[1], urllib.parse.unquote(parts[3]), parts[4])
                 elif len(parts) == 5 and parts[2] == "students" and parts[4] == "marks":
@@ -2107,7 +2258,10 @@ class SmartOmrUiHandler(BaseHTTPRequestHandler):
             else:
                 self._not_found()
         except Exception as exc:
-            self._bad_request(str(exc))
+            if self.headers.get("Accept") == "application/json":
+                self._send_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
+            else:
+                self._bad_request(str(exc))
 
     def _create_run(self) -> None:
         staging_dir = self.store.config.runs_dir / "_upload_staging" / uuid.uuid4().hex
@@ -2120,6 +2274,15 @@ class SmartOmrUiHandler(BaseHTTPRequestHandler):
             )
             exam_id = str(fields.get("exam_id") or "").strip()
             state = self.store.create_run(exam_id, files, fields)
+            try:
+                self.store.start_run(state["run_id"])
+            except Exception as exc:
+                self.store.write_state(
+                    state["run_id"],
+                    status="inspection_interrupted",
+                    stage="Inspection could not start",
+                    error=f"{type(exc).__name__}: {exc}",
+                )
         finally:
             shutil.rmtree(staging_dir, ignore_errors=True)
         self._redirect(f"/runs/{state['run_id']}/pages")
@@ -2153,20 +2316,80 @@ class SmartOmrUiHandler(BaseHTTPRequestHandler):
             or "application/octet-stream",
         )
 
-    def _inspection_json(self, run_id: str) -> None:
+    def _current_review(self, state: dict[str, Any]) -> dict[str, Any] | None:
+        if not state.get("parse_index_path"):
+            return None
+        return load_or_initialize_verified_index(Path(state["parse_dir"]))[0]
+
+    def _review_revision(self, run_id: str | None = None) -> str:
+        states = [self.store.read_state(run_id)] if run_id else self.store.list_runs()
+        stamps = []
+        for state in states:
+            run_dir = self.store.run_dir(state["run_id"])
+            paths = [run_dir / RUN_STATE_NAME]
+            if state.get("parse_dir"):
+                parse_dir = Path(state["parse_dir"])
+                paths.extend([parse_dir / "verified_index.json", parse_dir / "parse_index.json",
+                              parse_dir / "email_release" / EMAIL_QUEUE_CSV,
+                              parse_dir / "email_release" / EMAIL_LOG_CSV])
+            for path in paths:
+                try:
+                    stat = path.stat()
+                    stamps.append((str(path), stat.st_mtime_ns, stat.st_size))
+                except FileNotFoundError:
+                    stamps.append((str(path), None, None))
+        return hashlib.sha256(json.dumps(stamps, sort_keys=True).encode()).hexdigest()
+
+    def _inspection_json(self, run_id: str, query: dict[str, list[str]] | None = None) -> None:
         state = self.store.read_state(run_id)
         index = self.store.inspection_index(run_id)
         preview_path = Path(str(state.get("identity_preview_path") or ""))
         preview = _read_json(preview_path) if preview_path.is_file() else None
         if preview is not None:
             _refresh_identity_preview_counts(preview)
+            selected_source = (query or {}).get("source")
+            if selected_source:
+                source_index = max(1, min(int(index["total"]), int(selected_source[0])))
+                preview["pages"] = [
+                    row if int(row["source_index"]) == source_index else
+                    {key: value for key, value in row.items() if key != "identity"}
+                    for row in preview.get("pages", [])
+                ]
         index["run_status"] = state["status"]
         index["stage"] = state.get("stage")
         index["run_error"] = state.get("error")
         index["evaluated"] = bool(state.get("parse_index_path"))
         index["identity_preview"] = preview
+        index["operation_progress"] = state.get("progress")
+        index["can_assign"] = bool(index["evaluated"] and state["status"] == "completed")
+        index["review_rolls"] = []
+        if index["evaluated"]:
+            with self.store._state_lock:
+                verified, _path = load_or_initialize_verified_index(Path(state["parse_dir"]))
+            index["review_summary"] = _review_summary(verified)
+            ownership = {}
+            for student in verified.get("students", []):
+                for page in selected_student_pages(student):
+                    ownership[int(page["source_index"])] = {
+                        "roll_no": student["roll_no"], "sheet_page": page["page"],
+                        "status": student["status"], "student_name": student.get("student_name"),
+                    }
+            unmatched = {int(page["source_index"]): page for page in verified.get("unmatched_pages", [])}
+            for page in index["pages"]:
+                source = int(page["source_index"])
+                page["assignment"] = ownership.get(source) or {
+                    "status": unmatched.get(source, {}).get("status", "unavailable"), "roll_no": None,
+                }
+            index["review_rolls"] = [
+                {"roll_no": student["roll_no"], "name": student.get("student_name") or ""}
+                for student in verified.get("students", [])
+            ] + [
+                {"roll_no": student["roll_no"], "name": student.get("student_name") or ""}
+                for student in _missing_roster_students(verified)
+            ]
         index["can_identity_preview"] = (
-            state["status"] not in {"queued", "running", "inspecting", "identity_previewing"}
+            not index["evaluated"]
+            and state["status"] not in {"queued", "running", "inspecting", "identity_previewing"}
             and index["status"] == "completed"
             and bool(index["counts"]["aligned"] + index["counts"]["needs_review"])
         )
@@ -2176,14 +2399,10 @@ class SmartOmrUiHandler(BaseHTTPRequestHandler):
             and index["status"] == "completed"
             and bool(index["counts"]["aligned"] + index["counts"]["needs_review"])
             and not (self.store.run_dir(run_id) / "parsed").exists()
-            and preview is not None
-            and preview.get("status") == "completed"
         )
         index["can_re_evaluate"] = (
             index["evaluated"]
             and state["status"] == "completed"
-            and preview is not None
-            and preview.get("status") == "completed"
         )
         index["can_inspect"] = (
             state["status"] not in {"queued", "running", "inspecting", "identity_previewing"}
@@ -2346,6 +2565,8 @@ class SmartOmrUiHandler(BaseHTTPRequestHandler):
 
         state2, parse_dir, details, verified = self._student_details(run_id, roll_no)
         details_path = _resolve_output_path(details.get("details_path"), parse_dir)
+        if details_path.resolve() == (parse_dir / "verified_index.json").resolve():
+            raise ValueError("This student has no original parser record for training feedback; use source-page ownership correction instead")
         count, feedback_dir = _save_roll_correction_feedback(
             data_dir=self.store.config.data_dir,
             run_id=run_id,
@@ -2605,12 +2826,9 @@ class SmartOmrUiHandler(BaseHTTPRequestHandler):
             if not roll_no:
                 raise ValueError("roll number is required to assign an unmatched page")
             page_value = (form.get("page_index") or "").strip()
-            assign_unmatched_page(
-                parse_dir,
-                source_index,
-                roll_no,
+            self.store.assign_source(
+                run_id, source_index, roll_no,
                 page_index=int(page_value) if page_value else None,
-                reviewer="professor-ui",
                 note=note or "Assigned from professor UI.",
             )
         else:
@@ -2621,6 +2839,18 @@ class SmartOmrUiHandler(BaseHTTPRequestHandler):
                 reason=note or "Ignored as a stray/duplicate page from professor UI.",
             )
         self._redirect(f"/runs/{run_id}/review")
+
+    def _assign_source_page(self, run_id: str, source_index: int) -> None:
+        form = self._urlencoded_form()
+        self.store.assign_source(
+            run_id, source_index, str(form.get("roll_no") or ""),
+            page_index=int(form.get("page_index") or 0) or None,
+            replace_existing=form.get("replace_existing") == "1", note=str(form.get("note") or ""),
+        )
+        if self.headers.get("Accept") == "application/json":
+            self._send_json({"saved": True, "source_index": source_index})
+        else:
+            self._redirect(f"/runs/{run_id}/pages?page={source_index}")
 
     def _identity_suggestion_decision(self, run_id: str, candidate_id: str, action: str) -> None:
         state = self.store.read_state(run_id)
@@ -2727,23 +2957,25 @@ class SmartOmrUiHandler(BaseHTTPRequestHandler):
     def _page_runs(self) -> None:
         rows = []
         for state in self.store.list_runs():
-            summary = state.get("summary") or {}
+            current = self._current_review(state)
+            summary = _review_summary(current) if current is not None else {}
             rows.append(
                 "<tr>"
                 f"<td><a href=\"/runs/{html.escape(state['run_id'])}\">{html.escape(state.get('exam_id',''))}</a></td>"
                 f"<td>{_badge(state.get('status'))}</td>"
                 f"<td>{html.escape(str(summary.get('students','')))}</td>"
-                f"<td>{html.escape(str(summary.get('ready','')))}</td>"
+                f"<td>{html.escape(str(summary.get('verified','')))}</td>"
+                f"<td>{html.escape(str(summary.get('pending_verification','')))}</td>"
                 f"<td>{html.escape(str(summary.get('needs_review','')))}</td>"
                 f"<td>{html.escape(str(state.get('created_at','')))}</td>"
                 "</tr>"
             )
         table = """
         <table>
-          <thead><tr><th>Exam</th><th>Status</th><th>Students</th><th>Ready</th><th>Needs Review</th><th>Created</th></tr></thead>
+          <thead><tr><th>Exam</th><th>Status</th><th>Students</th><th>Manually Checked</th><th>Pending Verification</th><th>Needs Review</th><th>Created</th></tr></thead>
           <tbody>{}</tbody>
         </table>
-        """.format("".join(rows) or '<tr><td colspan="6" class="empty">No runs yet</td></tr>')
+        """.format("".join(rows) or '<tr><td colspan="7" class="empty">No runs yet</td></tr>')
         body = f"""
         <h1>Exam Runs</h1>
         <div class="actions">
@@ -2889,7 +3121,7 @@ class SmartOmrUiHandler(BaseHTTPRequestHandler):
             <div id="answer-key-table"></div>
           </section>
           <p class="muted">Upload the complete scanner PDF or one image. Every source page is inventoried and inspected before OCR or grouping starts. Uploaded answer key CSV/XLSX takes priority over the table above.</p>
-          <button type="submit">Create Inspection</button>
+          <button type="submit">Start Inspection</button>
         </form>
         <script>
         const manifestInput = document.getElementById("manifest-file");
@@ -3016,22 +3248,24 @@ class SmartOmrUiHandler(BaseHTTPRequestHandler):
         parse_dir = Path(str(state["parse_dir"]))
         index = _read_json(Path(str(state["parse_index_path"])))
         grouping_order_notice = _grouping_order_notice(index)
-        verified_by_roll: dict[str, dict[str, Any]] = {}
-        verified_path = parse_dir / "verified_index.json"
-        if verified_path.exists():
-            verified_index = _read_json(verified_path)
-            verified_by_roll = {
-                str(student.get("roll_no")): student
-                for student in verified_index.get("students", [])
-            }
+        verified_index = self._current_review(state)
+        verified_by_roll = {str(student.get("roll_no")): student for student in verified_index.get("students", [])}
+        metric_html = _review_metrics(_review_summary(verified_index))
         rows = []
-        for student in index.get("students", []):
-            details = _read_json(_resolve_output_path(student["details_path"], parse_dir))
+        students = list(index.get("students", []))
+        raw_rolls = {str(student.get("roll_no")) for student in students}
+        students.extend(student for roll, student in verified_by_roll.items() if roll not in raw_rolls)
+        for student in students:
+            details = (
+                _read_json(_resolve_output_path(student["details_path"], parse_dir))
+                if str(student.get("roll_no")) in raw_rolls else _review_created_details(student, parse_dir)
+            )
             score, total = _score(details)
             roll = str(details.get("student", {}).get("roll_no") or student.get("roll_no") or "")
             name = str(details.get("student", {}).get("name") or student.get("student_name") or "")
             email = str(details.get("student", {}).get("email") or student.get("student_email") or "")
-            flags = details.get("review_flags", [])
+            current_student = verified_by_roll.get(roll, {})
+            flags = current_student.get("review_flags", []) if current_student.get("status") != "verified" else []
             marks_cell = "" if grouping_only else f"<td>{_marks_label(details, verified_by_roll.get(roll))}</td>"
             rows.append(
                 "<tr>"
@@ -3044,7 +3278,7 @@ class SmartOmrUiHandler(BaseHTTPRequestHandler):
                 f"<td class=\"flags\">{html.escape(' | '.join(str(flag) for flag in flags[:3]))}</td>"
                 "</tr>"
             )
-        marks_action = "" if grouping_only else f'<a class="button" href="{_asset_url(state.get("marks_csv_path"))}">Download Marks CSV</a>'
+        marks_action = "" if grouping_only else f'<a class="button" href="{_asset_url(state.get("marks_csv_path"))}">Original Parser Marks CSV</a>'
         review_link = f"/runs/{html.escape(run_id)}/review"
         marks_heading = "" if grouping_only else "<th>Marks</th>"
         column_count = 6 if grouping_only else 7
@@ -3060,7 +3294,7 @@ class SmartOmrUiHandler(BaseHTTPRequestHandler):
           {marks_action}
           <a class="button secondary" href="{review_link}">{review_label}</a>
           <a class="button secondary" href="/runs/{html.escape(run_id)}/email">Email Release</a>
-          <a class="button secondary" href="{_asset_url(parse_dir / 'review_report.html')}">Open Raw Review Report</a>
+          <a class="button secondary" href="{_asset_url(parse_dir / 'review_report.html')}">Original Parser Report</a>
         </div>
         <div class="section-title"><h2>Students</h2></div>
         <table>
@@ -3078,9 +3312,6 @@ class SmartOmrUiHandler(BaseHTTPRequestHandler):
             (student for student in index.get("students", []) if str(student.get("roll_no")) == str(roll_no)),
             None,
         )
-        if student_index is None:
-            raise ValueError(f"student {roll_no} not found")
-        details = _read_json(_resolve_output_path(student_index["details_path"], parse_dir))
         verified = None
         verified_path = parse_dir / "verified_index.json"
         if verified_path.exists():
@@ -3089,6 +3320,14 @@ class SmartOmrUiHandler(BaseHTTPRequestHandler):
                 (student for student in verified_index.get("students", []) if str(student.get("roll_no")) == str(roll_no)),
                 None,
             )
+        if student_index is not None:
+            details = _read_json(_resolve_output_path(student_index["details_path"], parse_dir))
+            for key in ("pages", "sheet_pdf_path"):
+                details.setdefault(key, student_index.get(key))
+        elif verified is not None:
+            details = _review_created_details(verified, parse_dir)
+        else:
+            raise ValueError(f"student {roll_no} not found")
         return state, parse_dir, details, verified
 
     def _page_student(self, run_id: str, roll_no: str) -> None:
@@ -3099,7 +3338,8 @@ class SmartOmrUiHandler(BaseHTTPRequestHandler):
         status = verified.get("status") if verified else details.get("status")
         display_status = _professor_status(details.get("status"), status if verified else None)
         details_dir = _resolve_output_path(details.get("details_path"), parse_dir).parent
-        selection_changed = bool(verified and verified.get("manual_pages"))
+        selection_changed = _selection_changed(details, verified)
+        feedback_disabled = 'disabled title="No original parser record for this student"' if details_dir == parse_dir else ""
         current_pages = selected_student_pages(verified) if verified else list(details.get("pages", []))
         pages = []
         for page in current_pages:
@@ -3154,7 +3394,10 @@ class SmartOmrUiHandler(BaseHTTPRequestHandler):
                 f"<td>{html.escape(' | '.join(str(flag) for flag in response.get('review_flags', [])))}</td>"
                 "</tr>"
             )
-        flags = details.get("review_flags", [])
+        flags = list((verified or details).get("review_flags", []))
+        if verified and verified.get("status") == "verified":
+            flags = [f"Missing sheet page {page}" for page in verified.get("missing_pages", [])]
+        original_flags = details.get("review_flags", [])
         missing_pages = list((verified or {}).get("missing_pages", []))
         missing_note = (
             f'<span class="muted">Missing page(s) {html.escape(", ".join(str(page) for page in missing_pages))}; '
@@ -3186,20 +3429,22 @@ class SmartOmrUiHandler(BaseHTTPRequestHandler):
             )
         source_rows = "".join(
             "<tr>"
-            f"<td>Source {html.escape(str(page.get('source_index') or ''))}</td>"
+            f'<td><a href="/runs/{html.escape(run_id)}/pages?page={html.escape(str(page.get("source_index") or ""))}">Source {html.escape(str(page.get("source_index") or ""))}</a></td>'
             f"<td>{html.escape(str(page.get('page', page.get('page_index')) or ''))}</td>"
             f"<td>{html.escape(str(page.get('origin') or 'parser'))}</td>"
             "</tr>"
             for page in current_pages
         )
         marks_metric = "" if grouping_only else f'<div class="metric"><span>Marks</span><strong>{_marks_label(details, verified)}</strong></div>'
-        answers_section = "" if grouping_only else f"""
+        answers_section = "" if grouping_only else (
+            '<p class="review">Page selection changed. Original marks are not current.</p>' if selection_changed else f"""
             <div class="section-title"><h2>Answers And Marks</h2></div>
             <table>
               <thead><tr><th>Question</th><th>Type</th><th>Student Answer</th><th>Correct Answer</th><th>Marks</th><th>Status</th><th>Confidence</th><th>Notes</th></tr></thead>
               <tbody>{''.join(answer_rows) or '<tr><td colspan="8" class="empty">No objective answers found</td></tr>'}</tbody>
             </table>
         """
+        )
         edit_marks_operation = "" if grouping_only else f"""
                 <div class="operation">
                   <h3>Edit Marks</h3>
@@ -3226,6 +3471,7 @@ class SmartOmrUiHandler(BaseHTTPRequestHandler):
           <div class="actions">{decision_actions}</div>
           <div class="actions">
             <a class="button secondary" href="/runs/{html.escape(run_id)}">Back to Exam</a>
+            <a class="button secondary" href="/runs/{html.escape(run_id)}/review">Review Sheets</a>
             {pdf_link}
           </div>
         </div>
@@ -3250,7 +3496,7 @@ class SmartOmrUiHandler(BaseHTTPRequestHandler):
               <div class="operation-grid">
                 {edit_marks_operation}
                 <div class="operation">
-                  <h3>Correct Roll Mapping</h3>
+                  <h3>Roll OCR Training Feedback</h3>
                   <form method="post" action="/runs/{html.escape(run_id)}/students/{urllib.parse.quote(roll_no)}/correct-roll">
                     <div class="form-grid">
                       <div><label>Correct Roll No</label><input name="correct_roll_no" placeholder="2023118" required></div>
@@ -3258,7 +3504,7 @@ class SmartOmrUiHandler(BaseHTTPRequestHandler):
                       <div><label>Page</label><input name="page_index" type="number" min="1" value="1" required></div>
                       <div class="wide"><label>Note</label><input name="note" placeholder="Model read wrong roll"></div>
                     </div>
-                    <p><button type="submit">Save Training Feedback</button></p>
+                    <p><button type="submit" {feedback_disabled}>Save Training Feedback</button></p>
                   </form>
                 </div>
                 <div class="operation">
@@ -3285,10 +3531,11 @@ class SmartOmrUiHandler(BaseHTTPRequestHandler):
               </div>
             </section>
             <section class="band">
-              <h2>Source Pages</h2>
+              <details><summary>Original Parser Observations</summary>
+              <p>{'<br>'.join(html.escape(str(flag)) for flag in original_flags) or 'No original flags.'}</p>
               <table><thead><tr><th>Source</th><th>Page</th><th>Used</th></tr></thead><tbody>
               {''.join(f"<tr><td>{html.escape(str(src.get('source_index')))}</td><td>{html.escape(str(src.get('page_index')))}</td><td>{html.escape(str(src.get('used')))}</td></tr>" for src in details.get('source_pages', []))}
-              </tbody></table>
+              </tbody></table></details>
             </section>
           </aside>
         </div>
@@ -3315,7 +3562,7 @@ class SmartOmrUiHandler(BaseHTTPRequestHandler):
             missing = ", ".join(str(page) for page in student.get("missing_pages", []))
             decisions = student.get("decision_log", [])
             latest_note = str(decisions[-1].get("note") or "") if decisions else ""
-            marks_cell = "" if grouping_only else f"<td>{_fmt_num(score)} / {_fmt_num(total)}</td>"
+            marks_cell = "" if grouping_only else f"<td>{_marks_label(student, student)}</td>"
             rows.append(
                 "<tr>"
                 f"<td><a href=\"/runs/{html.escape(run_id)}/students/{urllib.parse.quote(roll)}\">{html.escape(roll)}</a></td>"
@@ -3328,10 +3575,13 @@ class SmartOmrUiHandler(BaseHTTPRequestHandler):
                 "</tr>"
             )
         unmatched_rows = []
+        assigned_sources = {page.get("source_index") for student in index.get("students", []) for page in selected_student_pages(student)}
         for page in index.get("unmatched_pages", []):
             source_index = int(page.get("source_index") or 0)
             page_index = page.get("page_index") or ""
             page_status = str(page.get("status") or "needs_review")
+            if page_status != "needs_review" or source_index in assigned_sources:
+                continue
             actions = ""
             if page_status == "needs_review":
                 actions = f"""
@@ -3353,7 +3603,7 @@ class SmartOmrUiHandler(BaseHTTPRequestHandler):
                 actions = html.escape(str(page.get("assigned_to_roll_no") or page_status))
             unmatched_rows.append(
                 "<tr>"
-                f"<td>{source_index}</td>"
+                f'<td><a href="/runs/{html.escape(run_id)}/pages?page={source_index}">Source {source_index}</a></td>'
                 f"<td>{html.escape(str(page_index))}</td>"
                 f"<td>{_badge(page_status)}</td>"
                 f"<td class=\"flags\">{html.escape(' | '.join(str(flag) for flag in page.get('review_flags', [])))}</td>"
@@ -3363,6 +3613,8 @@ class SmartOmrUiHandler(BaseHTTPRequestHandler):
             )
         page_error_rows = []
         for error in index.get("page_errors", []):
+            if error.get("status") == "ignored" or error.get("source_index") in assigned_sources:
+                continue
             page_error_rows.append(
                 "<tr>"
                 f"<td>{html.escape(str(error.get('source_index') or ''))}</td>"
@@ -3374,7 +3626,7 @@ class SmartOmrUiHandler(BaseHTTPRequestHandler):
             )
         missing_roster_rows = []
         reconciliation = index.get("roster_reconciliation") or {}
-        for student in reconciliation.get("missing_students", []):
+        for student in _missing_roster_students(index):
             missing_roster_rows.append(
                 "<tr>"
                 f"<td>{html.escape(str(student.get('roll_no') or ''))}</td>"
@@ -3409,7 +3661,9 @@ class SmartOmrUiHandler(BaseHTTPRequestHandler):
         review_title = "Sheet Matching Review" if grouping_only else "Review Cases"
         body = f"""
         <h1>{review_title}</h1>
-        <div class="actions band"><a class="button secondary" href="/runs/{html.escape(run_id)}">Back to Exam</a></div>
+        {_review_metrics(_review_summary(index))}
+        <div class="actions band"><a class="button secondary" href="/runs/{html.escape(run_id)}">Back to Exam</a>
+        <a class="button secondary" href="/runs/{html.escape(run_id)}/pages">Inspect Source Pages</a></div>
         {grouping_order_notice}
         <datalist id="student-rolls">{roll_options}</datalist>
         {suggestion_html}
@@ -3450,6 +3704,7 @@ class SmartOmrUiHandler(BaseHTTPRequestHandler):
         )
         body = f"""
         <h1>Email Release</h1>
+        {_review_metrics(_review_summary(self._current_review(state) or {}))}
         <div class="actions band"><a class="button secondary" href="/runs/{html.escape(run_id)}">Back to Exam</a></div>
         <section class="band">
           <h2>Prepare Queue</h2>
@@ -3534,8 +3789,8 @@ class SmartOmrUiHandler(BaseHTTPRequestHandler):
             queue_column_count = 5 if grouping_only else 6
             body += f"""
             <div class="grid">
-              <div class="metric"><span>Queued</span><strong>{len(queued)}</strong></div>
-              <div class="metric"><span>Skipped</span><strong>{len(skipped)}</strong></div>
+              <div class="metric"><span>Queued At Preparation</span><strong>{len(queued)}</strong></div>
+              <div class="metric"><span>Skipped At Preparation</span><strong>{len(skipped)}</strong></div>
             </div>
             <div class="actions band">
               <a class="button" href="{_asset_url(queue_path)}">Download Email Queue</a>

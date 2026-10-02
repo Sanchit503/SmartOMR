@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 
 import pymupdf
+import pytest
 from PIL import Image, ImageDraw
 
 from omr.contracts.geometry import mm_to_px, px_per_mm
@@ -404,7 +405,8 @@ def test_identity_grouping_refuses_duplicate_continuation_claims():
     assert all("duplicate page-2 ownership claim" in record.review_flags[-1] for record in unmatched)
 
 
-def test_batch_consumes_inspected_alignment_without_realigning(tmp_path: Path, monkeypatch):
+@pytest.mark.parametrize("reuse_identity", [False, True])
+def test_batch_consumes_inspected_alignment_without_realigning(tmp_path: Path, monkeypatch, reuse_identity):
     result = generate_exam(
         ExamConfig(
             exam_id="PREALIGNED_TEST",
@@ -428,6 +430,17 @@ def test_batch_consumes_inspected_alignment_without_realigning(tmp_path: Path, m
         "omr.workflows.batch.align_scan_page",
         lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("must not realign")),
     )
+    identities = None
+    if reuse_identity:
+        monkeypatch.setattr(
+            "omr.workflows.batch._page_identity",
+            lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("must not repeat OCR")),
+        )
+        identities = {1: {
+            "source_index": 1, "sheet_page": 1, "identity_kind": "bubbled",
+            "literal_roll_no": None, "program": None, "confidence": "low",
+            "identity": {}, "review_flags": [],
+        }}
     _students, index_path = parse_exam_bundle(
         result["pdf_path"],
         result["manifest_path"],
@@ -435,6 +448,7 @@ def test_batch_consumes_inspected_alignment_without_realigning(tmp_path: Path, m
         dpi=DPI,
         prealigned_pages={1: inspected},
         prealignment_errors={},
+        precomputed_identities=identities,
     )
 
     index = json.loads(index_path.read_text(encoding="utf-8"))

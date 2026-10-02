@@ -99,6 +99,16 @@ main:has(#inspection) { max-width: none; padding: 0; }
 .identity-cell strong, .identity-cell small { display: block; overflow-wrap: anywhere; }
 .identity-cell small { color: #66706b; font-size: 10px; margin-top: 2px; }
 .identity-observations { margin-bottom: 14px; }
+.workflow-steps { margin: 0; padding: 10px 24px 10px 44px; display: flex; flex-wrap: wrap; gap: 12px 40px; border-bottom: 1px solid #dee3e1; color: #707975; font-size: 12px; }
+.workflow-steps li[aria-current="step"] { color: #245641; font-weight: 600; }
+#identity-preview-summary { background: #f3f6f5; color: #38463d; }
+#identity-preview-summary.has-issues { background: #fff6e6; color: #8c641f; }
+.ownership-section { padding: 0 0 18px; border-bottom: 1px solid #dee3e1; grid-column: 1 / -1; }
+.ownership-section input { width: 100%; }
+.ownership-section label { margin-top: 10px; }
+.ownership-section .replace-choice { display: flex; align-items: center; gap: 8px; line-height: 1.4; }
+#inspection .replace-choice input { width: 16px; height: 16px; flex: 0 0 16px; }
+.ownership-section button { margin-top: 12px; }
 .source-metadata { margin-top: 26px; border-top: 1px solid #e5eae6; }
 .source-metadata details { font-size: 11px; color: #7a837d; }
 .source-metadata summary { cursor: pointer; }

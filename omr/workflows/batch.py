@@ -1924,6 +1924,7 @@ def parse_exam_bundle(
     progress_callback: Callable[[dict[str, Any]], None] | None = None,
     prealigned_pages: dict[int, AlignedPage] | None = None,
     prealignment_errors: dict[int, str] | None = None,
+    precomputed_identities: Mapping[int, dict[str, Any]] | None = None,
 ) -> tuple[list[dict[str, Any]], Path]:
     if min_group_confidence not in CONFIDENCE_RANK:
         raise ValueError(f"unknown minimum group confidence: {min_group_confidence}")
@@ -1987,14 +1988,28 @@ def parse_exam_bundle(
                 aligned = align_scan_page(raw_page, manifest, dpi, source_index=source_counter)
             _save_aligned_page(aligned, identity_dir)
 
-            identity_kind, roll_no, program, confidence, identity_payload, flags = _page_identity(
-                aligned,
-                manifest,
-                dpi,
-                identity_dir,
-                ocr_backend,
-                valid_rolls,
-            )
+            cached_identity = (precomputed_identities or {}).get(source_counter)
+            if cached_identity is not None:
+                if (
+                    cached_identity.get("source_index") != source_counter
+                    or cached_identity.get("sheet_page") != aligned.page_index
+                ):
+                    raise ValueError("precomputed identity does not match the inspected source page")
+                identity_kind = str(cached_identity["identity_kind"])
+                roll_no = cached_identity.get("literal_roll_no")
+                program = cached_identity.get("program")
+                confidence = str(cached_identity["confidence"])
+                identity_payload = cached_identity.get("identity")
+                flags = list(cached_identity.get("review_flags") or [])
+            else:
+                identity_kind, roll_no, program, confidence, identity_payload, flags = _page_identity(
+                    aligned,
+                    manifest,
+                    dpi,
+                    identity_dir,
+                    ocr_backend,
+                    valid_rolls,
+                )
         except Exception as exc:
             page_errors.append(_write_page_error(root, scan_path, source_counter, exc))
             if progress_callback is not None:

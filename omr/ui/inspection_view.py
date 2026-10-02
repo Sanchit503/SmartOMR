@@ -18,7 +18,7 @@ def inspection_body(state: dict) -> str:
     exam_id = html.escape(state["exam_id"])
     source_url = "/artifact?path=" + urllib.parse.quote(state["inputs"]["scan_path"])
     grouping_only = bool(state.get("inputs", {}).get("grouping_only"))
-    process_label = "Match &amp; Segregate Sheets" if grouping_only else "Run OCR, Grouping &amp; Grading"
+    process_label = "Read Rolls &amp; Match Sheets" if grouping_only else "Read Rolls, Match &amp; Grade"
     review_label = "Sheet Matching Review" if grouping_only else "Review Cases"
     return f"""
     <link rel="stylesheet" href="/static/inspection.css">
@@ -29,12 +29,17 @@ def inspection_body(state: dict) -> str:
         <div class="run-actions">
           <a class="quiet-command" href="{source_url}">{_icon('download')}Source file</a>
           <form id="inspect-form" method="post" action="/runs/{run_id}/inspect" hidden><button class="secondary" type="submit">Resume Inspection</button></form>
-          <form id="identity-preview-form" method="post" action="/runs/{run_id}/identity-preview" hidden><button class="secondary" type="submit">Preview Roll Detection</button></form>
+          <form id="identity-preview-form" method="post" action="/runs/{run_id}/identity-preview" hidden><button class="secondary" type="submit">Read Rolls Only</button></form>
           <form id="evaluate-form" method="post" action="/runs/{run_id}/evaluate" hidden><button type="submit">{process_label}{_icon('arrow-right')}</button></form>
           <form id="re-evaluate-form" method="post" action="/runs/{run_id}/re-evaluate" hidden><button class="secondary" type="submit">Re-run Grouping</button></form>
           <a id="review-link" class="button" href="/runs/{run_id}/review" hidden>{review_label}{_icon('arrow-right')}</a>
         </div>
       </div>
+      <ol class="workflow-steps" aria-label="Run stages">
+        <li id="step-inspect">Inspect Pages</li>
+        <li id="step-match">Read Rolls &amp; Match</li>
+        <li id="step-review">Review Sheets</li>
+      </ol>
       <div class="inspection-summary">
         <div class="count"><strong id="total-count">-</strong><span>source pages</span></div>
         <div class="count"><i class="status-dot aligned"></i><strong id="aligned-count">-</strong><span>aligned</span></div>
@@ -45,6 +50,7 @@ def inspection_body(state: dict) -> str:
       <div id="connection-error" class="inspection-alert" role="alert" hidden></div>
       <div id="run-error" class="inspection-alert" role="alert" hidden></div>
       <div id="identity-preview-summary" class="inspection-alert" hidden></div>
+      <div id="matching-summary" class="inspection-summary" role="status" hidden></div>
       <div class="inspection-workspace">
         <aside class="source-sidebar" aria-label="Source pages">
           <div class="source-filters">
@@ -60,11 +66,16 @@ def inspection_body(state: dict) -> str:
                 <option value="failed">Failed</option>
                 <option value="waiting">Waiting / processing</option>
               </optgroup>
-              <optgroup label="Roll preview">
+              <optgroup label="Roll evidence">
                 <option value="identity_review">Identity needs review</option>
                 <option value="identity_undetected">Roll not detected</option>
                 <option value="identity_detected">Identity detected</option>
                 <option value="identity_unavailable">Identity unavailable</option>
+              </optgroup>
+              <optgroup label="Sheet matching">
+                <option value="matching_unmatched">Unmatched pages</option>
+                <option value="matching_review">Student needs review</option>
+                <option value="matching_verified">Manually checked</option>
               </optgroup>
             </select>
           </div>
@@ -116,7 +127,7 @@ def inspection_body(state: dict) -> str:
           </dl>
           <h3>Observations</h3>
           <ul id="observations" class="observations"><li>Inspection pending</li></ul>
-          <h3>Roll preview</h3>
+          <h3>Roll evidence</h3>
           <dl class="evidence-list roll-preview">
             <div><dt>Literal roll</dt><dd id="identity-roll">Not previewed</dd></div>
             <div><dt>Program</dt><dd id="identity-program">-</dd></div>
@@ -125,7 +136,26 @@ def inspection_body(state: dict) -> str:
             <div><dt>Read from</dt><dd id="identity-kind">-</dd></div>
           </dl>
           <div id="identity-cells" class="identity-cells" aria-label="Roll digit evidence"></div>
-          <ul id="identity-observations" class="observations identity-observations"><li>Run Preview Roll Detection to inspect identity evidence.</li></ul>
+          <ul id="identity-observations" class="observations identity-observations"><li>Roll detection pending</li></ul>
+          <section class="ownership-section" id="ownership-section" hidden>
+            <h3>Page Ownership</h3>
+            <dl class="evidence-list"><div><dt>Assigned roll</dt><dd id="assigned-roll">Unmatched</dd></div><div><dt>Review status</dt><dd id="assignment-status">-</dd></div></dl>
+            <a id="assigned-student-link" class="quiet-command" hidden>Open Student Sheet {_icon('arrow-right')}</a>
+            <form id="assignment-form" method="post" hidden>
+              <h3>Correct Ownership</h3>
+              <div id="assignment-feedback" role="status" hidden></div>
+              <label for="assignment-roll">Student roll</label>
+              <input id="assignment-roll" name="roll_no" list="review-rolls" required autocomplete="off">
+              <datalist id="review-rolls"></datalist>
+              <label for="assignment-page">Sheet page</label>
+              <input id="assignment-page" name="page_index" type="number" min="1" required>
+              <label for="assignment-note">Review note</label>
+              <input id="assignment-note" name="note" required>
+              <label class="replace-choice"><input id="assignment-replace" name="replace_existing" type="checkbox" value="1">Replace existing page</label>
+              <button type="submit">Save Assignment {_icon('arrow-right')}</button>
+            </form>
+            <button id="next-unresolved" class="secondary" type="button" hidden>Next Unresolved {_icon('arrow-right')}</button>
+          </section>
           <form id="page-index-form" class="page-index-form" method="post" hidden>
             <h3>Correct sheet page</h3>
             <p>Use this only after visually checking the page. Corner and orientation alignment will run again.</p>

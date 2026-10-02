@@ -11,14 +11,19 @@ import argparse
 import csv
 import html
 import json
+import os
+import re
 import shutil
 import sys
+import tempfile
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from PIL import Image
 
+from omr.io.csv import normalize_roll
 from omr.workflows.parse import _json_path
 from omr.workflows.identity_resolution import resolution_digest
 
@@ -64,12 +69,35 @@ def _now() -> str:
 
 
 def _load_json(path: Path) -> dict[str, Any]:
-    return json.loads(path.read_text(encoding="utf-8"))
+    for attempt in range(5):
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except PermissionError:
+            if attempt == 4:
+                raise
+            time.sleep(.01 * (attempt + 1))
+    raise AssertionError("unreachable")
 
 
 def _write_json(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent, delete=False) as handle:
+            temporary = Path(handle.name)
+            json.dump(payload, handle, indent=2)
+        # A Windows reader or antivirus can briefly lock the destination.
+        for attempt in range(5):
+            try:
+                os.replace(temporary, path)
+                break
+            except PermissionError:
+                if attempt == 4:
+                    raise
+                time.sleep(.01 * (attempt + 1))
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
 
 
 def _parse_index_path(parsed_dir: str | Path) -> Path:
@@ -788,7 +816,8 @@ def load_or_initialize_verified_index(parsed_dir: str | Path) -> tuple[dict[str,
             resolution_path = _resolve_path(parse_index.get("identity_resolution_path"), parsed_root)
             index["identity_resolution_path"] = _relative_path(resolution_path, parsed_root)
             index["identity_resolution_digest"] = (parse_index.get("identity_resolution") or {}).get("digest")
-            _write_verified_index(parsed_root, index)
+            if resolution_path is not None:
+                _write_verified_index(parsed_root, index)
         return index, path
     return initialize_verification_index(parsed_dir)
 
@@ -1022,6 +1051,7 @@ def _ensure_review_student(
     roll_no: str,
     program: str,
     reviewer: str,
+    origin: str = "identity_suggestion",
 ) -> dict[str, Any]:
     try:
         return _student_by_roll(index, roll_no)
@@ -1056,10 +1086,10 @@ def _ensure_review_student(
         "sheet_pdf_path": None,
         "verified_sheet_pdf_path": None,
         "details_path": None,
-        "review_flags": ["Student bundle created from a human-approved identity suggestion."],
+        "review_flags": [f"Student bundle created from human review ({origin})."],
         "decision_log": [
             _decision(
-                "create_student_from_identity_suggestion",
+                f"create_student_from_{origin}",
                 reviewer,
                 "Created an empty review bundle before assigning proposed pages.",
             )
@@ -1068,6 +1098,13 @@ def _ensure_review_student(
     }
     index.setdefault("students", []).append(student)
     index["students"].sort(key=lambda row: str(row.get("roll_no") or ""))
+    reconciliation = index.get("roster_reconciliation") or {}
+    if roster_row:
+        reconciliation["missing_students"] = [
+            row for row in reconciliation.get("missing_students", []) if row.get("roll_no") != roll_no
+        ]
+        reconciliation["missing_count"] = len(reconciliation["missing_students"])
+        reconciliation["detected_roster_students"] = int(reconciliation.get("roster_total") or 0) - reconciliation["missing_count"]
     return student
 
 
@@ -1125,6 +1162,84 @@ def _detach_source(index: dict[str, Any], source_index: int, target_roll: str, r
             )
         )
         _refresh_student_page_state(student, expected_pages)
+
+
+def assign_source_page(
+    parsed_dir: str | Path,
+    source_index: int,
+    roll_no: str,
+    *,
+    page_index: int | None = None,
+    replace_existing: bool = False,
+    reviewer: str,
+    note: str,
+) -> tuple[dict[str, Any], Path]:
+    """Correct page ownership while keeping displaced pages available for review."""
+    if not note.strip():
+        raise ValueError("a review note is required for page assignment")
+    roll_no = normalize_roll(roll_no)
+    index, _path = load_or_initialize_verified_index(parsed_dir)
+    parsed_root = _parsed_dir_from_index(_parse_index_path(parsed_dir))
+    if not re.fullmatch(r"(?:[0-9]{7}|MT[0-9]{5}|PHD[0-9]{5})", roll_no):
+        raise ValueError("enter a complete BTech, MTech or PhD roll number")
+    reconciliation = index.get("roster_reconciliation") or {}
+    if reconciliation.get("roster_total") and roll_no not in _known_review_rolls(index):
+        raise ValueError(f"target roll number is not present in the review roster: {roll_no}")
+    page, owner = _find_source_page(index, int(source_index))
+    chosen_page = int(page_index or page.get("page") or 0)
+    expected_pages = list(range(1, int(index.get("expected_pages") or 0) + 1))
+    if chosen_page not in expected_pages:
+        raise ValueError("sheet page is outside the manifest")
+    image_path = _resolve_path(page.get("canonical_image_path"), parsed_root)
+    if image_path is None or not image_path.is_file():
+        raise ValueError("source page has no canonical image; resolve its inspection failure first")
+    target = next((student for student in index.get("students", []) if student.get("roll_no") == roll_no), None)
+    displaced_by_source = {} if target is None else {
+        int(existing["source_index"]): existing
+        for collection in ("pages", "manual_pages") for existing in target.get(collection, [])
+        if int(existing["page"]) == chosen_page and int(existing["source_index"]) != int(source_index)
+    }
+    displaced = list(displaced_by_source.values())
+    if displaced and not replace_existing:
+        raise ValueError(f"roll {roll_no} already has sheet page {chosen_page}; select Replace existing page after checking it")
+
+    program = "MTECH" if roll_no.startswith("MT") else "PHD" if roll_no.startswith("PHD") else "BTECH"
+    target = _ensure_review_student(index, roll_no, program, reviewer, origin="manual_assignment")
+    decision = _decision(
+        "assign_source_page", reviewer, note, source_index=int(source_index), page_index=chosen_page,
+        previous_roll_no=owner.get("roll_no") if owner else None, roll_no=roll_no,
+    )
+    for existing in displaced:
+        displaced_source = int(existing["source_index"])
+        displaced_record = next(
+            (row for row in index.get("unmatched_pages", []) if int(row["source_index"]) == displaced_source), None,
+        )
+        if displaced_record is None:
+            displaced_record = {"source_index": displaced_source, "decision_log": [], "review_flags": []}
+            index.setdefault("unmatched_pages", []).append(displaced_record)
+        displaced_record.update(status="needs_review", page_index=existing["page"], pages=[dict(existing)],
+                                assigned_to_roll_no=None, assigned_page=None)
+        displaced_record["review_flags"].append(f"Removed from roll {roll_no} by a manual page replacement.")
+        displaced_record["decision_log"].append(decision)
+    _detach_source(index, int(source_index), roll_no, reviewer)
+    for collection in ("pages", "manual_pages"):
+        target[collection] = [
+            existing for existing in target.get(collection, [])
+            if int(existing.get("source_index") or 0) != int(source_index)
+            and int(existing.get("page") or 0) != chosen_page
+        ]
+    page.update(page=chosen_page, origin="manual_assignment", assigned_from_source_index=int(source_index),
+                assigned_at=_now(), assigned_by=reviewer, assignment_note=note)
+    target["manual_pages"].append(page)
+    target.update(status="needs_review", eligible_for_email=False, verified_sheet_pdf_path=None, sheet_pdf_path=None)
+    target.setdefault("decision_log", []).append(decision)
+    unmatched = next(
+        (row for row in index.get("unmatched_pages", []) if int(row["source_index"]) == int(source_index)), None,
+    )
+    if unmatched is not None:
+        unmatched.update(status="assigned", assigned_to_roll_no=roll_no, assigned_page=chosen_page)
+        unmatched.setdefault("decision_log", []).append(decision)
+    return index, _write_verified_index(parsed_root, index)
 
 
 def decide_identity_suggestion(
