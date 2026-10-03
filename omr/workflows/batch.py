@@ -20,21 +20,16 @@ import numpy as np
 from PIL import Image
 
 from omr.contracts import load_manifest
-from omr.contracts.geometry import MM_PER_INCH, mm_to_px, px_per_mm
+from omr.contracts.geometry import MM_PER_INCH
 from omr.grading.mcq import read_mcq_responses
 from omr.io.csv import load_answer_key, load_students, normalize_roll
 from omr.identity_evidence import (
     BLOCK,
-    PROGRAM_INFERRED_FROM_GRID,
-    PROGRAM_SELECTOR_BLANK,
     SOURCES_CONTRADICT,
     evidence,
-    evidence_codes,
-    has_blocking_evidence,
     merge_evidence,
 )
 from omr.models import AlignedPage, Student
-from omr.reader.digit_model import extract_digit_feature
 from omr.reader.handwriting import (
     RollOcrBackend,
     build_roll_ocr_backend,
@@ -63,11 +58,10 @@ from omr.workflows.parse import (
 )
 from omr.reader.written_ocr import WrittenOcrBackend, build_written_ocr_backend, read_written_answer_texts
 from omr.workflows.identity_resolution import (
-    near_neighbour_guard,
-    page_evidence,
     resolve_identity_proposals,
     resolution_digest,
 )
+from omr.workflows.ownership import assess_ownership, add_order_suggestions
 
 
 CONFIDENCE_RANK = {"low": 0, "medium": 1, "high": 2}
@@ -127,20 +121,6 @@ class _PageRecord:
     review_flags: list[str]
 
 
-@dataclass(frozen=True)
-class _WriteInSignature:
-    program: str
-    features: np.ndarray
-    foreground_fractions: list[float]
-
-
-@dataclass(frozen=True)
-class _WriteInMatch:
-    anchor: _PageRecord
-    continuation: _PageRecord
-    score: float
-    anchor_margin: float
-    continuation_margin: float
 
 
 def _resolve_manifest_path(exam_id: str, data_dir: Path) -> Path:
@@ -265,187 +245,6 @@ def _page_identity(
     return "handwritten", roll_no, read.program, read.confidence, asdict(read), list(read.review_flags)
 
 
-def _strong_enough(confidence: str, minimum: str) -> bool:
-    return CONFIDENCE_RANK.get(confidence, 0) >= CONFIDENCE_RANK[minimum]
-
-
-def _identity_evidence(payload: dict[str, Any] | None) -> list[dict[str, Any]]:
-    if not isinstance(payload, dict):
-        return []
-    nested = payload.get("write_in_roll_read")
-    return merge_evidence(
-        payload.get("evidence_flags") if isinstance(payload.get("evidence_flags"), list) else [],
-        nested.get("evidence_flags") if isinstance(nested, dict) and isinstance(nested.get("evidence_flags"), list) else [],
-    )
-
-
-def _record_page_evidence(record: _PageRecord) -> dict[str, Any]:
-    return page_evidence(
-        {
-            "source_index": record.source_index,
-            "sheet_page": record.aligned_page.page_index,
-            "identity_kind": record.identity_kind,
-            "literal_roll_no": record.roll_no,
-            "program": record.program,
-            "confidence": record.confidence,
-            "identity": record.identity_payload or {},
-        }
-    )
-
-
-def _path_a_near_neighbour_evidence(
-    anchor: _PageRecord,
-    continuation: _PageRecord,
-    *,
-    valid_rolls: set[str] | None,
-    program_by_roll: Mapping[str, str] | None,
-) -> list[dict[str, Any]]:
-    if not valid_rolls or not anchor.roll_no or not anchor.program:
-        return []
-    anchor_page = _record_page_evidence(anchor)
-    continuation_page = _record_page_evidence(continuation)
-    _neighbours, flags = near_neighbour_guard(
-        anchor.roll_no,
-        anchor.program,
-        [
-            ("page1_cells", anchor_page["cell_probabilities"]),
-            (f"page{continuation.aligned_page.page_index}_cells", continuation_page["cell_probabilities"]),
-        ],
-        valid_rolls=valid_rolls,
-        program_by_roll=program_by_roll,
-        sheet_page=continuation.aligned_page.page_index,
-    )
-    return flags
-
-
-def _add_record_identity_evidence(record: _PageRecord, flags: list[dict[str, Any]]) -> None:
-    if not flags:
-        return
-    payload = dict(record.identity_payload or {})
-    payload["evidence_flags"] = merge_evidence(payload.get("evidence_flags"), flags)
-    record.identity_payload = payload
-    for flag in flags:
-        message = f"{flag.get('code')}: {flag.get('message')}"
-        if message not in record.review_flags:
-            record.review_flags.append(message)
-
-
-def _page_one_write_in_matches_bubbles(record: _PageRecord) -> bool:
-    if record.identity_kind != "bubbled" or not record.roll_no:
-        return False
-    payload = record.identity_payload or {}
-    write_in = payload.get("write_in_roll_read")
-    if not isinstance(write_in, dict):
-        return False
-    write_roll_no = normalize_roll(str(write_in.get("roll_no") or "")) or None
-    return (
-        write_roll_no == record.roll_no
-        and _cell_roll_matches(write_in, record.roll_no)
-        and _cell_min_probability(write_in) >= 0.30
-        and _cell_geometric_mean(write_in) >= 0.55
-    )
-
-
-def _cell_payload(read: dict[str, Any]) -> dict[str, Any] | None:
-    program = str(read.get("program") or "").upper()
-    results = read.get("ocr_results")
-    if not isinstance(results, dict) or not program:
-        return None
-    payload = results.get(program)
-    return payload if isinstance(payload, dict) else None
-
-
-def _cell_roll_matches(read: dict[str, Any], roll_no: str) -> bool:
-    payload = _cell_payload(read)
-    if payload is None:
-        # Compatibility for older persisted run artifacts that predate exact
-        # cell payload storage. New reads always take the branch below.
-        return normalize_roll(str(read.get("roll_no") or "")) == roll_no
-    cells = payload.get("cells")
-    if not isinstance(cells, dict):
-        return False
-    return normalize_roll(str(cells.get("text") or "")) == roll_no
-
-
-def _cell_min_probability(read: dict[str, Any]) -> float:
-    payload = _cell_payload(read)
-    cells = payload.get("cells") if payload else None
-    if not isinstance(cells, dict):
-        return {"high": 0.90, "medium": 0.60}.get(str(read.get("confidence") or "").lower(), 0.0)
-    try:
-        return float(cells.get("confidence") or 0.0)
-    except (TypeError, ValueError):
-        return 0.0
-
-
-def _cell_geometric_mean(read: dict[str, Any]) -> float:
-    payload = _cell_payload(read)
-    cells = payload.get("cells") if payload else None
-    raw = cells.get("raw") if isinstance(cells, dict) else None
-    entries = raw.get("cells") if isinstance(raw, dict) else None
-    probabilities: list[float] = []
-    if isinstance(entries, list):
-        for entry in entries:
-            value = entry.get("raw", {}).get("top_probability") if isinstance(entry, dict) else None
-            try:
-                probabilities.append(float(value))
-            except (TypeError, ValueError):
-                continue
-    if probabilities:
-        return float(np.exp(np.mean(np.log(np.clip(probabilities, 1e-6, 1.0)))))
-    return _cell_min_probability(read)
-
-
-def _record_has_usable_cell_roll(record: _PageRecord, minimum: float = 0.30) -> bool:
-    payload = record.identity_payload or {}
-    read = payload.get("write_in_roll_read") if record.identity_kind == "bubbled" else payload
-    if not isinstance(read, dict) or not read:
-        # Compatibility for pre-evidence test records and persisted artifacts.
-        return _strong_enough(record.confidence, "medium")
-    return (
-        record.roll_no is not None
-        and _cell_roll_matches(read, record.roll_no)
-        and _cell_min_probability(read) >= minimum
-    )
-
-
-def _is_clear_program_inferred_anchor(record: _PageRecord, valid_rolls: set[str] | None) -> bool:
-    """Allow a clear BTech-only grid when the program selector was left blank.
-
-    This is deliberately narrower than accepting every low-confidence page:
-    the completed grid must identify one program, the roll must be in the
-    roster, and there may be no bubble-grid ambiguity beyond the selector.
-    """
-    if record.identity_kind != "bubbled" or not record.roll_no or not record.program:
-        return False
-    if valid_rolls is None or record.roll_no not in valid_rolls:
-        return False
-    structured = _identity_evidence(record.identity_payload)
-    codes = evidence_codes(structured)
-    return (
-        PROGRAM_SELECTOR_BLANK in codes
-        and PROGRAM_INFERRED_FROM_GRID in codes
-        and not has_blocking_evidence(structured)
-    )
-
-
-def _has_blank_continuation_selector(record: _PageRecord) -> bool:
-    """Return whether a continuation page has no marked program selector."""
-    return PROGRAM_SELECTOR_BLANK in evidence_codes(_identity_evidence(record.identity_payload))
-
-
-def _continuation_program_matches_anchor(record: _PageRecord, anchor_program: str | None) -> bool:
-    """Allow blank-selector inference only for BTech continuation fields.
-
-    A blank selector is safe only when the literal handwritten roll already
-    matches a unique verified BTech page-one anchor. MTech and PhD share a
-    five-digit layout, so their blank selectors remain unmatched.
-    """
-    if not anchor_program or record.program != anchor_program:
-        return False
-    if not _has_blank_continuation_selector(record):
-        return True
-    return anchor_program == "BTECH" and record.program == "BTECH"
 
 
 def _best_page(existing: _PageRecord, challenger: _PageRecord) -> _PageRecord:
@@ -463,193 +262,25 @@ def _best_page(existing: _PageRecord, challenger: _PageRecord) -> _PageRecord:
 
 
 def _group_records_by_identity(
-    records: list[_PageRecord],
-    min_group_confidence: str,
-    page_one_index: int = 1,
-    valid_rolls: set[str] | None = None,
-    program_by_roll: Mapping[str, str] | None = None,
+    records: list[_PageRecord], min_group_confidence: str, page_one_index: int = 1,
+    valid_rolls: set[str] | None = None, program_by_roll: Mapping[str, str] | None = None,
 ) -> tuple[dict[str, list[_PageRecord]], list[_PageRecord]]:
-    grouped: dict[str, list[_PageRecord]] = {}
-    unmatched: list[_PageRecord] = []
-
-    verified_anchor_rolls: set[str] = set()
-    verified_anchor_programs: dict[str, str | None] = {}
-    verified_anchor_records: dict[str, _PageRecord] = {}
-    ordered = sorted(records, key=lambda item: item.source_index)
-    anchor_claims: dict[str, list[_PageRecord]] = {}
-    for record in ordered:
-        if record.aligned_page.page_index != page_one_index:
-            continue
-        exact_identity_match = _page_one_write_in_matches_bubbles(record)
-        if record.roll_no and (
-            _strong_enough(record.confidence, min_group_confidence)
-            or exact_identity_match
-            or _is_clear_program_inferred_anchor(record, valid_rolls)
-        ):
-            anchor_claims.setdefault(record.roll_no, []).append(record)
-        else:
-            unmatched.append(record)
-
-    # Duplicate ownership claims are evidence of a scanner/OCR problem, not a
-    # tie that may be solved by selecting the most confident page.
-    for roll_no, claims in anchor_claims.items():
-        if len(claims) != 1:
-            for record in claims:
-                record.review_flags.append(
-                    f"duplicate page-1 ownership claim for roll {roll_no}; left unmatched"
-                )
-                unmatched.append(record)
-            continue
-        record = claims[0]
-        grouped.setdefault(roll_no, []).append(record)
-        if _page_one_write_in_matches_bubbles(record):
-            verified_anchor_rolls.add(roll_no)
-            verified_anchor_programs[roll_no] = record.program
-            verified_anchor_records[roll_no] = record
-
-    continuation_claims: dict[tuple[str, int], list[_PageRecord]] = {}
-    for record in ordered:
-        if record.aligned_page.page_index == page_one_index:
-            continue
-        if not record.roll_no or not _strong_enough(record.confidence, min_group_confidence):
-            unmatched.append(record)
-            continue
-        if record.roll_no not in verified_anchor_rolls:
-            record.review_flags.append(
-                f"continuation page OCR read {record.roll_no}, but no page-1 sheet has the same "
-                "roll confirmed by both bubbles and handwriting"
-            )
-            unmatched.append(record)
-            continue
-        anchor_program = verified_anchor_programs.get(record.roll_no)
-        if not _continuation_program_matches_anchor(record, anchor_program):
-            record.review_flags.append(
-                f"continuation page program {record.program or 'unreadable'} does not match "
-                f"the verified page-1 program {anchor_program or 'unreadable'}"
-            )
-            unmatched.append(record)
-            continue
-        guard_flags = _path_a_near_neighbour_evidence(
-            verified_anchor_records[record.roll_no],
-            record,
-            valid_rolls=valid_rolls,
-            program_by_roll=program_by_roll,
-        )
-        if has_blocking_evidence(guard_flags):
-            _add_record_identity_evidence(record, guard_flags)
-            unmatched.append(record)
-            continue
-        continuation_claims.setdefault(
-            (record.roll_no, record.aligned_page.page_index), []
-        ).append(record)
-
-    for (roll_no, page_index), claims in continuation_claims.items():
-        if len(claims) != 1:
-            for record in claims:
-                record.review_flags.append(
-                    f"duplicate page-{page_index} ownership claim for roll {roll_no}; left unmatched"
-                )
-                unmatched.append(record)
-            continue
-        grouped.setdefault(roll_no, []).append(claims[0])
-    return grouped, unmatched
+    return _group_records_by_safe_ownership(
+        records, {"num_pages": max((record.aligned_page.page_index for record in records), default=1)},
+        valid_rolls=valid_rolls, program_by_roll=program_by_roll,
+    )
 
 
 def _reconcile_exact_cross_page_roll_pairs(
-    records: list[_PageRecord],
-    grouped: dict[str, list[_PageRecord]],
-    unmatched: list[_PageRecord],
-    *,
-    page_one_index: int,
-    valid_rolls: set[str] | None,
-    program_by_roll: Mapping[str, str] | None = None,
+    records: list[_PageRecord], grouped: dict[str, list[_PageRecord]],
+    unmatched: list[_PageRecord], *, page_one_index: int,
+    valid_rolls: set[str] | None, program_by_roll: Mapping[str, str] | None = None,
 ) -> tuple[dict[str, list[_PageRecord]], list[_PageRecord]]:
-    """Recover medium-confidence continuations from independently verified anchors.
-
-    This is deliberately a second-chance path for pages that missed the configured
-    grouping threshold.  It must not manufacture an anchor from one OCR channel or
-    resolve duplicate claims.  Page 1 therefore needs exact bubble/write-in
-    agreement, and every recovered continuation slot must be unique for that roll.
-    """
-    page_one_by_source = {
-        record.source_index: record
-        for record in records
-        if record.aligned_page.page_index == page_one_index and record.roll_no
-    }
-    page_one_by_roll: dict[str, _PageRecord] = {}
-    page_one_roll_counts: dict[str, int] = {}
-    for record in page_one_by_source.values():
-        assert record.roll_no is not None
-        page_one_roll_counts[record.roll_no] = page_one_roll_counts.get(record.roll_no, 0) + 1
-        page_one_by_roll[record.roll_no] = record
-
-    unmatched_by_source = {record.source_index: record for record in unmatched}
-    continuation_slot_counts: dict[tuple[str, int], int] = {}
-    for record in unmatched:
-        if record.aligned_page.page_index == page_one_index or not record.roll_no:
-            continue
-        slot = (record.roll_no, record.aligned_page.page_index)
-        continuation_slot_counts[slot] = continuation_slot_counts.get(slot, 0) + 1
-
-    recovered_sources: set[int] = set()
-    for continuation in sorted(unmatched, key=lambda item: item.source_index):
-        if continuation.aligned_page.page_index == page_one_index or not continuation.roll_no:
-            continue
-        anchor = page_one_by_roll.get(continuation.roll_no)
-        if (
-            anchor is None
-            or not anchor.roll_no
-            or anchor.identity_kind != "bubbled"
-            or not _page_one_write_in_matches_bubbles(anchor)
-            or not _record_has_usable_cell_roll(anchor)
-            or not _record_has_usable_cell_roll(continuation)
-            or page_one_roll_counts.get(anchor.roll_no) != 1
-            or (valid_rolls is not None and anchor.roll_no not in valid_rolls)
-            or continuation_slot_counts.get(
-                (continuation.roll_no, continuation.aligned_page.page_index)
-            ) != 1
-            or not _continuation_program_matches_anchor(continuation, anchor.program)
-            or continuation.source_index in recovered_sources
-        ):
-            continue
-
-        guard_flags = _path_a_near_neighbour_evidence(
-            anchor,
-            continuation,
-            valid_rolls=valid_rolls,
-            program_by_roll=program_by_roll,
-        )
-        if has_blocking_evidence(guard_flags):
-            _add_record_identity_evidence(continuation, guard_flags)
-            continue
-
-        if anchor.source_index in unmatched_by_source:
-            grouped.setdefault(anchor.roll_no, []).append(anchor)
-            recovered_sources.add(anchor.source_index)
-
-        identity_payload = dict(continuation.identity_payload or {})
-        identity_payload.update(
-            {
-                "grouped_roll_no": anchor.roll_no,
-                "grouped_program": anchor.program,
-                "grouped_from_page1_source_index": anchor.source_index,
-                "original_identity_kind": continuation.identity_kind,
-                "original_roll_no": continuation.roll_no,
-                "original_confidence": continuation.confidence,
-                "reconciliation": "exact page-1 bubble roll and continuation handwritten roll",
-            }
-        )
-        continuation.identity_kind = EXACT_CROSS_PAGE_ROLL_IDENTITY_KIND
-        continuation.program = continuation.program or anchor.program
-        continuation.identity_payload = identity_payload
-        continuation.review_flags.append(
-            "grouped only after exact agreement between the page-1 bubble roll and continuation "
-            "handwritten roll; source order was not used; review before release"
-        )
-        grouped.setdefault(anchor.roll_no, []).append(continuation)
-        recovered_sources.add(continuation.source_index)
-
-    return grouped, [record for record in unmatched if record.source_index not in recovered_sources]
+    # Recovery uses the same gates; weak exact text is not promoted by another path.
+    return _group_records_by_safe_ownership(
+        records, {"num_pages": max((record.aligned_page.page_index for record in records), default=1)},
+        valid_rolls=valid_rolls, program_by_roll=program_by_roll,
+    )
 
 
 def _page_sequence(records: list[_PageRecord]) -> list[int]:
@@ -747,148 +378,8 @@ def _source_order_inference(
     return result
 
 
-def _infer_grouping_mode(
-    records: list[_PageRecord],
-    manifest: dict,
-    total_source_pages: int | None = None,
-) -> str:
-    total = total_source_pages or max((record.source_index for record in records), default=0)
-    return str(_source_order_inference(records, manifest, total)["mode"])
 
 
-def _roll_write_in_field(manifest: dict, page_index: int, program: str | None) -> dict | None:
-    if not program:
-        return None
-    program = program.upper()
-    return next(
-        (
-            field
-            for field in manifest.get("write_in_fields", [])
-            if field.get("page", 1) == page_index
-            and field.get("name") == "roll_number"
-            and str(field.get("program", "")).upper() == program
-        ),
-        None,
-    )
-
-
-def _write_in_signature(
-    record: _PageRecord,
-    manifest: dict,
-    dpi: float,
-    program: str | None,
-    cache: dict[tuple[int, str], _WriteInSignature | None],
-) -> _WriteInSignature | None:
-    if not program:
-        return None
-    program = program.upper()
-    key = (record.source_index, program)
-    if key in cache:
-        return cache[key]
-
-    field = _roll_write_in_field(manifest, record.aligned_page.page_index, program)
-    if field is None:
-        cache[key] = None
-        return None
-
-    gray = np.asarray(record.aligned_page.image)
-    if gray.ndim == 3:
-        gray = gray.mean(axis=2)
-    gray = gray.astype(np.uint8, copy=False)
-    padding_mm = 0.5
-    features: list[np.ndarray] = []
-    foreground_fractions: list[float] = []
-    for index in range(int(field["cells"])):
-        x0, y0 = mm_to_px(
-            field["x_mm"] + index * field["cell_pitch_mm"] - padding_mm,
-            field["y_mm"] - padding_mm,
-            dpi,
-        )
-        width_px = round((field["cell_width_mm"] + 2 * padding_mm) * px_per_mm(dpi))
-        height_px = round((field["height_mm"] + 2 * padding_mm) * px_per_mm(dpi))
-        x1 = min(gray.shape[1], x0 + width_px)
-        y1 = min(gray.shape[0], y0 + height_px)
-        crop = gray[max(0, y0) : y1, max(0, x0) : x1]
-        if crop.size == 0:
-            cache[key] = None
-            return None
-        digit = extract_digit_feature(crop)
-        if digit.is_blank:
-            cache[key] = None
-            return None
-        features.append(digit.feature)
-        foreground_fractions.append(digit.foreground_fraction)
-
-    if not features:
-        cache[key] = None
-        return None
-    signature = _WriteInSignature(
-        program=program,
-        features=np.stack(features).astype(np.float32, copy=False),
-        foreground_fractions=foreground_fractions,
-    )
-    cache[key] = signature
-    return signature
-
-
-def _roll_digits_for_similarity(roll_no: str | None, cell_count: int) -> str | None:
-    if not roll_no:
-        return None
-    digits = "".join(char for char in roll_no if char.isdigit())
-    if len(digits) < cell_count:
-        return None
-    return digits[-cell_count:]
-
-
-def _positional_sequence_review_flag(grouping_mode: str, manifest: dict, page_sequence: list[int]) -> str:
-    expected = (
-        f"P1...P1, P2...P2 up to P{manifest['num_pages']}"
-        if grouping_mode == "page-major"
-        else f"P1 P2 ... P{manifest['num_pages']} repeated for each student"
-    )
-    return (
-        f"{grouping_mode} grouping skipped: expected scanner order {expected}, "
-        f"but detected page sequence {page_sequence}"
-    )
-
-
-def _positional_record(record: _PageRecord, anchor: _PageRecord, grouping_mode: str) -> _PageRecord:
-    review_flags = [
-        flag for flag in record.review_flags if flag != HANDWRITTEN_OCR_NOT_CONFIGURED_FLAG
-    ]
-    if record.roll_no and anchor.roll_no and record.roll_no != anchor.roll_no:
-        review_flags.append(
-            f"{grouping_mode} grouping attached page {record.aligned_page.page_index} to roll {anchor.roll_no}, "
-            f"but continuation-page roll OCR read {record.roll_no}"
-        )
-    if record.program and anchor.program and record.program != anchor.program:
-        review_flags.append(
-            f"{grouping_mode} grouping attached page {record.aligned_page.page_index} to roll {anchor.roll_no}, "
-            f"but continuation program reads {record.program} while page 1 reads {anchor.program}"
-        )
-
-    identity_payload = dict(record.identity_payload or {})
-    identity_payload.update(
-        {
-            "grouping_mode": grouping_mode,
-            "grouped_roll_no": anchor.roll_no,
-            "grouped_program": anchor.program,
-            "grouped_from_page1_source_index": anchor.source_index,
-            "original_identity_kind": record.identity_kind,
-            "original_roll_no": record.roll_no,
-            "original_confidence": record.confidence,
-        }
-    )
-    confidence = "high" if _strong_enough(anchor.confidence, "high") else "medium"
-    return replace(
-        record,
-        identity_kind=PAGE_MAJOR_IDENTITY_KIND if grouping_mode == "page-major" else SHEET_MAJOR_IDENTITY_KIND,
-        roll_no=anchor.roll_no,
-        program=record.program or anchor.program,
-        confidence=confidence,
-        identity_payload=identity_payload,
-        review_flags=review_flags,
-    )
 
 
 def _group_records_by_inferred_order(
@@ -899,210 +390,49 @@ def _group_records_by_inferred_order(
     total_source_pages: int,
     valid_rolls: set[str] | None,
 ) -> tuple[dict[str, list[_PageRecord]], list[_PageRecord]]:
-    """Group a strongly detected scanner order without hiding identity conflicts.
+    """Retained API: scanner order never establishes ownership."""
+    return _group_records_by_safe_ownership(records, manifest, valid_rolls=valid_rolls)
 
-    Page 1 remains the ownership anchor and must contain a readable bubbled roll.
-    Source order only determines which continuation pages belong beside that
-    anchor.  Duplicate roll claims and sheets without a valid anchor stay
-    unmatched for human review.
-    """
-    if grouping_mode not in {"sheet-major", "page-major"}:
-        raise ValueError(f"unsupported inferred grouping mode: {grouping_mode}")
-    num_pages = int(manifest["num_pages"])
-    if num_pages <= 1:
-        return _group_records_by_identity(records, "high", valid_rolls=valid_rolls)
 
-    student_count = total_source_pages // num_pages if total_source_pages % num_pages == 0 else 0
-    if grouping_mode == "page-major" and student_count <= 0:
-        return {}, list(records)
+def _group_records_by_safe_ownership(
+    records: list[_PageRecord], manifest: dict, *, valid_rolls: set[str] | None,
+    program_by_roll: Mapping[str, str] | None = None,
+) -> tuple[dict[str, list[_PageRecord]], list[_PageRecord]]:
+    assessment = assess_ownership(
+        [{"source_index": record.source_index, "sheet_page": record.aligned_page.page_index,
+          "identity_kind": record.identity_kind, "literal_roll_no": record.roll_no,
+          "program": record.program, "confidence": record.confidence,
+          "identity": record.identity_payload or {}} for record in records],
+        expected_pages=int(manifest["num_pages"]), valid_rolls=valid_rolls,
+        program_by_roll=program_by_roll, require_quality=False,
+    )
+    by_source = {record.source_index: record for record in records}
+    for decision in assessment["pages"]:
+        record = by_source[decision["source_index"]]
+        payload = dict(record.identity_payload or {})
+        payload["ownership_evidence_flags"] = decision["evidence_flags"]
+        record.identity_payload = payload
+        record.review_flags = list(dict.fromkeys(record.review_flags + [
+            flag["message"] for flag in decision["evidence_flags"] if flag["severity"] == BLOCK
+        ]))
+    grouped = {roll: [by_source[source] for source in student["source_indices"]]
+               for roll, student in assessment["students"].items()}
+    assigned = {int(source) for source in assessment["assignments"]}
+    return grouped, [record for record in records if record.source_index not in assigned]
 
-    slots: dict[int, dict[int, _PageRecord]] = {}
-    unmatched: list[_PageRecord] = []
-    for record in sorted(records, key=lambda item: item.source_index):
-        if grouping_mode == "sheet-major":
-            slot = (record.source_index - 1) // num_pages
-            expected_page = ((record.source_index - 1) % num_pages) + 1
-        else:
-            slot = (record.source_index - 1) % student_count
-            expected_page = ((record.source_index - 1) // student_count) + 1
-        if record.aligned_page.page_index != expected_page:
-            record.review_flags.append(
-                f"auto-detected {grouping_mode} order expected source {record.source_index} "
-                f"to be sheet page {expected_page}, but its page code reads "
-                f"{record.aligned_page.page_index}; left unmatched"
-            )
-            unmatched.append(record)
-            continue
-        slots.setdefault(slot, {})[expected_page] = record
 
-    anchors: dict[int, _PageRecord] = {}
-    claims_by_roll: dict[str, list[int]] = {}
-    for slot, pages in slots.items():
-        anchor = pages.get(1)
-        if (
-            anchor is None
-            or anchor.identity_kind != "bubbled"
-            or not anchor.roll_no
-            or (valid_rolls is not None and anchor.roll_no not in valid_rolls)
-        ):
-            continue
-        anchors[slot] = anchor
-        claims_by_roll.setdefault(anchor.roll_no, []).append(slot)
-
-    duplicate_rolls = {
-        roll_no for roll_no, claimed_slots in claims_by_roll.items() if len(claimed_slots) != 1
-    }
-    grouped: dict[str, list[_PageRecord]] = {}
-    already_unmatched = {record.source_index for record in unmatched}
-    for slot, pages in sorted(slots.items()):
-        anchor = anchors.get(slot)
-        if anchor is None:
-            reason = (
-                f"auto-detected {grouping_mode} order could not assign this sheet because page 1 "
-                "has no unique roster-valid bubbled roll"
-            )
-            for record in pages.values():
-                if reason not in record.review_flags:
-                    record.review_flags.append(reason)
-                if record.source_index not in already_unmatched:
-                    unmatched.append(record)
-                    already_unmatched.add(record.source_index)
-            continue
-
-        assert anchor.roll_no is not None
-        if anchor.roll_no in duplicate_rolls:
-            reason = (
-                f"duplicate page-1 ownership claim for roll {anchor.roll_no}; "
-                f"auto-detected {grouping_mode} order left every claimed sheet unmatched"
-            )
-            for record in pages.values():
-                if reason not in record.review_flags:
-                    record.review_flags.append(reason)
-                if record.source_index not in already_unmatched:
-                    unmatched.append(record)
-                    already_unmatched.add(record.source_index)
-            continue
-
-        if not _page_one_write_in_matches_bubbles(anchor):
-            anchor.review_flags.append(
-                f"auto-detected {grouping_mode} order used the unique page-1 bubbled roll "
-                f"{anchor.roll_no}; page-1 handwriting did not independently confirm ownership"
-            )
-        student_records = [anchor]
-        for page_index in range(2, num_pages + 1):
-            continuation = pages.get(page_index)
-            if continuation is None:
-                continue
-            positional = _positional_record(continuation, anchor, grouping_mode)
-            if not continuation.roll_no:
-                positional.review_flags.append(
-                    f"auto-detected {grouping_mode} order attached source "
-                    f"{continuation.source_index}; its handwritten roll was not independently readable"
-                )
-            student_records.append(positional)
-        grouped[anchor.roll_no] = student_records
-
-    return grouped, unmatched
 
 
 def _group_records_by_page_major(
-    records: list[_PageRecord],
-    manifest: dict,
-    min_group_confidence: str,
+    records: list[_PageRecord], manifest: dict, min_group_confidence: str,
 ) -> tuple[dict[str, list[_PageRecord]], list[_PageRecord]]:
-    if manifest["num_pages"] <= 1:
-        return _group_records_by_identity(records, min_group_confidence)
-
-    ordered = sorted(records, key=lambda item: item.source_index)
-    page_sequence = _page_sequence(ordered)
-    page_one_records = [record for record in ordered if record.aligned_page.page_index == 1]
-    student_count = len(page_one_records)
-    if student_count == 0:
-        for record in ordered:
-            record.review_flags.append("page-major grouping skipped: no page 1 records were detected")
-        return _group_records_by_identity(ordered, min_group_confidence)
-
-    if not _matches_page_major_sequence(page_sequence, manifest["num_pages"]):
-        flag = _positional_sequence_review_flag("page-major", manifest, page_sequence)
-        for record in ordered:
-            if record.aligned_page.page_index != 1:
-                record.review_flags.append(flag)
-        return _group_records_by_identity(ordered, min_group_confidence)
-
-    grouped: dict[str, list[_PageRecord]] = {}
-    unmatched: list[_PageRecord] = []
-    records_by_page: dict[int, list[_PageRecord]] = {
-        page_index: [
-            record for record in ordered if record.aligned_page.page_index == page_index
-        ]
-        for page_index in range(1, manifest["num_pages"] + 1)
-    }
-
-    for student_index, page_one_record in enumerate(records_by_page[1]):
-        roll_no = page_one_record.roll_no
-        if not roll_no or not _strong_enough(page_one_record.confidence, min_group_confidence):
-            flag = (
-                "page-major grouping skipped for this sheet: matching page 1 did not have a "
-                f"{min_group_confidence}-confidence roll number"
-            )
-            for page_index in range(1, manifest["num_pages"] + 1):
-                record = records_by_page[page_index][student_index]
-                record.review_flags.append(flag)
-                unmatched.append(record)
-            continue
-
-        student_records = [page_one_record]
-        for page_index in range(2, manifest["num_pages"] + 1):
-            student_records.append(
-                _positional_record(records_by_page[page_index][student_index], page_one_record, "page-major")
-            )
-        grouped.setdefault(roll_no, []).extend(student_records)
-
-    return grouped, unmatched
+    return _group_records_by_safe_ownership(records, manifest, valid_rolls=None)
 
 
 def _group_records_by_sheet_major(
-    records: list[_PageRecord],
-    manifest: dict,
-    min_group_confidence: str,
+    records: list[_PageRecord], manifest: dict, min_group_confidence: str,
 ) -> tuple[dict[str, list[_PageRecord]], list[_PageRecord]]:
-    if manifest["num_pages"] <= 1:
-        return _group_records_by_identity(records, min_group_confidence)
-
-    ordered = sorted(records, key=lambda item: item.source_index)
-    page_sequence = _page_sequence(ordered)
-    num_pages = manifest["num_pages"]
-    if not _matches_sheet_major_sequence(page_sequence, num_pages):
-        flag = _positional_sequence_review_flag("sheet-major", manifest, page_sequence)
-        for record in ordered:
-            if record.aligned_page.page_index != 1:
-                record.review_flags.append(flag)
-        return _group_records_by_identity(ordered, min_group_confidence)
-
-    student_count = len(ordered) // num_pages
-    grouped: dict[str, list[_PageRecord]] = {}
-    unmatched: list[_PageRecord] = []
-    for student_index in range(student_count):
-        offset = student_index * num_pages
-        sheet_records = ordered[offset : offset + num_pages]
-        page_one_record = sheet_records[0]
-        roll_no = page_one_record.roll_no
-        if not roll_no or not _strong_enough(page_one_record.confidence, min_group_confidence):
-            flag = (
-                "sheet-major grouping skipped for this sheet: page 1 did not have a "
-                f"{min_group_confidence}-confidence roll number"
-            )
-            for record in sheet_records:
-                record.review_flags.append(flag)
-            unmatched.extend(sheet_records)
-            continue
-
-        student_records = [page_one_record]
-        for record in sheet_records[1:]:
-            student_records.append(_positional_record(record, page_one_record, "sheet-major"))
-        grouped.setdefault(roll_no, []).extend(student_records)
-
-    return grouped, unmatched
+    return _group_records_by_safe_ownership(records, manifest, valid_rolls=None)
 
 
 def _write_page_error(root: Path, source_path: Path, source_index: int, error: Exception) -> dict[str, Any]:
@@ -1126,6 +456,7 @@ def _write_unmatched_page(
     manifest: dict,
     root: Path,
     dpi: float,
+    grouping_only: bool = False,
 ) -> dict[str, Any]:
     output_dir = root / "unmatched_pages" / f"source_{record.source_index:04d}"
     aligned = {record.aligned_page.page_index: record.aligned_page}
@@ -1145,7 +476,7 @@ def _write_unmatched_page(
     for report in quality_reports:
         review_flags.extend(f"page {report.page_index}: {flag}" for flag in report.review_flags)
     page_manifest = _manifest_for_pages(manifest, set(images_by_page))
-    written_crops = [
+    written_crops = [] if grouping_only else [
         replace(crop, ocr_crop_path=crop.ocr_crop_path or crop.crop_path)
         for crop in crop_written_responses(
             images_by_page,
@@ -1214,6 +545,7 @@ def _write_student_group(
     allow_partial: bool,
     roll_ocr_backend: RollOcrBackend | None,
     written_ocr_backend: WrittenOcrBackend | None,
+    grouping_only: bool = False,
 ) -> dict[str, Any]:
     output_dir = root / "students" / _safe_id(roll_no)
     selected_by_page: dict[int, _PageRecord] = {}
@@ -1289,13 +621,17 @@ def _write_student_group(
     available_pages = set(images_by_page)
     parse_manifest = _manifest_for_pages(manifest, available_pages) if allow_partial else manifest
 
-    readings = read_mcq_responses(images_by_page, parse_manifest, dpi)
-    mcq_responses, mcq_score, mcq_total = _mcq_payload(readings, parse_manifest, answer_key, review_flags)
-    numerical_responses, numerical_score, numerical_total = _numerical_payload(
-        images_by_page, manifest, dpi, answer_key, review_flags,
-    )
+    answer_review_flags: list[str] = []
+    readings = [] if grouping_only else read_mcq_responses(images_by_page, parse_manifest, dpi)
+    mcq_responses, mcq_score, mcq_total = _mcq_payload(readings, parse_manifest, answer_key, answer_review_flags)
+    if grouping_only:
+        numerical_responses, numerical_score, numerical_total = [], None, None
+    else:
+        numerical_responses, numerical_score, numerical_total = _numerical_payload(
+            images_by_page, manifest, dpi, answer_key, answer_review_flags,
+        )
 
-    written_crops = crop_written_responses(
+    written_crops = [] if grouping_only else crop_written_responses(
         images_by_page,
         parse_manifest,
         output_dir / "written",
@@ -1347,11 +683,38 @@ def _write_student_group(
                 "payload": _relative_identity_payload(identity_payload, output_dir),
             }
         )
-    status = "ready" if not review_flags else "needs_review"
+    observations = list(review_flags)
+    quality_by_page = {report.page_index: report.to_dict() for report in quality_reports}
+    ownership = assess_ownership(
+        [{"source_index": record.source_index, "sheet_page": record.aligned_page.page_index,
+          "identity_kind": record.identity_kind, "literal_roll_no": record.roll_no,
+          "program": record.program, "confidence": record.confidence,
+          "identity": record.identity_payload or {}, "quality": quality_by_page.get(record.aligned_page.page_index)}
+         for record in records], expected_pages=int(manifest["num_pages"]),
+        valid_rolls=set(students) if students is not None else None,
+        program_by_roll={roll: student.program for roll, student in (students or {}).items()},
+    )
+    decision = ownership["students"].get(roll_no)
+    complete = bool(decision and decision["status"] == "auto_matched")
+    ownership_flags = [str(flag["message"]) for page in ownership["pages"] for flag in page["evidence_flags"]
+                       if flag.get("severity") == BLOCK]
+    if missing_pages:
+        ownership_flags.append(f"partial scan: missing page(s): {', '.join(map(str, missing_pages))}")
+    review_flags = list(dict.fromkeys(ownership_flags + ([] if grouping_only else answer_review_flags)))
+    if not complete and not review_flags:
+        review_flags.append("Ownership is not confirmed by independent identity evidence.")
+    status = "ready" if complete and not review_flags else "needs_review"
     details_path = output_dir / "student.json"
     payload = {
         "exam_id": manifest["exam_id"],
         "status": status,
+        "grouping_only": grouping_only,
+        "ownership_decision": {"policy_version": ownership["policy_version"],
+                               "status": "auto_matched" if complete else "needs_review",
+                               "source_indices": decision["source_indices"] if decision else [],
+                               "evidence_digest": ownership["digest"]},
+        "answer_review_flags": answer_review_flags,
+        "observations": observations,
         "student": _student_payload(student, roll_no, program),
         "roll_read": roll_read,
         "identity_reads": identity_reads,
@@ -1920,6 +1283,7 @@ def parse_exam_bundle(
     ocr_backend: RollOcrBackend | None = None,
     min_group_confidence: str = "high",
     grouping_mode: str = "auto",
+    grouping_only: bool = False,
     written_ocr_backend: WrittenOcrBackend | None = None,
     progress_callback: Callable[[dict[str, Any]], None] | None = None,
     prealigned_pages: dict[int, AlignedPage] | None = None,
@@ -1940,7 +1304,7 @@ def parse_exam_bundle(
     valid_rolls = set(students) if students else None
     program_by_roll = {roll_no: student.program for roll_no, student in (students or {}).items()}
     default_marks = float(manifest["exam"].get("marks_per_mcq", 1.0))
-    answer_key = load_answer_key(answer_key_path, default_marks=default_marks) if answer_key_path else None
+    answer_key = load_answer_key(answer_key_path, default_marks=default_marks) if answer_key_path and not grouping_only else None
     _validate_numerical_answer_key(manifest, answer_key)
 
     page_records_for_bundle: list[_PageRecord] = []
@@ -2050,39 +1414,15 @@ def parse_exam_bundle(
         manifest,
         total_source_pages,
     )
-    applied_grouping_mode = (
+    suggested_order_mode = (
         str(order_inference["mode"])
         if grouping_mode == "auto"
         else grouping_mode
     )
-    if grouping_mode == "auto" and applied_grouping_mode in {"page-major", "sheet-major"}:
-        grouped, unmatched = _group_records_by_inferred_order(
-            page_records_for_bundle,
-            manifest,
-            applied_grouping_mode,
-            total_source_pages=total_source_pages,
-            valid_rolls=valid_rolls,
-        )
-    elif applied_grouping_mode == "page-major":
-        grouped, unmatched = _group_records_by_page_major(page_records_for_bundle, manifest, min_group_confidence)
-    elif applied_grouping_mode == "sheet-major":
-        grouped, unmatched = _group_records_by_sheet_major(page_records_for_bundle, manifest, min_group_confidence)
-    else:
-        grouped, unmatched = _group_records_by_identity(
-            page_records_for_bundle,
-            min_group_confidence,
-            page_one_index=int(manifest["roll_number_block"].get("page", 1)),
-            valid_rolls=valid_rolls,
-            program_by_roll=program_by_roll,
-        )
-        grouped, unmatched = _reconcile_exact_cross_page_roll_pairs(
-            page_records_for_bundle,
-            grouped,
-            unmatched,
-            page_one_index=int(manifest["roll_number_block"].get("page", 1)),
-            valid_rolls=valid_rolls,
-            program_by_roll=program_by_roll,
-        )
+    applied_grouping_mode = "identity"
+    grouped, unmatched = _group_records_by_safe_ownership(
+        page_records_for_bundle, manifest, valid_rolls=valid_rolls, program_by_roll=program_by_roll,
+    )
 
     current_assignments = {
         record.source_index: roll_no
@@ -2111,6 +1451,10 @@ def parse_exam_bundle(
         program_by_roll=program_by_roll,
         current_assignments=current_assignments,
     )
+    identity_resolution = add_order_suggestions(
+        identity_resolution, resolution_pages, current_assignments,
+        mode=suggested_order_mode, expected_pages=int(manifest["num_pages"]), total_pages=total_source_pages,
+    )
     identity_resolution["digest"] = resolution_digest(identity_resolution)
     identity_resolution_path = root / "identity_resolution.json"
     identity_resolution_path.write_text(json.dumps(identity_resolution, indent=2), encoding="utf-8")
@@ -2131,6 +1475,7 @@ def parse_exam_bundle(
                 allow_partial,
                 ocr_backend,
                 written_ocr_backend,
+                grouping_only=grouping_only,
             )
         )
         if progress_callback is not None:
@@ -2143,12 +1488,13 @@ def parse_exam_bundle(
                 }
             )
 
-    unmatched_results = [_write_unmatched_page(record, manifest, root, dpi) for record in unmatched]
+    unmatched_results = [_write_unmatched_page(record, manifest, root, dpi, grouping_only=grouping_only) for record in unmatched]
     roster_reconciliation = _reconcile_roster(students, student_results)
     index_path = root / "parse_index.json"
     index = {
         "exam_id": manifest["exam_id"],
         "mode": "multi_student_bundle",
+        "grouping_only": grouping_only,
         "requested_grouping_mode": grouping_mode,
         "grouping_mode": applied_grouping_mode,
         "grouping_order_inference": order_inference,
@@ -2197,6 +1543,9 @@ def parse_exam_bundle(
                     for page in result["pages"]
                 ],
                 "review_flags": result["review_flags"],
+                "ownership_decision": result["ownership_decision"],
+                "answer_review_flags": result["answer_review_flags"],
+                "observations": result["observations"],
                 "details_path": result["details_path"],
             }
             for result in student_results
@@ -2225,6 +1574,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-root", type=Path, default=DEFAULT_OUTPUT_ROOT)
     parser.add_argument("--dpi", default=300.0, type=float, help="Canonical reading DPI")
     parser.add_argument("--written-padding-mm", default=0.0, type=float)
+    parser.add_argument("--grouping-only", action="store_true", help="Match sheets without reading or grading answers")
     parser.add_argument(
         "--strict-complete",
         action="store_true",
@@ -2272,16 +1622,15 @@ def build_parser() -> argparse.ArgumentParser:
         "--min-group-confidence",
         default="high",
         choices=["medium", "high"],
-        help="Minimum identity confidence required before a page is attached to a student",
+        help="Legacy option; all automatic ownership still requires exact cells with minimum confidence 0.80",
     )
     parser.add_argument(
         "--grouping-mode",
         default="auto",
         choices=sorted(GROUPING_MODES),
         help=(
-            "auto uses source order only when detected page codes establish page-major or sheet-major order "
-            "with high confidence, otherwise it uses exact roll identity; "
-            "page-major expects A1 B1 ... A2 B2 ...; sheet-major expects A1 A2 ... B1 B2 ..."
+            "All modes require exact independent identity for ownership. "
+            "page-major and sheet-major select order-only human-review suggestions, never positional attachment."
         ),
     )
     return parser
@@ -2317,6 +1666,7 @@ def main(argv: list[str] | None = None) -> int:
             min_group_confidence=args.min_group_confidence,
             grouping_mode=args.grouping_mode,
             written_ocr_backend=written_ocr_backend,
+            grouping_only=args.grouping_only,
         )
     except (OSError, ScanError, ValueError, RuntimeError) as exc:
         print(str(exc), file=sys.stderr)

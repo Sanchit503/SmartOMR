@@ -41,7 +41,8 @@ main:has(#student-workspace) { max-width: none; padding: 0; }
 .student-item span { color: #69746e; margin: 4px 0 6px; }
 .queue-status, .student-state { display: inline-block; font-size: 10px; padding: 3px 5px; border-radius: 3px; line-height: 1.4; background: #edf1ef; color: #586760; }
 .queue-status.needs_review, .queue-status.missing_pages, .student-state.needs_review, .student-state.missing_pages { color: #8b600e; background: #fff5de; }
-.queue-status.verified, .student-state.verified { color: #245c40; background: #e6f3e9; }
+.queue-status.verified, .student-state.verified, .queue-status.approved, .student-state.approved { color: #245c40; background: #e6f3e9; }
+.queue-status.auto_matched, .student-state.auto_matched { color: #245c40; background: #e6f3e9; }
 .student-document { min-width: 0; background: #fff; }
 .sheet-preview-heading { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 10px; padding: 16px; border-bottom: 1px solid #dfe5e2; }
 .sheet-preview-heading h2 { margin: 0 0 5px !important; }

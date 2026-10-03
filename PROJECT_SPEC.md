@@ -202,9 +202,11 @@ For sheet-fed scanner bundles, default to identity-first automatic grouping:
 - Input order is irrelevant, so a continuation page may occur before its page 1 in the source PDF.
 - Missing, unreadable, conflicting, duplicate, and non-roster identities stay in human review.
 
-`page-major` (`A1 B1 C1 A2 B2 C2`) and `sheet-major` (`A1 A2 B1 B2 C1 C2`) are explicit operator
-overrides for independently verified scanner order. Automatic mode never groups by positional or
-visual-handwriting similarity.
+`page-major` (`A1 B1 C1 A2 B2 C2`) and `sheet-major` (`A1 A2 B1 B2 C1 C2`) select
+order-based suggestions only, never automatic ownership. All grouping modes use
+the exact-ownership policy with a 0.80 minimum cell-confidence gate and a 0.85
+selected-digit gate at one-digit roster neighbours. See
+`docs/EXACT_OWNERSHIP_WORKFLOW.md` for the current policy and release workflow.
 
 The current file-based workflow also writes `review_report.csv` and `review_report.html` beside
 `parse_index.json`. These are the local version of the future review queue: they show ready
@@ -213,8 +215,10 @@ exact flags that must be cleared before emailing or final grading.
 
 The human verification step writes a separate `verified_index.json`; it does not rewrite the raw
 parser output. A reviewer can verify a student, reject a grouping, keep a student on hold, assign an
-unmatched continuation page to a roll number, or ignore a stray page. Only rows marked `verified`
-with a generated verified sheet become eligible for later email/grading automation.
+unmatched continuation page to a roll number, or ignore a stray page. Clean
+`auto_matched` records remain email-ineligible until explicit batch approval.
+Only `approved` or individually `verified` records with a complete current PDF
+become eligible for a later explicit email release.
 
 ---
 

@@ -164,9 +164,12 @@ def _cell_data(read: Mapping[str, Any], fallback_program: str | None) -> dict[st
         crop_paths = all_paths.get(program, []) if isinstance(all_paths, dict) else []
     strip = payload.get("strip")
     strip = strip if isinstance(strip, dict) else {}
+    cell_roll = _normalized_roll(cells.get("text"))
+    if cell_roll and len(cell_roll) == 5 and cell_roll.isascii() and cell_roll.isdigit():
+        cell_roll = {"MTECH": "MT", "PHD": "PHD"}.get(program, "") + cell_roll
     return {
         "program": program or None,
-        "roll_no": _normalized_roll(cells.get("text")),
+        "roll_no": cell_roll,
         "minimum_probability": round(_number(cells.get("confidence")), 6),
         "geometric_mean": round(geometric_mean, 6),
         "probabilities": probability_rows,
@@ -520,7 +523,7 @@ def resolve_identity_proposals(
     current_assignments: Mapping[int, str] | None = None,
 ) -> dict[str, Any]:
     """Return Path B/C suggestions without modifying any assignment."""
-    normalized = [page_evidence(page) for page in pages]
+    normalized = [dict(page) if "cell_roll" in page else page_evidence(page) for page in pages]
     roster = set(valid_rolls or set())
     programs = dict(program_by_roll or {})
     assignments = {int(source): str(roll) for source, roll in (current_assignments or {}).items()}

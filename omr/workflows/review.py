@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import csv
 import html
+import hashlib
 import json
 import os
 import re
@@ -26,6 +27,7 @@ from PIL import Image
 from omr.io.csv import normalize_roll
 from omr.workflows.parse import _json_path
 from omr.workflows.identity_resolution import resolution_digest
+from omr.workflows.ownership import POLICY_VERSION
 
 
 VERIFICATION_SCHEMA_VERSION = 1
@@ -33,7 +35,7 @@ VERIFIED_INDEX_NAME = "verified_index.json"
 VERIFICATION_CSV_NAME = "verification_report.csv"
 VERIFICATION_HTML_NAME = "verification_report.html"
 
-STUDENT_STATUSES = {"pending_verification", "needs_review", "missing_pages", "verified", "rejected"}
+STUDENT_STATUSES = {"auto_matched", "approved", "pending_verification", "needs_review", "missing_pages", "verified", "rejected"}
 UNMATCHED_PAGE_STATUSES = {"needs_review", "assigned", "ignored"}
 PAGE_ERROR_STATUSES = {"error", "ignored"}
 
@@ -176,6 +178,7 @@ def _normalized_student_page(page: dict[str, Any], parsed_dir: Path, base_dir: P
         "debug_image_path": _relative_path(page.get("debug_image_path"), parsed_dir, base_dir),
         "alignment_overlay_path": _relative_path(page.get("alignment_overlay_path"), parsed_dir, base_dir),
         "sampling_overlay_path": _relative_path(page.get("sampling_overlay_path"), parsed_dir, base_dir),
+        "alignment_report_path": _relative_path(page.get("alignment_report_path"), parsed_dir, base_dir),
         "origin": "parser",
     }
 
@@ -211,6 +214,10 @@ def _student_from_parse_index(
     missing_pages = [page for page in expected_pages if page not in pages_found]
     parser_status = str(student.get("status") or "needs_review")
     status = _initial_status(parser_status, missing_pages)
+    ownership = student.get("ownership_decision") or details_payload.get("ownership_decision") or {}
+    if (status == "pending_verification" and ownership.get("policy_version") == POLICY_VERSION
+            and ownership.get("status") == "auto_matched"):
+        status = "auto_matched"
     decision_log: list[dict[str, Any]] = []
 
     if auto_verify_ready and status == "pending_verification":
@@ -250,6 +257,9 @@ def _student_from_parse_index(
         "verified_sheet_pdf_path": None,
         "details_path": _relative_path(student.get("details_path"), parsed_dir),
         "review_flags": list(student.get("review_flags", [])),
+        "ownership_decision": ownership,
+        "answer_review_flags": list(student.get("answer_review_flags", details_payload.get("answer_review_flags", []))),
+        "observations": list(student.get("observations", details_payload.get("observations", []))),
         "decision_log": decision_log,
         "eligible_for_email": False,
     }
@@ -489,7 +499,7 @@ def _html_link(value: str | None) -> str:
 
 
 def _status_class(status: str) -> str:
-    if status == "verified":
+    if status in {"verified", "approved", "auto_matched"}:
         return "verified"
     if status in {"pending_verification", "needs_review", "missing_pages"}:
         return "review"
@@ -532,6 +542,8 @@ def _write_verification_html(path: Path, index: dict[str, Any], rows: list[dict[
     unmatched_counts = counts.get("unmatched_pages", {})
     error_counts = counts.get("page_errors", {})
     metrics = [
+        ("Auto Matched", student_counts.get("auto_matched", 0)),
+        ("Approved For Release", student_counts.get("approved", 0)),
         ("Verified", student_counts.get("verified", 0)),
         ("Pending", student_counts.get("pending_verification", 0)),
         ("Needs Review", student_counts.get("needs_review", 0)),
@@ -726,9 +738,15 @@ def _write_verified_index(parsed_dir: Path, index: dict[str, Any]) -> Path:
     expected_pages = list(range(1, int(index.get("expected_pages") or 0) + 1))
     for student in index.get("students", []):
         _refresh_student_page_state(student, expected_pages)
-        student["eligible_for_email"] = student.get("status") == "verified" and bool(
+        if student.get("grading_selection_key") and student["grading_selection_key"] != student_selection_key(student):
+            student["grading_status"] = "stale"
+            flag = "Selected pages changed; grade answers again"
+            student["review_flags"] = list(dict.fromkeys(student.get("review_flags", []) + [flag]))
+            for name in ("mcq_score", "mcq_total", "numerical_score", "numerical_total"):
+                student[name] = None
+        student["eligible_for_email"] = student.get("status") in {"verified", "approved"} and bool(
             student.get("verified_sheet_pdf_path")
-        ) and not student.get("missing_pages")
+        ) and not student.get("missing_pages") and student.get("grading_status") != "stale"
     index["status_counts"] = _status_counts(index)
     index["updated_at"] = _now()
     index["reports"] = _write_reports(parsed_dir, index)
@@ -769,6 +787,7 @@ def initialize_verification_index(
         "schema_version": VERIFICATION_SCHEMA_VERSION,
         "exam_id": parse_index.get("exam_id"),
         "mode": "verification_review",
+        "grouping_only": bool(parse_index.get("grouping_only")),
         "source_parse_index_path": _json_path(parse_index_path, parsed_root),
         "parser_grouping_mode": parse_index.get("grouping_mode"),
         "detected_page_sequence": parse_index.get("detected_page_sequence", []),
@@ -848,6 +867,12 @@ def selected_student_pages(student: dict[str, Any]) -> list[dict[str, Any]]:
         if page_no is not None:
             selected[int(page_no)] = page
     return [selected[page_no] for page_no in sorted(selected)]
+
+
+def student_selection_key(student: dict[str, Any]) -> str:
+    selection = [{key: page.get(key) for key in ("page", "source_index", "canonical_image_path")}
+                 for page in selected_student_pages(student)]
+    return hashlib.sha256(json.dumps(selection, sort_keys=True).encode()).hexdigest()
 
 
 def _create_verified_sheet_pdf(parsed_dir: Path, student: dict[str, Any]) -> str:

@@ -49,7 +49,7 @@
     let visible = [];
     for (const item of items) {
       const status = item.dataset.status;
-      const matches = kind === "all" || (kind === "unchecked" && status !== "verified")
+      const matches = kind === "all" || (kind === "unchecked" && !["verified", "approved", "auto_matched"].includes(status))
         || (kind === "needs_review" && ["needs_review", "missing_pages", "rejected"].includes(status))
         || (kind === "missing_pages" && item.dataset.missing === "true")
         || (!["unchecked", "needs_review", "missing_pages"].includes(kind) && kind === status);

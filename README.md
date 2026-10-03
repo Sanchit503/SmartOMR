@@ -27,18 +27,23 @@ python -m omr.ui.app
 ```
 
 Open `http://127.0.0.1:8765`, then upload the scanned PDF and matching manifest.
-The first step is **Scan Inspection**: every source page remains in the inventory, with
-original/aligned/overlay views, alignment checks, failures, progress, and retry/resume.
-This step does not read roll numbers, group students, grade, or send email.
-The answer key and student roster are optional uploads. CSV/XLSX rosters are normalized into the canonical
+Click **1. Detect Rolls & Group Sheets**. One background job aligns pages, reads literal
+roll evidence once, and groups independently matching pages into student bundles.
+The source-page workspace remains available for diagnostics, progress, and corrections;
+there is no separate inspection or roll-preview click in a new UI run.
+No answer key is needed for grouping. The student roster is optional. CSV/XLSX rosters are normalized into the canonical
 `roll_no,name,email,program` shape. The IIITD portal export is supported even when it contains a
 blank row, `Roll No.`/`Student Name` headers, `Lecture` in `Class Type`, and an email column whose
 header is blank.
 
-After inspection, **Read Rolls & Match Sheets** reads identities and creates student bundles
-in grouping-only mode. Grading runs only when selected for the run. Only the identity-reading
-step requires local roll-number OCR. Inspection does not require Tesseract.
-Run this preflight before evaluation:
+After grouping and any needed ownership corrections, choose **2. Grade Answers**.
+Enter the objective answer key or upload CSV/XLSX, including dropped questions.
+Grading uses current selected aligned images without repeating roll OCR or changing
+ownership. Unresolved/incomplete selections are skipped and counted explicitly.
+Written answers are cropped for professor marking, not automatically scored.
+Changed page selections invalidate previous grades and block their release until regraded.
+Only the identity-reading step requires local roll-number OCR.
+Run this preflight before matching:
 
 ```powershell
 .\.venv\Scripts\python.exe -m omr.health --check-handwriting-ocr
@@ -307,8 +312,16 @@ python -m omr.workflows.batch \
 
 Source order does not matter: page 2 may appear before page 1. Missing, unreadable, conflicting,
 duplicate, or non-roster identities remain in the review queue instead of being guessed. Explicit
-`--grouping-mode page-major` and `--grouping-mode sheet-major` overrides remain available only for
-controlled scanner workflows whose physical page order has been independently verified.
+`--grouping-mode page-major` and `--grouping-mode sheet-major` select order-based
+suggestions only. They cannot attach a page automatically. Clean ownership requires
+cell confidence >= 0.80 and the exact-identity checks, with a 0.85 near-neighbour guard.
+Use `--grouping-only` to match sheets without reading/grading answers.
+
+The UI provides **Reassess Saved Evidence** for an existing completed run and
+**Approve Clean Matches** for explicit batch release approval. Existing manual
+decisions are preserved, and no OCR rerun is needed for reassessment. See
+[Exact Ownership Workflow](docs/EXACT_OWNERSHIP_WORKFLOW.md) for decisions, statuses,
+legacy-run handling, and validation limits.
 
 Output is written under `data/parsed/<exam_id>/students/<roll_no>/`:
 
@@ -676,10 +689,9 @@ sits nearest is the true top-left, at any rotation and any scale.
 ### Identity on every page
 
 A multi-page sheet is scanned as a loose batch, so every page has to say who it belongs to and
-which page it is. The default parser groups by roll identity. Separate page-major and sheet-major
-scanner modes are available only when the operator knows the scan order; in those modes, the
-page-index bars must confirm the exact selected sequence before continuation pages are attached by
-position.
+which page it is. All parser modes group by exact roll identity. Page-major and
+sheet-major scanner order may produce human-reviewed suggestions, never automatic
+positional attachment.
 
 | On every page | Read by | What it's for |
 |---|---|---|

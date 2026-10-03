@@ -143,6 +143,8 @@
         (filter === "matching_unmatched" && !assignment.roll_no && assignment.status === "needs_review") ||
         (filter === "matching_review" && assignment.roll_no && ["needs_review", "missing_pages", "rejected"].includes(assignment.status)) ||
         (filter === "matching_verified" && assignment.status === "verified")
+        || (filter === "matching_auto" && assignment.status === "auto_matched")
+        || (filter === "matching_approved" && assignment.status === "approved")
       );
       button.hidden = !(
         (!search || String(page.source_index).includes(search) || String(identityLabel).toUpperCase().includes(search.toUpperCase())) &&
@@ -286,7 +288,7 @@
       text("aligned-count", inventory.counts.aligned);
       text("review-count", inventory.counts.needs_review);
       text("failed-count", inventory.counts.failed);
-      const evaluating = ["queued", "running"].includes(inventory.run_status);
+      const evaluating = ["queued", "running", "grading"].includes(inventory.run_status);
       const readingRolls = inventory.run_status === "identity_previewing";
       const inspectionStage = inventory.run_status.startsWith("inspect") ? inventory.stage : inventory.status;
       text("progress-label", evaluating || readingRolls ? inventory.stage || "Preparing matching" : inventory.evaluated ? "Matching complete" : inventory.status === "completed" ? `${inventory.processed} / ${inventory.total} inspected` : `${inventory.processed} / ${inventory.total} inspected - ${inspectionStage}`);
@@ -296,13 +298,16 @@
       if (activeOperation && !operation?.total) byId("progress").removeAttribute("value");
       else byId("progress").value = activeOperation ? operation.processed : inventory.processed;
       for (const id of ["step-inspect", "step-match", "step-review"]) byId(id)?.removeAttribute("aria-current");
-      byId(inventory.evaluated && !activeOperation ? "step-review" : inventory.status === "completed" ? "step-match" : "step-inspect")?.setAttribute("aria-current", "step");
+      const step = inventory.two_step ? (inventory.evaluated ? "step-match" : "step-inspect")
+        : inventory.evaluated && !activeOperation ? "step-review" : inventory.status === "completed" ? "step-match" : "step-inspect";
+      byId(step)?.setAttribute("aria-current", "step");
       byId("inspect-form").hidden = !inventory.can_inspect;
       byId("inspect-form").querySelector("button").textContent = inventory.status === "completed" ? "Retry Failed Pages" : "Resume Inspection";
       byId("identity-preview-form").hidden = !inventory.can_identity_preview;
       byId("identity-preview-form").querySelector("button").textContent = "Read Rolls Only";
       byId("evaluate-form").hidden = !inventory.can_evaluate;
       byId("re-evaluate-form").hidden = !inventory.can_re_evaluate;
+      byId("grade-link").hidden = !inventory.can_grade;
       byId("review-link").hidden = !inventory.evaluated;
       alertText("run-error", inventory.run_error || inventory.error);
       alertText("connection-error", "");
@@ -310,7 +315,7 @@
       const summary = inventory.review_summary;
       if (byId("matching-summary")) {
         byId("matching-summary").hidden = !summary;
-        if (summary) text("matching-summary", `${summary.students} students; ${summary.verified} manually checked; ${summary.pending_verification} pending verification; ${summary.needs_review} need review; ${summary.assigned_pages} assigned pages; ${summary.unmatched_pages} unmatched; ${summary.page_errors} unreadable.`);
+        if (summary) text("matching-summary", `${summary.students} students; ${summary.verified} manually checked; ${summary.auto_matched || 0} auto matched; ${summary.approved || 0} approved for release; ${summary.pending_verification} pending verification; ${summary.needs_review} need review; ${summary.assigned_pages} assigned pages; ${summary.unmatched_pages} unmatched; ${summary.page_errors} unreadable.`);
       }
       identityRows = new Map((preview?.pages || []).map((row) => [Number(row.source_index), row]));
       const previewSummary = byId("identity-preview-summary");
@@ -394,7 +399,7 @@
   byId("next-unresolved")?.addEventListener("click", () => {
     const unresolved = inventory.pages.filter((page) => {
       const assignment = page.assignment || {};
-      return assignment.status !== "verified" && assignment.status !== "ignored";
+      return !["verified", "approved", "auto_matched", "ignored"].includes(assignment.status);
     });
     const next = unresolved.find((page) => page.source_index > selected) || unresolved[0];
     if (next) select(next.source_index);

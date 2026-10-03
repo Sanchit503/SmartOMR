@@ -790,13 +790,15 @@ def _read_write_in_roll_number(
         empty_field = empty_field or bool(cell_raw.get("empty_field"))
         # Strip segmentation is deliberately diagnostic only. It may be useful
         # to a reviewer, but it cannot veto a literal exact-cell result.
-        strip_result = ocr_backend.read_roll(crop_path, program=program, valid_rolls=valid_rolls)
+        strip_result = (RollOcrResult("", confidence=0.0, raw={"reason": "empty_field"})
+                        if cell_raw.get("empty_field") else
+                        ocr_backend.read_roll(crop_path, program=program, valid_rolls=valid_rolls))
         strip_normalized = normalize_handwritten_roll_text(strip_result.text, program=program)
         ocr_results[program] = {
             "strip": _ocr_result_payload(strip_result),
             "cells": _ocr_result_payload(cell_result),
             "text": cell_result.text or strip_result.text,
-            "normalized_roll": cell_normalized or strip_normalized,
+            "normalized_roll": cell_normalized,
             "confidence": _combined_confidence(cell_result.confidence, strip_result.confidence),
             "cell_crop_paths": cell_crop_paths.get(program, []),
         }
@@ -805,7 +807,7 @@ def _read_write_in_roll_number(
         if cell_normalized and strip_normalized and cell_normalized != strip_normalized:
             review_flags.append(f"STRIP_DISAGREES: {program} cells={cell_normalized}, strip={strip_normalized}")
         if not cell_normalized and strip_normalized:
-            candidates.append((program, strip_normalized, strip_result.confidence, strip_result.text, "strip"))
+            review_flags.append("whole-strip OCR is diagnostic only; incomplete digit cells cannot establish identity")
 
     if empty_field:
         review_flags.append("EMPTY_FIELD: handwritten roll field has blank digit cells")
@@ -1048,6 +1050,34 @@ def _relative_cell_ink(cell_path: Path) -> float:
     inset_y = max(1, round(height * BLANK_CELL_INSET_FRACTION))
     inset_x = max(1, round(width * BLANK_CELL_INSET_FRACTION))
     interior = gray[inset_y : height - inset_y, inset_x : width - inset_x]
+    # A locally shifted printed frame can survive the fixed crop inset. Locate
+    # all four frame edges before measuring ink; recognition crops are unchanged.
+    paper = float(np.percentile(gray, 90))
+    dark = gray <= paper - BLANK_CELL_DARKNESS_DELTA
+    rows = np.mean(dark, axis=1)
+    columns = np.mean(dark, axis=0)
+    top = np.flatnonzero(rows[:max(1, round(height * .35))] >= .55)
+    bottom = np.flatnonzero(rows[min(height - 1, round(height * .65)):] >= .55)
+    left = np.flatnonzero(columns[:max(1, round(width * .35))] >= .55)
+    right = np.flatnonzero(columns[min(width - 1, round(width * .65)):] >= .55)
+    if all(len(edges) for edges in (top, bottom, left, right)):
+        # Use the outermost contiguous bands, not a digit's inner horizontal
+        # stroke (notably 7) or vertical stroke (notably 1).
+        top_edge, left_edge = int(top[0]), int(left[0])
+        bottom_edge = int(bottom[-1]) + round(height * .65)
+        right_edge = int(right[-1]) + round(width * .65)
+        while top_edge + 1 < height and rows[top_edge + 1] >= .55:
+            top_edge += 1
+        while left_edge + 1 < width and columns[left_edge + 1] >= .55:
+            left_edge += 1
+        while bottom_edge > 0 and rows[bottom_edge - 1] >= .55:
+            bottom_edge -= 1
+        while right_edge > 0 and columns[right_edge - 1] >= .55:
+            right_edge -= 1
+        y0, y1 = top_edge + 2, bottom_edge - 1
+        x0, x1 = left_edge + 2, right_edge - 1
+        if y1 - y0 >= height * .30 and x1 - x0 >= width * .30:
+            interior = gray[y0:y1, x0:x1]
     if interior.size == 0:
         return 0.0
     paper_level = float(np.percentile(interior, 90))

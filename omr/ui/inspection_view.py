@@ -18,7 +18,8 @@ def inspection_body(state: dict) -> str:
     exam_id = html.escape(state["exam_id"])
     source_url = "/artifact?path=" + urllib.parse.quote(state["inputs"]["scan_path"])
     grouping_only = bool(state.get("inputs", {}).get("grouping_only"))
-    process_label = "Read Rolls &amp; Match Sheets" if grouping_only else "Read Rolls, Match &amp; Grade"
+    two_step = state.get("inputs", {}).get("workflow") == "two_step"
+    process_label = "1. Detect Rolls &amp; Group Sheets" if two_step else "Read Rolls &amp; Match Sheets" if grouping_only else "Read Rolls, Match &amp; Grade"
     review_label = "Sheet Matching Review" if grouping_only else "Review Cases"
     return f"""
     <link rel="stylesheet" href="/static/inspection.css">
@@ -30,15 +31,16 @@ def inspection_body(state: dict) -> str:
           <a class="quiet-command" href="{source_url}">{_icon('download')}Source file</a>
           <form id="inspect-form" method="post" action="/runs/{run_id}/inspect" hidden><button class="secondary" type="submit">Resume Inspection</button></form>
           <form id="identity-preview-form" method="post" action="/runs/{run_id}/identity-preview" hidden><button class="secondary" type="submit">Read Rolls Only</button></form>
-          <form id="evaluate-form" method="post" action="/runs/{run_id}/evaluate" hidden><button type="submit">{process_label}{_icon('arrow-right')}</button></form>
+          <form id="evaluate-form" method="post" action="/runs/{run_id}/{'match' if two_step else 'evaluate'}" hidden><button type="submit">{process_label}{_icon('arrow-right')}</button></form>
+          <a id="grade-link" class="button" href="/runs/{run_id}/grade" hidden>2. Grade Answers</a>
           <form id="re-evaluate-form" method="post" action="/runs/{run_id}/re-evaluate" hidden><button class="secondary" type="submit">Re-run Grouping</button></form>
           <a id="review-link" class="button" href="/runs/{run_id}/review" hidden>{review_label}{_icon('arrow-right')}</a>
         </div>
       </div>
       <ol class="workflow-steps" aria-label="Run stages">
-        <li id="step-inspect">Inspect Pages</li>
-        <li id="step-match">Read Rolls &amp; Match</li>
-        <li id="step-review">Review Sheets</li>
+        <li id="step-inspect">{'1. Detect Rolls &amp; Group Sheets' if two_step else 'Inspect Pages'}</li>
+        <li id="step-match">{'2. Grade Answers' if two_step else 'Read Rolls &amp; Match'}</li>
+        <li id="step-review"{' hidden' if two_step else ''}>Review Sheets</li>
       </ol>
       <div class="inspection-summary">
         <div class="count"><strong id="total-count">-</strong><span>source pages</span></div>
@@ -76,6 +78,8 @@ def inspection_body(state: dict) -> str:
                 <option value="matching_unmatched">Unmatched pages</option>
                 <option value="matching_review">Student needs review</option>
                 <option value="matching_verified">Manually checked</option>
+                <option value="matching_auto">Auto matched</option>
+                <option value="matching_approved">Approved for release</option>
               </optgroup>
             </select>
           </div>

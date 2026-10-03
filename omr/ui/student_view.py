@@ -14,14 +14,18 @@ from omr.workflows.review import selected_student_pages
 
 QUEUE_FILTERS = {
     "all": "All students",
-    "unchecked": "Not manually checked",
+    "unchecked": "Needs human attention",
     "pending_verification": "Awaiting verification",
+    "auto_matched": "Auto matched",
+    "approved": "Approved for release",
     "needs_review": "Needs review",
     "missing_pages": "Missing pages",
     "verified": "Manually checked",
     "rejected": "Rejected",
 }
 STATUS_LABELS = {
+    "auto_matched": "Auto matched",
+    "approved": "Approved for release",
     "pending_verification": "Awaiting verification",
     "needs_review": "Needs review",
     "missing_pages": "Missing pages",
@@ -39,7 +43,7 @@ def queue_matches(student: dict, kind: str, search: str) -> bool:
     status = student.get("status") or "needs_review"
     matches = (
         kind == "all"
-        or (kind == "unchecked" and status != "verified")
+        or (kind == "unchecked" and status not in {"verified", "approved", "auto_matched"})
         or (kind == "needs_review" and status in {"needs_review", "missing_pages", "rejected"})
         or (kind == "missing_pages" and bool(student.get("missing_pages")))
         or (kind not in {"unchecked", "needs_review", "missing_pages"} and status == kind)
@@ -123,6 +127,8 @@ def workspace_body(*, state: dict, student: dict, index: dict, summary: dict, pa
     counts = {
         "Students": summary.get("students", 0),
         "Manually checked": summary.get("verified", 0),
+        "Auto matched": summary.get("auto_matched", 0),
+        "Approved for release": summary.get("approved", 0),
         "Awaiting verification": summary.get("pending_verification", 0),
         "Needs review": summary.get("needs_review", 0),
     }
