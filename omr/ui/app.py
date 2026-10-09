@@ -37,7 +37,7 @@ from omr.contracts import load_manifest
 from omr.generator.config import ExamConfig, NumericalQuestionConfig, WrittenQuestionConfig
 from omr.generator.generate import generate_exam
 from omr.io.csv import load_answer_key, load_students
-from omr.models import AlignedPage
+from omr.models import AlignedPage, Student
 from omr.reader.handwriting import build_roll_ocr_backend, save_roll_number_crop_sets
 from omr.reader.scan import align_scan_page, iter_scan_pages
 from omr.ui import identity_cache, inspection
@@ -59,6 +59,7 @@ from omr.workflows.batch import (
 )
 from omr.workflows.review import (
     assign_source_page,
+    create_identity_suggestion_pdf,
     decide_identity_suggestion,
     hold_student,
     ignore_unmatched_page,
@@ -784,6 +785,11 @@ def _render_identity_suggestions(
         roll_no = str(candidate.get("roll_no") or "")
         program = str(candidate.get("program") or "")
         decision = decisions.get(candidate_id)
+        try:
+            preview_pdf = create_identity_suggestion_pdf(parse_dir, candidate)
+            preview_link = f'<a class="button secondary" href="{_asset_url(preview_pdf, parse_dir)}">Open Review PDF</a>'
+        except (FileNotFoundError, ValueError):
+            preview_link = '<span class="muted">Review PDF unavailable until page images are present.</span>'
         blocked = bool(candidate.get("blocked"))
         state_badge = _badge("blocked" if blocked else "suggested")
         auto_badge = _badge("shadow eligible" if candidate.get("shadow_auto_eligible") else "human decision")
@@ -832,6 +838,16 @@ def _render_identity_suggestions(
                 <input name="note" required placeholder="What you checked on both pages">
                 <button type="submit">Approve {html.escape(roll_no)}</button>
               </form>
+              <form method="post" action="{action_base}approve_page1">
+                <label>Page 1 approval note</label>
+                <input name="note" required placeholder="Why Page 1 belongs to this roll">
+                <button class="secondary" type="submit">Accept Page 1 Only</button>
+              </form>
+              <form method="post" action="{action_base}approve_page2">
+                <label>Continuation-page approval note</label>
+                <input name="note" required placeholder="Why this page belongs to this roll">
+                <button class="secondary" type="submit">Accept Page 2 Only</button>
+              </form>
               <form method="post" action="{action_base}assign">
                 <label>Correct roster roll</label>
                 <input name="roll_no" list="student-rolls" required placeholder="Roll number">
@@ -854,7 +870,7 @@ def _render_identity_suggestions(
                   <h3>{html.escape(roll_no)} <span class="muted">{html.escape(program)}</span></h3>
                   <p class="mono">Path {html.escape(str(candidate.get('path') or ''))} | page 1 source {html.escape(str(candidate.get('page_one_source_index') or ''))} | page {html.escape(str(candidate.get('sheet_page') or ''))} source {html.escape(str(candidate.get('continuation_source_index') or ''))}</p>
                 </div>
-                <div class="actions">{state_badge}{auto_badge}</div>
+                <div class="actions">{state_badge}{auto_badge}{preview_link}</div>
               </div>
               <div class="suggestion-pages">
                 {_render_identity_page('Page 1 anchor', dict(candidate.get('page_one') or {}), roll_no, program, parse_dir)}
@@ -1253,9 +1269,13 @@ def _parse_student_reupload(
     students_path: Path | None,
     answer_key_path: Path | None,
     roll_ocr_backend: object | None,
+    student_override: Student | None = None,
 ) -> dict[str, Any]:
     manifest = load_manifest(manifest_path)
     students = load_students(students_path) if students_path and students_path.exists() else None
+    if student_override is not None:
+        students = dict(students or {})
+        students[student_override.roll_no] = student_override
     default_marks = float(manifest["exam"].get("marks_per_mcq", 1.0))
     answer_key = load_answer_key(answer_key_path, default_marks=default_marks) if answer_key_path and answer_key_path.exists() else None
     records: list[_PageRecord] = []
@@ -1348,6 +1368,118 @@ def _existing_student_records(
                 review_flags=[],
             )
         )
+    return records
+
+
+def _selected_review_student_records(
+    *,
+    verified_student: dict[str, Any],
+    parse_dir: Path,
+    roll_no: str,
+    run_dir: Path | None = None,
+) -> list[_PageRecord]:
+    """Load the professor-selected canonical pages for one targeted regrade."""
+    program = str(verified_student.get("program") or "") or None
+    records: list[_PageRecord] = []
+    for page in selected_student_pages(verified_student):
+        page_no = int(page.get("page") or page.get("page_index") or 0)
+        source_index = int(page.get("source_index") or 0)
+        image_path = _resolve_output_path(page.get("canonical_image_path"), parse_dir)
+        if page_no <= 0 or source_index <= 0:
+            raise ValueError(f"selected source page {source_index or '?'} has no usable aligned image")
+        if not image_path.is_file() and run_dir is not None:
+            inventory = inspection.load_inventory(run_dir)
+            inspected = next(
+                (item for item in inventory.get("pages", []) if int(item.get("source_index") or 0) == source_index),
+                None,
+            )
+            aligned_value = inspected.get("aligned") if inspected else None
+            if aligned_value:
+                candidate = (run_dir / str(aligned_value)).resolve()
+                if candidate.is_relative_to((run_dir / "inspection").resolve()) and candidate.is_file():
+                    image_path = candidate
+        if not image_path.is_file():
+            raise ValueError(f"selected source page {source_index} has no usable aligned image")
+        image = np.asarray(Image.open(image_path).convert("L"))
+        records.append(
+            _PageRecord(
+                source_path=image_path,
+                source_index=source_index,
+                aligned_page=AlignedPage(
+                    page_index=page_no,
+                    source_index=source_index,
+                    image=image,
+                    alignment_confidence=float(page.get("alignment_confidence") or 1.0),
+                    page_mark_confidence=float(page.get("page_mark_confidence") or 1.0),
+                    debug_image=None,
+                ),
+                identity_kind="professor_selected_page",
+                roll_no=roll_no,
+                program=program,
+                confidence="high",
+                identity_payload=None,
+                review_flags=["page ownership was selected manually by the professor"],
+            )
+        )
+    if not records:
+        raise ValueError("this student has no selected source pages to regrade")
+    return records
+
+
+def _external_source_page_records(
+    *,
+    run_dir: Path,
+    source_indexes: list[int],
+    roll_no: str,
+    program: str,
+) -> list[_PageRecord]:
+    """Use existing inspected source pages for a professor-added external student."""
+    inventory = inspection.load_inventory(run_dir)
+    source_records = {
+        int(record.get("source_index") or 0): record
+        for record in inventory.get("pages", [])
+    }
+    records: list[_PageRecord] = []
+    seen_sheet_pages: set[int] = set()
+    for source_index in source_indexes:
+        record = source_records.get(source_index)
+        if record is None:
+            raise ValueError(f"source page {source_index} is not present in this scan")
+        page_index = record.get("page_index")
+        aligned_value = record.get("aligned")
+        if page_index is None or not aligned_value:
+            raise ValueError(f"source page {source_index} has not passed inspection/alignment")
+        page_no = int(page_index)
+        if page_no in seen_sheet_pages:
+            raise ValueError(f"more than one selected source is detected as OMR page {page_no}")
+        aligned_path = (run_dir / str(aligned_value)).resolve()
+        inspection_root = (run_dir / "inspection").resolve()
+        if not aligned_path.is_relative_to(inspection_root) or not aligned_path.is_file():
+            raise ValueError(f"aligned image for source page {source_index} is unavailable")
+        image = np.asarray(Image.open(aligned_path).convert("L"))
+        records.append(
+            _PageRecord(
+                source_path=aligned_path,
+                source_index=source_index,
+                aligned_page=AlignedPage(
+                    page_index=page_no,
+                    source_index=source_index,
+                    image=image,
+                    alignment_confidence=float(record.get("alignment_confidence") or 0.0),
+                    page_mark_confidence=float(record.get("page_mark_confidence") or 0.0),
+                    debug_image=None,
+                ),
+                identity_kind="external_manual_source",
+                roll_no=roll_no,
+                program=program,
+                confidence="high",
+                identity_payload=None,
+                review_flags=["source page was assigned to an external student by the professor"],
+            )
+        )
+        seen_sheet_pages.add(page_no)
+    if not records:
+        raise ValueError("enter at least one source page number")
     return records
 
 
@@ -1851,6 +1983,146 @@ class RunStore:
             )
         self.start_run(run_id, evaluate=True)
 
+    def start_answer_key_regrade(self, run_id: str, answer_key_path: Path) -> None:
+        """Regrade existing student bundles without re-reading or regrouping scans."""
+        with self._worker_lock:
+            if self._worker and self._worker.is_alive():
+                raise ValueError("Another operation is running. Wait for it to finish before regrading.")
+            state = self.read_state(run_id)
+            if _is_grouping_only(state):
+                raise ValueError("This is a grouping-only run and has no answer key to regrade.")
+            if not state.get("parse_index_path") or not Path(str(state.get("parse_dir") or "")).is_dir():
+                raise ValueError("There is no completed evaluation to regrade.")
+            manifest = load_manifest(Path(str(state["inputs"]["manifest_path"])))
+            load_answer_key(answer_key_path, default_marks=float(manifest["exam"].get("marks_per_mcq", 1.0)))
+            self.write_state(
+                run_id,
+                status="regrading",
+                stage="Queued answer-key regrade",
+                error=None,
+                progress={"phase": "regrading", "processed": 0, "total": 0},
+            )
+            self._worker = threading.Thread(
+                target=self._run_answer_key_regrade,
+                args=(run_id, answer_key_path),
+                daemon=True,
+            )
+            self._worker.start()
+
+    def _run_answer_key_regrade(self, run_id: str, answer_key_path: Path) -> None:
+        try:
+            with self._review_lock:
+                state = self.read_state(run_id)
+                parse_dir = Path(str(state["parse_dir"]))
+                index_path = Path(str(state["parse_index_path"]))
+                manifest = load_manifest(Path(str(state["inputs"]["manifest_path"])))
+                default_marks = float(manifest["exam"].get("marks_per_mcq", 1.0))
+                answer_key = load_answer_key(answer_key_path, default_marks=default_marks)
+                students_path = Path(str(state["inputs"]["students_path"])) if state["inputs"].get("students_path") else None
+                students = load_students(students_path) if students_path and students_path.exists() else {}
+                students = dict(students)
+                verified, verified_path = load_or_initialize_verified_index(parse_dir)
+                verified_students = list(verified.get("students", []))
+                index = _read_json(index_path)
+                index_students = {str(student.get("roll_no")): student for student in index.get("students", [])}
+                total = len(verified_students)
+                self.write_state(run_id, stage=f"Regrading 0/{total} student bundles", progress={"phase": "regrading", "processed": 0, "total": total})
+
+                for processed, verified_student in enumerate(verified_students, start=1):
+                    roll_no = str(verified_student.get("roll_no") or "").strip()
+                    if not roll_no:
+                        continue
+                    if roll_no not in students:
+                        students[roll_no] = Student(
+                            roll_no=roll_no,
+                            name=str(verified_student.get("student_name") or f"External student {roll_no}"),
+                            email=str(verified_student.get("student_email") or ""),
+                            program=str(verified_student.get("program") or ""),
+                        )
+                    records = _selected_review_student_records(
+                        verified_student=verified_student,
+                        parse_dir=parse_dir,
+                        roll_no=roll_no,
+                        run_dir=self.run_dir(run_id),
+                    )
+                    result = _write_student_group(
+                        roll_no, records, manifest, parse_dir, students, answer_key,
+                        200.0, 0.0, True, None, None,
+                    )
+                    result.setdefault("decision_log", []).append(
+                        {
+                            "action": "answer_key_regrade",
+                            "reviewer": "professor-ui",
+                            "note": "Regraded from retained inspected pages after an answer-key update.",
+                            "created_at": _now(),
+                        }
+                    )
+                    _write_json(Path(result["details_path"]), result)
+                    index_students[roll_no] = _student_index_entry(result)
+                    verified_student.update(
+                        parser_status=result.get("status"),
+                        details_path=result.get("details_path"),
+                        sheet_pdf_path=str(Path(result["details_path"]).parent / result["sheet_pdf_path"])
+                        if result.get("sheet_pdf_path") else None,
+                        mcq_score=result.get("mcq_score"),
+                        mcq_total=result.get("mcq_total"),
+                        numerical_score=result.get("numerical_score"),
+                        numerical_total=result.get("numerical_total"),
+                        manual_score_override=None,
+                        manual_total_override=None,
+                    )
+                    verified_student.setdefault("decision_log", []).append(
+                        {
+                            "action": "answer_key_regrade",
+                            "reviewer": "professor-ui",
+                            "note": "Marks recomputed after an answer-key update.",
+                            "created_at": _now(),
+                        }
+                    )
+                    self.write_state(
+                        run_id,
+                        stage=f"Regrading {processed}/{total} student bundles",
+                        progress={"phase": "regrading", "processed": processed, "total": total},
+                    )
+
+                index["students"] = list(index_students.values())
+                _recalculate_status_counts(index)
+                report_paths = _write_review_reports(
+                    parse_dir, manifest, index, _load_student_results_for_report(index, parse_dir),
+                    index.get("unmatched_pages", []), index.get("page_errors", []),
+                )
+                index["reports"] = report_paths
+                index["review_report_csv_path"] = report_paths["csv"]
+                index["review_report_html_path"] = report_paths["html"]
+                _write_json(index_path, index)
+                _write_json(verified_path, verified)
+                marks_csv = _write_marks_csv(self.run_dir(run_id), parse_dir, index)
+                inputs = dict(state["inputs"])
+                inputs["answer_key_path"] = str(answer_key_path)
+                self.write_state(
+                    run_id,
+                    status="completed",
+                    stage="Answer-key regrade completed",
+                    inputs=inputs,
+                    marks_csv_path=str(marks_csv),
+                    answer_key_regraded_at=_now(),
+                    summary={
+                        **dict(state.get("summary") or {}),
+                        "students": len(index.get("students", [])),
+                        "ready": index["status_counts"].get("ready", 0),
+                        "needs_review": index["status_counts"].get("needs_review", 0),
+                    },
+                    error=None,
+                )
+        except Exception as exc:
+            self.write_state(
+                run_id,
+                status="completed",
+                stage="Answer-key regrade failed",
+                error=f"{type(exc).__name__}: {exc}",
+                traceback=traceback.format_exc(),
+            )
+
     def assign_inspection_page(self, run_id: str, source_index: int, page_index: int) -> dict[str, Any]:
         """Apply a human-confirmed template page number before evaluation."""
         with self._worker_lock:
@@ -2202,7 +2474,7 @@ class SmartOmrUiHandler(BaseHTTPRequestHandler):
             self._send_html("Error", body, status=HTTPStatus.INTERNAL_SERVER_ERROR)
 
     def do_POST(self) -> None:  # noqa: N802
-        if re.search(r"/(students/|unmatched/|suggestions/|pages/\d+/assign|email/prepare)", self.path):
+        if re.search(r"/(students/|unmatched/|suggestions/|manual-assign/|external-student|answer-key/regrade|pages/\d+/assign|email/prepare)", self.path):
             with self.store._review_lock:
                 self._handle_post()
         else:
@@ -2227,12 +2499,18 @@ class SmartOmrUiHandler(BaseHTTPRequestHandler):
                 elif len(parts) == 3 and parts[2] == "re-evaluate":
                     self.store.restart_evaluation(parts[1])
                     self._redirect(f"/runs/{parts[1]}/pages?matching=1")
+                elif len(parts) == 3 and parts[2] == "external-student":
+                    self._add_external_student(parts[1])
+                elif len(parts) == 4 and parts[2] == "answer-key" and parts[3] == "regrade":
+                    self._replace_answer_key_and_regrade(parts[1])
                 elif len(parts) == 5 and parts[2] == "pages" and parts[4] == "page-index":
                     self._assign_page_index(parts[1], int(parts[3]))
                 elif len(parts) == 5 and parts[2] == "pages" and parts[4] == "assign":
                     self._assign_source_page(parts[1], int(parts[3]))
                 elif len(parts) == 5 and parts[2] == "students" and parts[4] in {"verify", "hold", "reject"}:
                     self._student_decision(parts[1], urllib.parse.unquote(parts[3]), parts[4])
+                elif len(parts) == 5 and parts[2] == "students" and parts[4] == "regrade":
+                    self._regrade_selected_student(parts[1], urllib.parse.unquote(parts[3]))
                 elif len(parts) == 5 and parts[2] == "students" and parts[4] == "marks":
                     self._update_student_marks(parts[1], urllib.parse.unquote(parts[3]))
                 elif len(parts) == 5 and parts[2] == "students" and parts[4] == "correct-roll":
@@ -2243,12 +2521,14 @@ class SmartOmrUiHandler(BaseHTTPRequestHandler):
                     self._replace_student_page(parts[1], urllib.parse.unquote(parts[3]))
                 elif len(parts) == 5 and parts[2] == "unmatched" and parts[4] in {"assign", "ignore"}:
                     self._unmatched_decision(parts[1], int(parts[3]), parts[4])
-                elif len(parts) == 5 and parts[2] == "suggestions" and parts[4] in {"approve", "assign", "reject"}:
+                elif len(parts) == 5 and parts[2] == "suggestions" and parts[4] in {"approve", "approve_page1", "approve_page2", "assign", "reject"}:
                     self._identity_suggestion_decision(
                         parts[1],
                         urllib.parse.unquote(parts[3]),
                         parts[4],
                     )
+                elif len(parts) == 4 and parts[2] == "manual-assign" and parts[3] == "source":
+                    self._manual_source_assignment(parts[1])
                 elif len(parts) == 4 and parts[2] == "email" and parts[3] == "prepare":
                     self._prepare_email(parts[1])
                 elif len(parts) == 4 and parts[2] == "email" and parts[3] == "send":
@@ -2548,6 +2828,78 @@ class SmartOmrUiHandler(BaseHTTPRequestHandler):
         self.store.write_state(run_id, marks_csv_path=str(marks_csv))
         self._redirect(f"/runs/{run_id}/students/{urllib.parse.quote(roll_no)}")
 
+    def _regrade_selected_student(self, run_id: str, roll_no: str) -> None:
+        """Rebuild one student's output from the currently approved page selection."""
+        state, parse_dir, details, verified = self._student_details(run_id, roll_no)
+        if not verified or not _selection_changed(details, verified):
+            raise ValueError("there is no changed page selection to regrade")
+        index_path = Path(str(state.get("parse_index_path") or ""))
+        if not index_path.is_file():
+            raise ValueError("run is not parsed yet")
+
+        manifest_path = Path(str(state["inputs"]["manifest_path"]))
+        students_path = Path(str(state["inputs"]["students_path"])) if state["inputs"].get("students_path") else None
+        answer_key_path = Path(str(state["inputs"]["answer_key_path"])) if state["inputs"].get("answer_key_path") else None
+        manifest = load_manifest(manifest_path)
+        students = load_students(students_path) if students_path and students_path.exists() else None
+        default_marks = float(manifest["exam"].get("marks_per_mcq", 1.0))
+        answer_key = load_answer_key(answer_key_path, default_marks=default_marks) if answer_key_path and answer_key_path.exists() else None
+        records = _selected_review_student_records(
+            verified_student=verified,
+            parse_dir=parse_dir,
+            roll_no=roll_no,
+        )
+
+        run_dir = self.store.run_dir(run_id)
+        student_dir = parse_dir / "students" / _safe_id(roll_no)
+        backup_dir = run_dir / "manual_regrade_backups" / _safe_id(roll_no) / datetime.now().strftime("%Y%m%d_%H%M%S")
+        if student_dir.exists():
+            backup_dir.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copytree(student_dir, backup_dir)
+        try:
+            result = _write_student_group(
+                roll_no,
+                records,
+                manifest,
+                parse_dir,
+                students,
+                answer_key,
+                200.0,
+                0.0,
+                True,
+                None,
+                None,
+            )
+            action = "reprocessed" if answer_key is None else "regraded"
+            result.setdefault("review_flags", []).append(
+                f"student was {action} from professor-selected source pages"
+            )
+            result.setdefault("decision_log", []).append(
+                {
+                    "action": "regrade_selected_pages",
+                    "reviewer": "professor-ui",
+                    "note": "Rebuilt PDF and marks from the current manually selected source pages.",
+                    "created_at": _now(),
+                }
+            )
+            _write_json(Path(result["details_path"]), result)
+            _commit_student_result(
+                store=self.store,
+                run_id=run_id,
+                state=state,
+                parse_dir=parse_dir,
+                index_path=index_path,
+                roll_no=roll_no,
+                result=result,
+                roll_ocr_state=dict(state.get("roll_ocr") or {}),
+            )
+        except Exception:
+            if backup_dir.exists():
+                shutil.rmtree(student_dir, ignore_errors=True)
+                shutil.copytree(backup_dir, student_dir)
+            raise
+        self._redirect(f"/runs/{run_id}/students/{urllib.parse.quote(roll_no)}")
+
     def _correct_student_roll_feedback(self, run_id: str, roll_no: str) -> None:
         state = self.store.read_state(run_id)
         parse_dir = Path(str(state.get("parse_dir") or ""))
@@ -2625,6 +2977,174 @@ class SmartOmrUiHandler(BaseHTTPRequestHandler):
                 _write_json(verified_path, verified_index)
 
         self._redirect(f"/runs/{run_id}/students/{urllib.parse.quote(roll_no)}")
+
+    def _add_external_student(self, run_id: str) -> None:
+        """Process a professor-added sheet for a student absent from the roster."""
+        state = self.store.read_state(run_id)
+        parse_dir = Path(str(state.get("parse_dir") or ""))
+        index_path = Path(str(state.get("parse_index_path") or ""))
+        run_dir = self.store.run_dir(run_id)
+        if not parse_dir.exists() or not index_path.is_file():
+            raise ValueError("run is not parsed yet")
+
+        staging_dir = run_dir / "_upload_staging" / uuid.uuid4().hex
+        try:
+            fields, files = parse_multipart_upload(
+                self.rfile,
+                content_type=self.headers.get("content-type", ""),
+                content_length=int(self.headers.get("content-length", 0)),
+                staging_dir=staging_dir,
+            )
+            roll_no = re.sub(r"\s+", "", str(fields.get("roll_no") or "").upper())
+            if not re.fullmatch(r"[A-Z0-9_-]{3,24}", roll_no):
+                raise ValueError("external student ID must contain only letters, digits, underscores, or hyphens")
+            name = str(fields.get("name") or "").strip() or f"External student {roll_no}"
+            email = str(fields.get("email") or "").strip()
+            program = str(fields.get("program") or "BTECH").upper()
+            if program not in {"BTECH", "MTECH", "PHD"}:
+                raise ValueError("program must be BTECH, MTECH, or PHD")
+            note = str(fields.get("note") or "").strip()
+            raw_sources = str(fields.get("source_indexes") or "").strip()
+            source_indexes: list[int] = []
+            if raw_sources:
+                try:
+                    source_indexes = [int(value.strip()) for value in raw_sources.split(",") if value.strip()]
+                except ValueError as exc:
+                    raise ValueError("source page numbers must be whole numbers, separated by commas") from exc
+                if not source_indexes or any(value < 1 for value in source_indexes):
+                    raise ValueError("source page numbers must be positive whole numbers")
+                if len(set(source_indexes)) != len(source_indexes):
+                    raise ValueError("each source page number may be entered only once")
+            upload = files.get("student_sheet")
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            saved_upload: Path | None = None
+            if not source_indexes:
+                if upload is None or not upload.path.exists() or upload.path.stat().st_size == 0:
+                    raise ValueError("enter source page number(s), or upload a student PDF/image")
+                saved_dir = run_dir / "external_student_uploads" / _safe_id(roll_no) / timestamp
+                saved_dir.mkdir(parents=True, exist_ok=True)
+                saved_upload = saved_dir / _safe_id(upload.filename or upload.path.name)
+                shutil.copy2(upload.path, saved_upload)
+        finally:
+            shutil.rmtree(staging_dir, ignore_errors=True)
+
+        student_dir = parse_dir / "students" / _safe_id(roll_no)
+        backup_dir = run_dir / "external_student_backups" / _safe_id(roll_no) / timestamp
+        if student_dir.exists():
+            backup_dir.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copytree(student_dir, backup_dir)
+        try:
+            student_override = Student(roll_no=roll_no, name=name, email=email, program=program)
+            if source_indexes:
+                manifest_path = Path(str(state["inputs"]["manifest_path"]))
+                manifest = load_manifest(manifest_path)
+                students_path = Path(str(state["inputs"]["students_path"])) if state["inputs"].get("students_path") else None
+                students = load_students(students_path) if students_path and students_path.exists() else {}
+                students = dict(students)
+                students[roll_no] = student_override
+                answer_key_path = Path(str(state["inputs"]["answer_key_path"])) if state["inputs"].get("answer_key_path") else None
+                default_marks = float(manifest["exam"].get("marks_per_mcq", 1.0))
+                answer_key = load_answer_key(answer_key_path, default_marks=default_marks) if answer_key_path and answer_key_path.exists() else None
+                records = _external_source_page_records(
+                    run_dir=run_dir,
+                    source_indexes=source_indexes,
+                    roll_no=roll_no,
+                    program=program,
+                )
+                result = _write_student_group(
+                    roll_no, records, manifest, parse_dir, students, answer_key,
+                    200.0, 0.0, True, None, None,
+                )
+                roll_ocr_state = {"enabled": False, "provider": "manual_source_assignment"}
+            else:
+                roll_ocr_backend, roll_ocr_state = _build_ui_roll_ocr_backend()
+                result = _parse_student_reupload(
+                    upload_path=saved_upload,
+                    roll_no=roll_no,
+                    parse_dir=parse_dir,
+                    manifest_path=Path(str(state["inputs"]["manifest_path"])),
+                    students_path=Path(str(state["inputs"]["students_path"])) if state["inputs"].get("students_path") else None,
+                    answer_key_path=Path(str(state["inputs"]["answer_key_path"])) if state["inputs"].get("answer_key_path") else None,
+                    roll_ocr_backend=roll_ocr_backend,
+                    student_override=student_override,
+                )
+            result.setdefault("review_flags", []).append(
+                "external student added manually; not present in the uploaded roster"
+            )
+            result.setdefault("decision_log", []).append(
+                {
+                    "action": "add_external_student",
+                    "reviewer": "professor-ui",
+                    "note": note or "Added an external student outside the roster.",
+                    "source_indexes": source_indexes,
+                    "created_at": _now(),
+                }
+            )
+            _write_json(Path(result["details_path"]), result)
+            _commit_student_result(
+                store=self.store,
+                run_id=run_id,
+                state=state,
+                parse_dir=parse_dir,
+                index_path=index_path,
+                roll_no=roll_no,
+                result=result,
+                roll_ocr_state=roll_ocr_state,
+            )
+            verified, verified_path = load_or_initialize_verified_index(parse_dir)
+            external = next(student for student in verified["students"] if str(student.get("roll_no")) == roll_no)
+            external["external_student"] = True
+            external["eligible_for_email"] = False
+            external.setdefault("review_flags", []).append(
+                "external student: excluded from automatic email release until added to the official roster"
+            )
+            external.setdefault("decision_log", []).append(
+                {
+                    "action": "add_external_student",
+                    "reviewer": "professor-ui",
+                    "note": note or "Added an external student outside the roster.",
+                    "source_indexes": source_indexes,
+                    "created_at": _now(),
+                }
+            )
+            _write_json(verified_path, verified)
+        except Exception:
+            if backup_dir.exists():
+                shutil.rmtree(student_dir, ignore_errors=True)
+                shutil.copytree(backup_dir, student_dir)
+            raise
+        self._redirect(f"/runs/{run_id}/students/{urllib.parse.quote(roll_no)}")
+
+    def _replace_answer_key_and_regrade(self, run_id: str) -> None:
+        """Save a replacement key, then regrade only the retained student bundles."""
+        state = self.store.read_state(run_id)
+        if _is_grouping_only(state):
+            raise ValueError("This is a grouping-only run and cannot be regraded")
+        staging_dir = self.store.run_dir(run_id) / "_upload_staging" / uuid.uuid4().hex
+        try:
+            _fields, files = parse_multipart_upload(
+                self.rfile,
+                content_type=self.headers.get("content-type", ""),
+                content_length=int(self.headers.get("content-length", 0)),
+                staging_dir=staging_dir,
+            )
+            upload = files.get("answer_key")
+            if upload is None or not upload.path.is_file() or upload.path.stat().st_size == 0:
+                raise ValueError("choose a replacement answer-key CSV or XLSX file")
+            inputs_dir = self.store.run_dir(run_id) / "inputs"
+            inputs_dir.mkdir(parents=True, exist_ok=True)
+            target = inputs_dir / "answer_key.csv"
+            if target.exists():
+                archive = self.store.run_dir(run_id) / "answer_key_history"
+                archive.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(target, archive / f"answer_key_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv")
+            _normalize_tabular_upload(upload.path, target)
+            manifest = load_manifest(Path(str(state["inputs"]["manifest_path"])))
+            load_answer_key(target, default_marks=float(manifest["exam"].get("marks_per_mcq", 1.0)))
+        finally:
+            shutil.rmtree(staging_dir, ignore_errors=True)
+        self.store.start_answer_key_regrade(run_id, target)
+        self._redirect(f"/runs/{run_id}")
 
     def _reupload_student_sheet(self, run_id: str, roll_no: str) -> None:
         state = self.store.read_state(run_id)
@@ -2864,6 +3384,21 @@ class SmartOmrUiHandler(BaseHTTPRequestHandler):
             assigned_roll_no=(form.get("roll_no") or "").strip().upper() or None,
             reviewer="professor-ui",
             note=note,
+        )
+        self._redirect(f"/runs/{run_id}/review")
+
+    def _manual_source_assignment(self, run_id: str) -> None:
+        state = self.store.read_state(run_id)
+        parse_dir = Path(str(state.get("parse_dir") or ""))
+        form = self._urlencoded_form()
+        assign_source_page(
+            parse_dir,
+            int(form.get("source_index") or 0),
+            (form.get("roll_no") or "").strip().upper(),
+            page_index=int(form.get("page_index") or 0),
+            replace_existing=form.get("replace_existing") == "on",
+            reviewer="professor-ui",
+            note=(form.get("note") or "").strip(),
         )
         self._redirect(f"/runs/{run_id}/review")
 
@@ -3279,6 +3814,16 @@ class SmartOmrUiHandler(BaseHTTPRequestHandler):
                 "</tr>"
             )
         marks_action = "" if grouping_only else f'<a class="button" href="{_asset_url(state.get("marks_csv_path"))}">Original Parser Marks CSV</a>'
+        answer_key_regrade = "" if grouping_only else f"""
+        <section class=\"band\">
+          <h2>Update Answer Key</h2>
+          <form method=\"post\" enctype=\"multipart/form-data\" action=\"/runs/{html.escape(run_id)}/answer-key/regrade\" class=\"grid\">
+            <div class=\"wide\"><label>Replacement answer key CSV / XLSX</label><input name=\"answer_key\" type=\"file\" accept=\".csv,.xlsx\" required></div>
+            <div><button type=\"submit\">Replace Key And Regrade All Students</button></div>
+          </form>
+          <p class=\"muted\">This keeps the existing inspected pages and page mapping. For numerical alternatives, put both correct values in one answer cell, for example <code>35|36</code>. Dropped questions use <code>DROPPED</code> with marks <code>0</code>.</p>
+        </section>
+        """
         review_link = f"/runs/{html.escape(run_id)}/review"
         marks_heading = "" if grouping_only else "<th>Marks</th>"
         column_count = 6 if grouping_only else 7
@@ -3296,6 +3841,7 @@ class SmartOmrUiHandler(BaseHTTPRequestHandler):
           <a class="button secondary" href="/runs/{html.escape(run_id)}/email">Email Release</a>
           <a class="button secondary" href="{_asset_url(parse_dir / 'review_report.html')}">Original Parser Report</a>
         </div>
+        {answer_key_regrade}
         <div class="section-title"><h2>Students</h2></div>
         <table>
           <thead><tr><th>Roll No</th><th>Name</th><th>Email</th>{marks_heading}<th>Status</th><th>Flags</th><th>Review Notes</th></tr></thead>
@@ -3459,6 +4005,24 @@ class SmartOmrUiHandler(BaseHTTPRequestHandler):
                 </div>
         """
         replacement_button = "Upload And Reprocess Sheet" if grouping_only else "Upload And Re-evaluate"
+        regrade_action = ""
+        regrade_toolbar_action = ""
+        if selection_changed:
+            regrade_label = "Reprocess Selected Pages" if grouping_only else "Regrade Selected Pages"
+            regrade_toolbar_action = f'''
+                <form method="post" action="/runs/{html.escape(run_id)}/students/{urllib.parse.quote(roll_no)}/regrade">
+                  <button type="submit">{regrade_label}</button>
+                </form>
+            '''
+            regrade_action = f'''
+                <div class="operation">
+                  <h3>Apply Manual Page Mapping</h3>
+                  <p class="muted">Rebuild this student's PDF and marks from the source pages selected above.</p>
+                  <form method="post" action="/runs/{html.escape(run_id)}/students/{urllib.parse.quote(roll_no)}/regrade">
+                    <p><button type="submit">{regrade_label}</button></p>
+                  </form>
+                </div>
+            '''
         body = f"""
         <h1>Student {html.escape(str(student.get('roll_no') or roll_no))}</h1>
         <div class="grid">
@@ -3468,7 +4032,7 @@ class SmartOmrUiHandler(BaseHTTPRequestHandler):
           <div class="metric"><span>Status</span><strong>{_badge(display_status)}</strong></div>
         </div>
         <div class="actions band toolbar">
-          <div class="actions">{decision_actions}</div>
+          <div class="actions">{regrade_toolbar_action}{decision_actions}</div>
           <div class="actions">
             <a class="button secondary" href="/runs/{html.escape(run_id)}">Back to Exam</a>
             <a class="button secondary" href="/runs/{html.escape(run_id)}/review">Review Sheets</a>
@@ -3494,6 +4058,7 @@ class SmartOmrUiHandler(BaseHTTPRequestHandler):
             <section class="band">
               <h2>Review Operations</h2>
               <div class="operation-grid">
+                {regrade_action}
                 {edit_marks_operation}
                 <div class="operation">
                   <h3>Roll OCR Training Feedback</h3>
@@ -3575,6 +4140,7 @@ class SmartOmrUiHandler(BaseHTTPRequestHandler):
                 "</tr>"
             )
         unmatched_rows = []
+        manual_page_cards = []
         assigned_sources = {page.get("source_index") for student in index.get("students", []) for page in selected_student_pages(student)}
         for page in index.get("unmatched_pages", []):
             source_index = int(page.get("source_index") or 0)
@@ -3610,6 +4176,23 @@ class SmartOmrUiHandler(BaseHTTPRequestHandler):
                 f"<td><a href=\"{_asset_url(page.get('details_path'), parse_dir)}\">details</a></td>"
                 f"<td>{actions}</td>"
                 "</tr>"
+            )
+            page_records = page.get("pages") if isinstance(page.get("pages"), list) else []
+            canonical_image = ""
+            if page_records and isinstance(page_records[0], dict):
+                canonical_image = str(page_records[0].get("canonical_image_path") or "")
+            image_html = (
+                f'<a href="/runs/{html.escape(run_id)}/pages?page={source_index}">'
+                f'<img class="sheet" loading="lazy" src="{_asset_url(canonical_image, parse_dir)}" '
+                f'alt="Unmatched source {source_index}"></a>'
+                if canonical_image
+                else '<p class="muted">Image unavailable</p>'
+            )
+            manual_page_cards.append(
+                f'<article class="suggestion"><div class="suggestion-heading"><h3>Source {source_index}</h3>'
+                f'<span>{_badge(page_status)}</span></div><p>Detected OMR page: '
+                f'{html.escape(str(page_index or "unknown"))}</p>{image_html}'
+                f'<p><a href="/runs/{html.escape(run_id)}/pages?page={source_index}">Open full image and overlays</a></p></article>'
             )
         page_error_rows = []
         for error in index.get("page_errors", []):
@@ -3667,6 +4250,33 @@ class SmartOmrUiHandler(BaseHTTPRequestHandler):
         {grouping_order_notice}
         <datalist id="student-rolls">{roll_options}</datalist>
         {suggestion_html}
+        <div class="section-title"><h2>Manual Source Mapping</h2></div>
+        <section class="band">
+          <form method="post" action="/runs/{html.escape(run_id)}/manual-assign/source" class="grid">
+            <div><label>Source page number</label><input name="source_index" type="number" min="1" required></div>
+            <div><label>OMR page number</label><input name="page_index" type="number" min="1" max="{html.escape(str(index.get('expected_pages') or 1))}" required></div>
+            <div><label>Roster roll number</label><input name="roll_no" list="student-rolls" required></div>
+            <div><label><input name="replace_existing" type="checkbox"> Replace existing page</label></div>
+            <div class="wide"><label>Reason</label><input name="note" required placeholder="Why this source page belongs to this roster roll"></div>
+            <div><button type="submit">Map Source Page</button></div>
+          </form>
+        </section>
+        <div class="section-title"><h2>External Student Not In Roster</h2></div>
+        <section class="band">
+          <form method="post" enctype="multipart/form-data" action="/runs/{html.escape(run_id)}/external-student" class="grid">
+            <div><label>Student ID / Roll No</label><input name="roll_no" placeholder="SP26004" required></div>
+            <div><label>Program</label><select name="program"><option value="BTECH">BTECH</option><option value="MTECH">MTECH</option><option value="PHD">PHD</option></select></div>
+            <div><label>Name</label><input name="name" placeholder="Student name"></div>
+            <div><label>Email</label><input name="email" type="email" placeholder="optional"></div>
+            <div><label>Source page number(s)</label><input name="source_indexes" placeholder="43, 44"></div>
+            <div><label>Student PDF / Image</label><input name="student_sheet" type="file" accept=".pdf,.png,.jpg,.jpeg,.tif,.tiff"></div>
+            <div class="wide"><label>Reason</label><input name="note" required placeholder="Why this student is absent from the roster"></div>
+            <div><button type="submit">Add And Evaluate External Student</button></div>
+          </form>
+          <p class="muted">Enter inspected source pages from this scan, for example 43, 44. Upload is only needed when the sheet is outside this scan. External students remain in review and are excluded from automatic email release.</p>
+        </section>
+        <div class="section-title"><h2>Unmatched Page Images For Manual Mapping</h2></div>
+        <section class="pages">{''.join(manual_page_cards) or '<p class="empty">No unmatched pages require mapping.</p>'}</section>
         <div class="section-title"><h2>Students Needing Review</h2></div>
         <table><thead><tr><th>Roll No</th>{marks_heading}<th>Status</th><th>Missing Pages</th><th>Flags</th><th>Parser Notes</th><th>Latest Decision</th></tr></thead>
         <tbody>{review_rows_html}</tbody></table>

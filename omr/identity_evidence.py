@@ -12,6 +12,7 @@ SEVERITIES = {INFO, WARN, BLOCK}
 STRIP_DISAGREES = "STRIP_DISAGREES"
 FAINT_BUBBLE = "FAINT_BUBBLE"
 LOW_CELL_CONFIDENCE = "LOW_CELL_CONFIDENCE"
+PAGE2_LOW_CONF = "PAGE2_LOW_CONF"
 EMPTY_FIELD = "EMPTY_FIELD"
 PROGRAM_SELECTOR_BLANK = "PROGRAM_SELECTOR_BLANK"
 PROGRAM_SELECTOR_AMBIGUOUS = "PROGRAM_SELECTOR_AMBIGUOUS"
@@ -28,12 +29,15 @@ ROLL_NOT_IN_ROSTER = "ROLL_NOT_IN_ROSTER"
 PAGE1_MISSING = "PAGE1_MISSING"
 ANCHOR_VIA_PAGE2 = "ANCHOR_VIA_PAGE2"
 ANCHOR_VIA_CELLS = "ANCHOR_VIA_CELLS"
+ATTACHED_BY_ORDER = "ATTACHED_BY_ORDER"
+ROSTER_CELL_SUPPORT = "ROSTER_CELL_SUPPORT"
 
 
 FRIENDLY_MESSAGES = {
     STRIP_DISAGREES: "Whole-strip OCR disagrees with the individual digit cells.",
     FAINT_BUBBLE: "The bubbled identity was recovered from faint marks.",
     LOW_CELL_CONFIDENCE: "At least one handwritten digit has low model confidence.",
+    PAGE2_LOW_CONF: "Page 2 was attached through an exact verified anchor despite low identity confidence.",
     EMPTY_FIELD: "The handwritten roll-number field appears empty.",
     PROGRAM_SELECTOR_BLANK: "The program selector is blank.",
     PROGRAM_SELECTOR_AMBIGUOUS: "The program selector has competing or faint marks.",
@@ -50,6 +54,8 @@ FRIENDLY_MESSAGES = {
     PAGE1_MISSING: "The proposal has no page-one identity anchor.",
     ANCHOR_VIA_PAGE2: "Page-one bubbles and continuation-page cells agree.",
     ANCHOR_VIA_CELLS: "Page-one and continuation-page digit cells agree.",
+    ATTACHED_BY_ORDER: "This page was paired by verified scanner collation, not independent identity evidence.",
+    ROSTER_CELL_SUPPORT: "Cell probabilities support a roster roll, but do not replace the literal OCR read.",
 }
 
 
@@ -107,6 +113,7 @@ def merge_evidence(*groups: Iterable[dict[str, Any]] | None) -> list[dict[str, A
 
 __all__ = [
     "ANCHOR_SLOT_TAKEN",
+    "ATTACHED_BY_ORDER",
     "ANCHOR_VIA_CELLS",
     "ANCHOR_VIA_PAGE2",
     "BLOCK",
@@ -117,6 +124,7 @@ __all__ = [
     "FAINT_BUBBLE",
     "INFO",
     "LOW_CELL_CONFIDENCE",
+    "PAGE2_LOW_CONF",
     "NEAR_NEIGHBOUR_EVIDENCE_MISSING",
     "NEAR_NEIGHBOUR_HOLD",
     "NO_ANCHOR_FOR_ROLL",
@@ -125,6 +133,7 @@ __all__ = [
     "PROGRAM_SELECTOR_AMBIGUOUS",
     "PROGRAM_SELECTOR_BLANK",
     "ROLL_NOT_IN_ROSTER",
+    "ROSTER_CELL_SUPPORT",
     "SOURCES_CONTRADICT",
     "STRIP_DISAGREES",
     "WARN",

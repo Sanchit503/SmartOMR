@@ -14,6 +14,7 @@ from omr.generator.generate import generate_exam
 from omr.identity_evidence import (
     BLOCK,
     NEAR_NEIGHBOUR_HOLD,
+    PAGE2_LOW_CONF,
     PROGRAM_INFERRED_FROM_GRID,
     PROGRAM_SELECTOR_BLANK,
     WARN,
@@ -255,6 +256,33 @@ def test_exact_cross_page_roll_pair_is_recovered_only_with_roster_match():
         valid_rolls={"2023999"},
     )
     assert {record.source_index for record in unmatched} == {11, 47}
+
+
+def test_exact_cross_page_recovery_does_not_reject_a_strong_page_two_for_weak_anchor_cells():
+    page_one = _record(11, 1, "2023478", "medium")
+    page_one_read = _cell_read("2023478", 0.90)
+    weak_anchor_digit = page_one_read["ocr_results"]["BTECH"]["cells"]["raw"]["cells"][-1]["raw"]
+    weak_anchor_digit["top_probability"] = 0.30
+    weak_anchor_digit["class_probabilities"]["8"] = 0.30
+    weak_anchor_digit["class_probabilities"]["3"] = 0.70
+    page_one.identity_payload = {"write_in_roll_read": page_one_read}
+    page_two = _record(47, 2, "2023478", "medium")
+    page_two.identity_payload = _cell_read("2023478", 0.90)
+
+    grouped, unmatched = _reconcile_exact_cross_page_roll_pairs(
+        [page_one, page_two],
+        {},
+        [page_one, page_two],
+        page_one_index=1,
+        valid_rolls={"2023478", "2023473"},
+        program_by_roll={"2023478": "BTECH", "2023473": "BTECH"},
+    )
+
+    assert unmatched == []
+    assert [record.source_index for record in grouped["2023478"]] == [11, 47]
+    assert PAGE2_LOW_CONF in {
+        flag["code"] for flag in grouped["2023478"][1].identity_payload["evidence_flags"]
+    }
 
 
 def test_exact_cross_page_recovery_supports_all_unique_continuation_slots():

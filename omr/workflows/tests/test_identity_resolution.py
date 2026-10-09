@@ -213,6 +213,25 @@ def test_path_b_requires_an_existing_page_one_anchor_for_shadow_eligibility():
     assert NO_ANCHOR_FOR_ROLL in _codes(candidate)
 
 
+def test_path_b_surfaces_a_borderline_page_two_for_review_without_auto_attachment():
+    roll = "MT26108"
+    result = resolve_identity_proposals(
+        [
+            _page_one(roll, roll, program="MTECH"),
+            _continuation(roll, program="MTECH", minimum=0.28),
+        ],
+        valid_rolls={roll},
+        program_by_roll={roll: "MTECH"},
+        current_assignments={1: roll},
+    )
+
+    assert result["counts"]["suggested_candidates"] == 1
+    candidate = result["candidates"][0]
+    assert candidate["path"] == "B"
+    assert candidate["automatic_attachment_enabled"] is False
+    assert candidate["shadow_auto_eligible"] is False
+
+
 def test_path_b_blocks_different_valid_page_one_cell_roll():
     bubble_roll = "2023478"
     cell_roll = "2023473"
@@ -286,3 +305,17 @@ def test_duplicate_continuation_claims_block_every_candidate_order_independently
     assert [candidate["candidate_id"] for candidate in first["candidates"]] == [
         candidate["candidate_id"] for candidate in second["candidates"]
     ]
+
+
+def test_order_attachment_audit_marks_a_valid_cell_contradiction():
+    assigned = "2023478"
+    other = "2023473"
+    continuation = _continuation(other)
+    continuation["identity"]["attachment_method"] = "scanner_order"
+    result = resolve_identity_proposals(
+        [_page_one(assigned, assigned), continuation],
+        valid_rolls={assigned, other},
+        program_by_roll={assigned: "BTECH", other: "BTECH"},
+        current_assignments={1: assigned, 2: assigned},
+    )
+    assert result["counts"]["order_attachment_audit"]["contradict_valid_roster"] == 1

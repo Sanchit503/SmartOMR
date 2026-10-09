@@ -42,6 +42,7 @@ from omr.reader.handwriting import (
     read_write_in_roll_number,
     save_roll_number_crop_sets,
 )
+from omr.identity_evidence import ATTACHED_BY_ORDER, PAGE2_LOW_CONF, WARN, evidence, merge_evidence
 from omr.reader.identity import read_roll_number
 from omr.reader.scan import ScanError, align_scan_page, iter_scan_pages
 from omr.reader.written import crop_written_responses
@@ -302,13 +303,11 @@ def _path_a_near_neighbour_evidence(
 ) -> list[dict[str, Any]]:
     if not valid_rolls or not anchor.roll_no or not anchor.program:
         return []
-    anchor_page = _record_page_evidence(anchor)
     continuation_page = _record_page_evidence(continuation)
     _neighbours, flags = near_neighbour_guard(
         anchor.roll_no,
         anchor.program,
         [
-            ("page1_cells", anchor_page["cell_probabilities"]),
             (f"page{continuation.aligned_page.page_index}_cells", continuation_page["cell_probabilities"]),
         ],
         valid_rolls=valid_rolls,
@@ -637,6 +636,17 @@ def _reconcile_exact_cross_page_roll_pairs(
                 "original_roll_no": continuation.roll_no,
                 "original_confidence": continuation.confidence,
                 "reconciliation": "exact page-1 bubble roll and continuation handwritten roll",
+                "evidence_flags": merge_evidence(
+                    identity_payload.get("evidence_flags"),
+                    [
+                        evidence(
+                            PAGE2_LOW_CONF,
+                            WARN,
+                            source_index=continuation.source_index,
+                            cell_min_probability=round(_cell_min_probability(continuation.identity_payload or {}), 6),
+                        )
+                    ],
+                ),
             }
         )
         continuation.identity_kind = EXACT_CROSS_PAGE_ROLL_IDENTITY_KIND
@@ -856,6 +866,10 @@ def _positional_record(record: _PageRecord, anchor: _PageRecord, grouping_mode: 
     review_flags = [
         flag for flag in record.review_flags if flag != HANDWRITTEN_OCR_NOT_CONFIGURED_FLAG
     ]
+    review_flags.append(
+        f"ATTACHED_BY_ORDER: {grouping_mode} scanner collation paired this page; "
+        "independent identity evidence is required before verification"
+    )
     if record.roll_no and anchor.roll_no and record.roll_no != anchor.roll_no:
         review_flags.append(
             f"{grouping_mode} grouping attached page {record.aligned_page.page_index} to roll {anchor.roll_no}, "
@@ -877,6 +891,18 @@ def _positional_record(record: _PageRecord, anchor: _PageRecord, grouping_mode: 
             "original_identity_kind": record.identity_kind,
             "original_roll_no": record.roll_no,
             "original_confidence": record.confidence,
+            "attachment_method": "scanner_order",
+            "evidence_flags": merge_evidence(
+                identity_payload.get("evidence_flags"),
+                [
+                    evidence(
+                        ATTACHED_BY_ORDER,
+                        WARN,
+                        grouping_mode=grouping_mode,
+                        anchor_source_index=anchor.source_index,
+                    )
+                ],
+            ),
         }
     )
     confidence = "high" if _strong_enough(anchor.confidence, "high") else "medium"
@@ -949,8 +975,18 @@ def _group_records_by_inferred_order(
         anchors[slot] = anchor
         claims_by_roll.setdefault(anchor.roll_no, []).append(slot)
 
+    # A repeated bubble alone is not an agreed ownership claim.  When bubbles
+    # collide, retain a sole independently confirmed page-one anchor and leave
+    # every unsupported competing bubble for the global review resolver.
+    exact_claims_by_roll: dict[str, list[int]] = {}
+    for roll_no, claimed_slots in claims_by_roll.items():
+        exact_claims_by_roll[roll_no] = [
+            slot for slot in claimed_slots if _page_one_write_in_matches_bubbles(anchors[slot])
+        ]
     duplicate_rolls = {
-        roll_no for roll_no, claimed_slots in claims_by_roll.items() if len(claimed_slots) != 1
+        roll_no
+        for roll_no, claimed_slots in claims_by_roll.items()
+        if len(claimed_slots) > 1 and len(exact_claims_by_roll[roll_no]) != 1
     }
     grouped: dict[str, list[_PageRecord]] = {}
     already_unmatched = {record.source_index for record in unmatched}
@@ -974,6 +1010,19 @@ def _group_records_by_inferred_order(
             reason = (
                 f"duplicate page-1 ownership claim for roll {anchor.roll_no}; "
                 f"auto-detected {grouping_mode} order left every claimed sheet unmatched"
+            )
+            for record in pages.values():
+                if reason not in record.review_flags:
+                    record.review_flags.append(reason)
+                if record.source_index not in already_unmatched:
+                    unmatched.append(record)
+                    already_unmatched.add(record.source_index)
+            continue
+
+        if len(claims_by_roll[anchor.roll_no]) > 1 and slot not in exact_claims_by_roll[anchor.roll_no]:
+            reason = (
+                f"duplicate page-1 bubble claim for roll {anchor.roll_no}; this page lacks independent "
+                "bubble/cell agreement and was left for identity review"
             )
             for record in pages.values():
                 if reason not in record.review_flags:

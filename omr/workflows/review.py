@@ -25,7 +25,7 @@ from PIL import Image
 
 from omr.io.csv import normalize_roll
 from omr.workflows.parse import _json_path
-from omr.workflows.identity_resolution import resolution_digest
+from omr.workflows.identity_resolution import resolve_identity_proposals, resolution_digest
 
 
 VERIFICATION_SCHEMA_VERSION = 1
@@ -728,7 +728,7 @@ def _write_verified_index(parsed_dir: Path, index: dict[str, Any]) -> Path:
         _refresh_student_page_state(student, expected_pages)
         student["eligible_for_email"] = student.get("status") == "verified" and bool(
             student.get("verified_sheet_pdf_path")
-        ) and not student.get("missing_pages")
+        ) and not student.get("missing_pages") and not student.get("external_student")
     index["status_counts"] = _status_counts(index)
     index["updated_at"] = _now()
     index["reports"] = _write_reports(parsed_dir, index)
@@ -822,11 +822,87 @@ def load_or_initialize_verified_index(parsed_dir: str | Path) -> tuple[dict[str,
     return initialize_verification_index(parsed_dir)
 
 
+def _rebuild_identity_resolution_from_preview(parsed_root: Path, index: dict[str, Any]) -> dict[str, Any]:
+    """Recover review proposals when an older parser run omitted its JSON artifact."""
+    run_dir = parsed_root.parent.parent
+    preview_path = run_dir / "identity_preview" / "index.json"
+    if not preview_path.is_file():
+        return {}
+    preview = _load_json(preview_path)
+    preview_pages = preview.get("pages") if isinstance(preview.get("pages"), list) else []
+    if not preview_pages:
+        return {}
+
+    assignments: dict[int, str] = {}
+    page_images: dict[int, str] = {}
+    programs: dict[str, str] = {}
+    for student in index.get("students", []):
+        roll_no = str(student.get("roll_no") or "").upper()
+        if not roll_no:
+            continue
+        programs[roll_no] = str(student.get("program") or "").upper()
+        for page in selected_student_pages(student):
+            source_index = int(page.get("source_index") or 0)
+            if source_index:
+                assignments[source_index] = roll_no
+                page_images[source_index] = str(page.get("canonical_image_path") or "")
+    for page in index.get("unmatched_pages", []):
+        source_index = int(page.get("source_index") or 0)
+        pages = page.get("pages") if isinstance(page.get("pages"), list) else []
+        if source_index and pages and isinstance(pages[0], dict):
+            page_images[source_index] = str(pages[0].get("canonical_image_path") or "")
+
+    pages = []
+    for page in preview_pages:
+        if not isinstance(page, dict):
+            continue
+        source_index = int(page.get("source_index") or 0)
+        pages.append(
+            {
+                "source_index": source_index,
+                "sheet_page": page.get("sheet_page"),
+                "identity_kind": page.get("identity_kind"),
+                "literal_roll_no": page.get("literal_roll_no"),
+                "program": page.get("program"),
+                "confidence": page.get("confidence"),
+                "identity": page.get("identity") or {},
+                "page_image_path": page_images.get(source_index, ""),
+                "current_roll": assignments.get(source_index),
+            }
+        )
+    resolution = resolve_identity_proposals(
+        pages,
+        valid_rolls=set(programs),
+        program_by_roll=programs,
+        current_assignments=assignments,
+    )
+    resolution["digest"] = resolution_digest(resolution)
+    output_path = parsed_root / "identity_resolution.json"
+    output_path.write_text(json.dumps(resolution, indent=2), encoding="utf-8")
+    parse_index_path = _parse_index_path(parsed_root)
+    parse_index = _load_json(parse_index_path)
+    parse_index["identity_resolution_path"] = _relative_path(output_path, parsed_root)
+    parse_index["identity_resolution"] = {
+        "policy_version": resolution["policy_version"],
+        "mode": resolution["mode"],
+        "digest": resolution["digest"],
+        "counts": resolution["counts"],
+    }
+    parse_index_path.write_text(json.dumps(parse_index, indent=2), encoding="utf-8")
+    index["identity_resolution_path"] = _relative_path(output_path, parsed_root)
+    index["identity_resolution_digest"] = resolution["digest"]
+    _write_verified_index(parsed_root, index)
+    return resolution
+
+
 def load_identity_resolution(parsed_dir: str | Path) -> dict[str, Any]:
     index, _path = load_or_initialize_verified_index(parsed_dir)
     parsed_root = _parsed_dir_from_index(_parse_index_path(parsed_dir))
     path = _resolve_path(index.get("identity_resolution_path"), parsed_root)
     if path is None or not path.is_file():
+        recovered = _rebuild_identity_resolution_from_preview(parsed_root, index)
+        if recovered:
+            return recovered
         return {}
     payload = _load_json(path)
     expected = str(index.get("identity_resolution_digest") or payload.get("digest") or "")
@@ -874,6 +950,34 @@ def _create_verified_sheet_pdf(parsed_dir: Path, student: dict[str, Any]) -> str
     for image in images:
         image.close()
     return _json_path(output_path, parsed_dir)
+
+
+def create_identity_suggestion_pdf(parsed_dir: str | Path, candidate: dict[str, Any]) -> str:
+    """Materialize a review-only PDF for a Path B/C proposal."""
+    root = Path(parsed_dir)
+    candidate_id = str(candidate.get("candidate_id") or "")
+    if not candidate_id:
+        raise ValueError("identity suggestion has no candidate id")
+    output_path = root / "identity_suggestions" / candidate_id / "review_only_sheet.pdf"
+    if output_path.exists():
+        return _json_path(output_path, root)
+    image_paths = [
+        candidate.get("page_one", {}).get("page_image_path"),
+        candidate.get("continuation", {}).get("page_image_path"),
+    ]
+    images: list[Image.Image] = []
+    try:
+        for value in image_paths:
+            image_path = _resolve_path(value, root)
+            if image_path is None or not image_path.is_file():
+                raise FileNotFoundError(f"suggestion image is unavailable: {value}")
+            images.append(Image.open(image_path).convert("RGB"))
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        images[0].save(output_path, save_all=True, append_images=images[1:], resolution=300.0)
+    finally:
+        for image in images:
+            image.close()
+    return _json_path(output_path, root)
 
 
 def verify_student(
@@ -1252,7 +1356,7 @@ def decide_identity_suggestion(
     assigned_roll_no: str | None = None,
 ) -> tuple[dict[str, Any], Path]:
     """Approve or reject a shadow proposal while preserving raw parser output."""
-    if action not in {"approve", "reject", "assign"}:
+    if action not in {"approve", "approve_page1", "approve_page2", "reject", "assign"}:
         raise ValueError(f"unknown identity suggestion action: {action}")
     if not note.strip():
         raise ValueError("a review note is required for identity suggestion decisions")
@@ -1302,6 +1406,12 @@ def decide_identity_suggestion(
         int(candidate.get("page_one_source_index") or 0): 1,
         int(candidate.get("continuation_source_index") or 0): int(candidate.get("sheet_page") or 0),
     }
+    if action == "approve_page1":
+        source_page_numbers = {int(candidate.get("page_one_source_index") or 0): 1}
+    elif action == "approve_page2":
+        source_page_numbers = {
+            int(candidate.get("continuation_source_index") or 0): int(candidate.get("sheet_page") or 0)
+        }
     for source_index, page_number in source_page_numbers.items():
         if source_index <= 0 or page_number <= 0:
             raise ValueError("identity suggestion contains an invalid source or sheet page")

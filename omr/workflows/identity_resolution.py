@@ -15,6 +15,7 @@ from omr.identity_evidence import (
     ANCHOR_SLOT_TAKEN,
     ANCHOR_VIA_CELLS,
     ANCHOR_VIA_PAGE2,
+    ATTACHED_BY_ORDER,
     BLOCK,
     DUPLICATE_AGREED_CLAIM,
     LOW_CELL_CONFIDENCE,
@@ -24,6 +25,7 @@ from omr.identity_evidence import (
     PROGRAM_SELECTOR_AMBIGUOUS,
     PROGRAM_SELECTOR_BLANK,
     ROLL_NOT_IN_ROSTER,
+    ROSTER_CELL_SUPPORT,
     SOURCES_CONTRADICT,
     WARN,
     evidence,
@@ -36,6 +38,10 @@ PATH_A_CELL_MIN = 0.30
 PATH_A_GEOMETRIC_MEAN = 0.55
 PATH_B_CELL_MIN = 0.80
 PATH_C_CELL_MIN = 0.65
+# A borderline Page 2 can be useful to a reviewer when it exactly matches a
+# verified Page-1 bubble anchor. This is display-only; it never changes an
+# automatic assignment threshold.
+PATH_B_REVIEW_CELL_MIN = 0.25
 SUGGESTION_CELL_MIN = 0.30
 NEAR_NEIGHBOUR_SELECTED_PROBABILITY = 0.85
 # Compatibility alias for callers written against the first shadow-policy draft.
@@ -192,6 +198,8 @@ def page_evidence(page: Mapping[str, Any]) -> dict[str, Any]:
         identity.get("evidence_flags") if isinstance(identity.get("evidence_flags"), list) else [],
         read.get("evidence_flags") if isinstance(read.get("evidence_flags"), list) else [],
     )
+    results = read.get("ocr_results") if isinstance(read.get("ocr_results"), dict) else {}
+    roster_suggestion = results.get("_roster_suggestion") if isinstance(results.get("_roster_suggestion"), dict) else {}
     return {
         "source_index": int(page.get("source_index") or 0),
         "sheet_page": sheet_page,
@@ -212,6 +220,13 @@ def page_evidence(page: Mapping[str, Any]) -> dict[str, Any]:
         "evidence_flags": evidence_flags,
         "page_image_path": str(page.get("page_image_path") or ""),
         "current_roll": _normalized_roll(page.get("current_roll")),
+        "attachment_method": identity.get("attachment_method"),
+        "roster_suggestion": {
+            "roll_no": _normalized_roll(roster_suggestion.get("roll_no")),
+            "score": _number(roster_suggestion.get("score")),
+            "margin": _number(roster_suggestion.get("margin")),
+            "clear": bool(roster_suggestion.get("clear")),
+        },
     }
 
 
@@ -373,6 +388,23 @@ def _candidate(
     sheet_page = int(continuation["sheet_page"])
     if roll_no not in valid_rolls:
         flags.append(evidence(ROLL_NOT_IN_ROSTER, BLOCK, roll_no=roll_no))
+    for source_name, page in (("page1", page_one), ("page2", continuation)):
+        suggestion = page.get("roster_suggestion") if isinstance(page.get("roster_suggestion"), dict) else {}
+        if (
+            suggestion.get("roll_no") == roll_no
+            and float(suggestion.get("score") or 0.0) >= 0.60
+            and float(suggestion.get("margin") or 0.0) >= 0.15
+            and page.get("cell_roll") not in valid_rolls
+        ):
+            flags.append(
+                evidence(
+                    ROSTER_CELL_SUPPORT,
+                    WARN,
+                    source=source_name,
+                    score=round(float(suggestion["score"]), 6),
+                    margin=round(float(suggestion["margin"]), 6),
+                )
+            )
     if page_one_claim_count != 1 or continuation_claim_count != 1:
         flags.append(
             evidence(
@@ -553,7 +585,7 @@ def resolve_identity_proposals(
                     continue
                 if continuation.get("current_roll") == bubble_roll:
                     continue
-                if float(continuation.get("cell_min_probability") or 0.0) < SUGGESTION_CELL_MIN:
+                if float(continuation.get("cell_min_probability") or 0.0) < PATH_B_REVIEW_CELL_MIN:
                     continue
                 candidate = _candidate(
                     path="B",
@@ -621,6 +653,33 @@ def resolve_identity_proposals(
             for page in normalized
         ),
     }
+    order_attachment_audit: list[dict[str, Any]] = []
+    for page in normalized:
+        if page.get("attachment_method") != "scanner_order" or page["sheet_page"] <= 1:
+            continue
+        assigned_roll = page.get("current_roll")
+        cell_roll = page.get("cell_roll")
+        if cell_roll == assigned_roll:
+            outcome = "agree"
+        elif not cell_roll:
+            outcome = "unreadable"
+        elif cell_roll in roster:
+            outcome = "contradict_valid_roster"
+        else:
+            outcome = "contradict_nonroster"
+        order_attachment_audit.append(
+            {
+                "source_index": page["source_index"],
+                "sheet_page": page["sheet_page"],
+                "assigned_roll": assigned_roll,
+                "cell_roll": cell_roll,
+                "outcome": outcome,
+            }
+        )
+    counts["order_attachment_audit"] = {
+        outcome: sum(item["outcome"] == outcome for item in order_attachment_audit)
+        for outcome in ("agree", "unreadable", "contradict_valid_roster", "contradict_nonroster")
+    }
     return {
         "schema_version": 1,
         "policy_version": POLICY_VERSION,
@@ -631,6 +690,7 @@ def resolve_identity_proposals(
             "path_a_cell_min": PATH_A_CELL_MIN,
             "path_a_geometric_mean": PATH_A_GEOMETRIC_MEAN,
             "path_b_cell_min": PATH_B_CELL_MIN,
+            "path_b_review_cell_min": PATH_B_REVIEW_CELL_MIN,
             "path_c_cell_min": PATH_C_CELL_MIN,
             "suggestion_cell_min": SUGGESTION_CELL_MIN,
             "near_neighbour_selected_probability": NEAR_NEIGHBOUR_SELECTED_PROBABILITY,
@@ -638,6 +698,7 @@ def resolve_identity_proposals(
         "counts": counts,
         "pages": normalized,
         "candidates": candidates,
+        "order_attachment_audit": order_attachment_audit,
     }
 
 
@@ -651,6 +712,7 @@ __all__ = [
     "NEAR_NEIGHBOUR_SUPPORT",
     "NEAR_NEIGHBOUR_SELECTED_PROBABILITY",
     "PATH_B_CELL_MIN",
+    "PATH_B_REVIEW_CELL_MIN",
     "PATH_C_CELL_MIN",
     "POLICY_VERSION",
     "near_neighbour_guard",
