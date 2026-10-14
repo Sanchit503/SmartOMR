@@ -95,5 +95,5 @@ def test_grouping_order_notice_explains_guarded_source_pairing():
 
     assert "auto-detected sheet-major" in notice
     assert "323/323 readable page codes matched" in notice
-    assert "unique, roster-valid bubbled roll" in notice
+    assert "Scanner order is not proof of ownership" in notice
     assert _grouping_order_notice({}) == ""

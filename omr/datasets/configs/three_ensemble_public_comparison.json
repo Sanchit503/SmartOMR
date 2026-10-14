@@ -1,0 +1,25 @@
+{
+  "labels_csv": "data/roll_digit_dataset/shared_quiz_midsem_v2/test.csv",
+  "writer_catalog_csv": "data/roll_digit_dataset/shared_quiz_midsem_v2/labels.csv",
+  "require_common_holdout": false,
+  "ensembles": [
+    {
+      "name": "UI configured ensemble",
+      "manifest": "data/models/roll_digit_ensemble_7_quiz_midsem_v2/ensemble_manifest.public.json",
+      "train_csv": "data/roll_digit_dataset/shared_quiz_midsem_v2/local_fit_train.csv",
+      "val_csv": "data/roll_digit_dataset/shared_quiz_midsem_v2/local_fit_val.csv"
+    },
+    {
+      "name": "Laptop diverse ensemble",
+      "manifest": "data/models/roll_digit_ensemble_7_diverse_heads_v1/ensemble_manifest.public.json",
+      "train_csv": "data/roll_digit_dataset/shared_quiz_midsem_v2/local_fit_train.csv",
+      "val_csv": "data/roll_digit_dataset/shared_quiz_midsem_v2/local_fit_val.csv"
+    },
+    {
+      "name": "Colab diverse ensemble",
+      "manifest": "data/models/roll_digit_ensemble_7_colab_gpu_v1/ensemble_manifest.public.json",
+      "train_csv": "data/roll_digit_dataset/shared_quiz_midsem_v2/train.csv",
+      "val_csv": "data/roll_digit_dataset/shared_quiz_midsem_v2/val.csv"
+    }
+  ]
+}

@@ -1,0 +1,262 @@
+{
+  "kind": "roll_digit_resnet_probability_ensemble",
+  "dataset_dir": "data/roll_digit_dataset/shared_quiz_midsem_v2",
+  "kaggle_train_csv": null,
+  "kaggle_epochs": 0,
+  "kaggle_limit": null,
+  "image_size": 64,
+  "cell_padding_mm": 1.5,
+  "member_count": 7,
+  "members": [
+    {
+      "member": 1,
+      "seed": 557,
+      "initial_checkpoint": "data\\models\\roll_digit_ensemble_7\\omr_finetuned_member_01_seed_557.pt",
+      "initial_checkpoint_sha256": "7a85a82c8394518335a40c2993e47ca7d0f10059580cebf082f39ad077921f97",
+      "model_path": "omr_finetuned_member_01_seed_557.pt",
+      "metrics_path": "omr_finetuned_member_01_seed_557.metrics.json",
+      "checkpoint_sha256": "eff0c5f8d9c0a4fa07e8062f9e3a7df2d0ea75ccde9d522da50130b829d3e0eb",
+      "best_val_accuracy": 0.9902557856272838,
+      "model_config": {
+        "num_classes": 11,
+        "dense_hidden_sizes": [],
+        "dropout": 0.0
+      },
+      "training_config": {
+        "image_size": 64,
+        "batch_size": 64,
+        "epochs": 12,
+        "learning_rate": 0.0001,
+        "weight_decay": 0.0001,
+        "seed": 557,
+        "dense_hidden_sizes": [],
+        "dropout": 0.0,
+        "optimizer": "adamw",
+        "regularization": "decoupled_weight_decay",
+        "head_reinitialized": false
+      }
+    },
+    {
+      "member": 2,
+      "seed": 558,
+      "initial_checkpoint": "data\\models\\roll_digit_ensemble_7\\omr_finetuned_member_02_seed_558.pt",
+      "initial_checkpoint_sha256": "67ac4af3633f46a9f43d596361c996864a34c4918bdbdc4495ba3ef055885552",
+      "model_path": "omr_finetuned_member_02_seed_558.pt",
+      "metrics_path": "omr_finetuned_member_02_seed_558.metrics.json",
+      "checkpoint_sha256": "dc556f631bf58a0a99c2dae47654398c780c99a42cbf91015762af6d52c170db",
+      "best_val_accuracy": 0.9926918392204629,
+      "model_config": {
+        "num_classes": 11,
+        "dense_hidden_sizes": [
+          64
+        ],
+        "dropout": 0.15
+      },
+      "training_config": {
+        "image_size": 64,
+        "batch_size": 64,
+        "epochs": 24,
+        "learning_rate": 0.0003,
+        "weight_decay": 0.0001,
+        "seed": 558,
+        "dense_hidden_sizes": [
+          64
+        ],
+        "dropout": 0.15,
+        "optimizer": "adam",
+        "regularization": "l2_penalty",
+        "head_reinitialized": true
+      }
+    },
+    {
+      "member": 3,
+      "seed": 559,
+      "initial_checkpoint": "data\\models\\roll_digit_ensemble_7\\omr_finetuned_member_03_seed_559.pt",
+      "initial_checkpoint_sha256": "a51a25acf73b3d9837c152c9c4501c8950c1e901ac6b950398761bf40414a88b",
+      "model_path": "omr_finetuned_member_03_seed_559.pt",
+      "metrics_path": "omr_finetuned_member_03_seed_559.metrics.json",
+      "checkpoint_sha256": "fa96ba8d18e99647c119fb0a492851f8976f839c1853a49d6b2d14af166c1d08",
+      "best_val_accuracy": 0.9902557856272838,
+      "model_config": {
+        "num_classes": 11,
+        "dense_hidden_sizes": [
+          64,
+          32
+        ],
+        "dropout": 0.2
+      },
+      "training_config": {
+        "image_size": 64,
+        "batch_size": 64,
+        "epochs": 24,
+        "learning_rate": 0.0005,
+        "weight_decay": 0.0001,
+        "seed": 559,
+        "dense_hidden_sizes": [
+          64,
+          32
+        ],
+        "dropout": 0.2,
+        "optimizer": "adam",
+        "regularization": "l2_penalty",
+        "head_reinitialized": true
+      }
+    },
+    {
+      "member": 4,
+      "seed": 560,
+      "initial_checkpoint": "data\\models\\roll_digit_ensemble_7\\omr_finetuned_member_04_seed_560.pt",
+      "initial_checkpoint_sha256": "c1a157125f8467e8bfff493b591217e59da3fbff7ee7b69a9ab034e689e989a6",
+      "model_path": "omr_finetuned_member_04_seed_560.pt",
+      "metrics_path": "omr_finetuned_member_04_seed_560.metrics.json",
+      "checkpoint_sha256": "e236ad44a1eb6ab17b2e822dd02c362b8b7e5fe0ca6a20f362d1cbfcc4994ad5",
+      "best_val_accuracy": 0.9939098660170523,
+      "model_config": {
+        "num_classes": 11,
+        "dense_hidden_sizes": [
+          96,
+          48
+        ],
+        "dropout": 0.25
+      },
+      "training_config": {
+        "image_size": 64,
+        "batch_size": 64,
+        "epochs": 24,
+        "learning_rate": 0.0003,
+        "weight_decay": 0.0002,
+        "seed": 560,
+        "dense_hidden_sizes": [
+          96,
+          48
+        ],
+        "dropout": 0.25,
+        "optimizer": "adamw",
+        "regularization": "decoupled_weight_decay",
+        "head_reinitialized": true
+      }
+    },
+    {
+      "member": 5,
+      "seed": 561,
+      "initial_checkpoint": "data\\models\\roll_digit_ensemble_7\\omr_finetuned_member_05_seed_561.pt",
+      "initial_checkpoint_sha256": "a999c95be8cbd3a1b0c1f130d1b13191216ed496c9dfd613b0a3b796e9c1e445",
+      "model_path": "omr_finetuned_member_05_seed_561.pt",
+      "metrics_path": "omr_finetuned_member_05_seed_561.metrics.json",
+      "checkpoint_sha256": "2c19e06c3f3a439c47ab69a73af01761a2c8ba56a4bac045c53cf8591493d17c",
+      "best_val_accuracy": 0.9902557856272838,
+      "model_config": {
+        "num_classes": 11,
+        "dense_hidden_sizes": [
+          48
+        ],
+        "dropout": 0.3
+      },
+      "training_config": {
+        "image_size": 64,
+        "batch_size": 64,
+        "epochs": 24,
+        "learning_rate": 0.0002,
+        "weight_decay": 0.0003,
+        "seed": 561,
+        "dense_hidden_sizes": [
+          48
+        ],
+        "dropout": 0.3,
+        "optimizer": "adamw",
+        "regularization": "decoupled_weight_decay",
+        "head_reinitialized": true
+      }
+    },
+    {
+      "member": 6,
+      "seed": 562,
+      "initial_checkpoint": "data\\models\\roll_digit_ensemble_7\\omr_finetuned_member_06_seed_562.pt",
+      "initial_checkpoint_sha256": "895da00dd6e68c92f3170a03f761e3028df072bbcde96b0d30de1f73df50880f",
+      "model_path": "omr_finetuned_member_06_seed_562.pt",
+      "metrics_path": "omr_finetuned_member_06_seed_562.metrics.json",
+      "checkpoint_sha256": "36d596730af7591e45dd8bb582e16edd8cd36513815c1d0c744f2afdcbbc921b",
+      "best_val_accuracy": 0.9926918392204629,
+      "model_config": {
+        "num_classes": 11,
+        "dense_hidden_sizes": [
+          96,
+          32
+        ],
+        "dropout": 0.15
+      },
+      "training_config": {
+        "image_size": 64,
+        "batch_size": 64,
+        "epochs": 24,
+        "learning_rate": 0.0003,
+        "weight_decay": 5e-05,
+        "seed": 562,
+        "dense_hidden_sizes": [
+          96,
+          32
+        ],
+        "dropout": 0.15,
+        "optimizer": "adam",
+        "regularization": "l2_penalty",
+        "head_reinitialized": true
+      }
+    },
+    {
+      "member": 7,
+      "seed": 563,
+      "initial_checkpoint": "data\\models\\roll_digit_ensemble_7\\omr_finetuned_member_07_seed_563.pt",
+      "initial_checkpoint_sha256": "33e886e4da423e35ca98608497552577ec882f97dc8ee59d9ad346b59c945b9e",
+      "model_path": "omr_finetuned_member_07_seed_563.pt",
+      "metrics_path": "omr_finetuned_member_07_seed_563.metrics.json",
+      "checkpoint_sha256": "0a51f22149d36072b7f6841302697bf477e702c026f56f7a94bef6dbe173236d",
+      "best_val_accuracy": 0.9853836784409257,
+      "model_config": {
+        "num_classes": 11,
+        "dense_hidden_sizes": [],
+        "dropout": 0.0
+      },
+      "training_config": {
+        "image_size": 64,
+        "batch_size": 64,
+        "epochs": 12,
+        "learning_rate": 5e-05,
+        "weight_decay": 0.0002,
+        "seed": 563,
+        "dense_hidden_sizes": [],
+        "dropout": 0.0,
+        "optimizer": "adam",
+        "regularization": "l2_penalty",
+        "head_reinitialized": false
+      }
+    }
+  ],
+  "aggregation": "validation-weighted probability average",
+  "initial_ensemble": "data\\models\\roll_digit_ensemble_7\\ensemble_manifest.json",
+  "initial_ensemble_sha256": "b3ca6cc1823ce94b569860b1e0f69625b28cc7bf526feab3308564409604e38e",
+  "dataset_csv_sha256": {
+    "train.csv": "4babb1920b73064b4a3daac63f110e8f3016492c2f404512b5c4ad3dec74cb25",
+    "val.csv": "d784ca9d41ffb6c0199994bcf7597936099ec3bc4e40e18a04cde6c405ad5eca"
+  },
+  "augmentation": "upright_v2: rotations within 5 degrees, mild contrast/brightness, faint ink; no flips",
+  "decision_policy": "literal ResNet prediction; roster validation never rewrites OCR",
+  "member_config_path": "omr\\datasets\\configs\\roll_digit_ensemble_diverse_v1.json",
+  "member_config_sha256": "f30a7bebec654c38319968499dc934f3d65b2ac5820e23e9a5e194e402f4df49",
+  "training_config": {
+    "scope": "defaults_overridden_per_member",
+    "dense_hidden_sizes": [],
+    "dropout": 0.0,
+    "optimizer": "adamw",
+    "weight_decay": 0.0001,
+    "regularization": "decoupled_weight_decay",
+    "head_reinitialized": false
+  },
+  "publication": {
+    "source_manifest_sha256": "1247319c6a10a0924e9f8898f6b2c20ceaf3c1a38282b38b0e8ef33828a7f4d9",
+    "source_dataset_csv_sha256": {
+      "train.csv": "1361d0d49ef955ecee545fdacc36c107a110be017e41d01a9bb2f9a8968dbb82",
+      "val.csv": "58201042f77f7f561e2790cddbf778ae43d55946aa45d179c3d05fa9027982e2"
+    },
+    "policy": "Same checkpoint bytes and crop memberships; CSVs reserialized with pseudonymous writers and no identifying metadata."
+  }
+}

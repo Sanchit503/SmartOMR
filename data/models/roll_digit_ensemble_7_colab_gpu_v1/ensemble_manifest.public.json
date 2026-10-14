@@ -1,0 +1,262 @@
+{
+  "kind": "roll_digit_resnet_probability_ensemble",
+  "dataset_dir": "data/roll_digit_dataset/shared_quiz_midsem_v2",
+  "kaggle_train_csv": null,
+  "kaggle_epochs": 0,
+  "kaggle_limit": null,
+  "image_size": 64,
+  "cell_padding_mm": 1.5,
+  "member_count": 7,
+  "members": [
+    {
+      "member": 1,
+      "seed": 557,
+      "initial_checkpoint": "/content/smartomr_training_inputs/models/member_seed_557.pt",
+      "initial_checkpoint_sha256": "218f69cf1dfac330422b1399a7bc893f3a81c7575eb0bbd75879da686961f3c3",
+      "model_path": "omr_finetuned_member_01_seed_557.pt",
+      "metrics_path": "omr_finetuned_member_01_seed_557.metrics.json",
+      "checkpoint_sha256": "4a7824ba852cfb3788a56ea2c414e124251b13a8f44aed40fd184ecc3bbd36e4",
+      "best_val_accuracy": 0.9943019943019943,
+      "model_config": {
+        "num_classes": 11,
+        "dense_hidden_sizes": [],
+        "dropout": 0.0
+      },
+      "training_config": {
+        "image_size": 64,
+        "batch_size": 64,
+        "epochs": 12,
+        "learning_rate": 0.0001,
+        "weight_decay": 0.0001,
+        "seed": 557,
+        "dense_hidden_sizes": [],
+        "dropout": 0.0,
+        "optimizer": "adamw",
+        "regularization": "decoupled_weight_decay",
+        "head_reinitialized": false
+      }
+    },
+    {
+      "member": 2,
+      "seed": 558,
+      "initial_checkpoint": "/content/smartomr_training_inputs/models/member_seed_558.pt",
+      "initial_checkpoint_sha256": "e9c6171192b73837e17e71079e74ed08947acd816a5643a767111c099d159173",
+      "model_path": "omr_finetuned_member_02_seed_558.pt",
+      "metrics_path": "omr_finetuned_member_02_seed_558.metrics.json",
+      "checkpoint_sha256": "b3d0bfa837bb0ee270e02b7ccc8cd983512ec9ab33ec87998670c3820098c03a",
+      "best_val_accuracy": 0.9943019943019943,
+      "model_config": {
+        "num_classes": 11,
+        "dense_hidden_sizes": [
+          64
+        ],
+        "dropout": 0.15
+      },
+      "training_config": {
+        "image_size": 64,
+        "batch_size": 64,
+        "epochs": 24,
+        "learning_rate": 0.0003,
+        "weight_decay": 0.0001,
+        "seed": 558,
+        "dense_hidden_sizes": [
+          64
+        ],
+        "dropout": 0.15,
+        "optimizer": "adam",
+        "regularization": "l2_penalty",
+        "head_reinitialized": true
+      }
+    },
+    {
+      "member": 3,
+      "seed": 559,
+      "initial_checkpoint": "/content/smartomr_training_inputs/models/member_seed_559.pt",
+      "initial_checkpoint_sha256": "25bc6bea31ccbf35a27d47ca1a551dac4a8343073fb2a2c30120fc9619c06df1",
+      "model_path": "omr_finetuned_member_03_seed_559.pt",
+      "metrics_path": "omr_finetuned_member_03_seed_559.metrics.json",
+      "checkpoint_sha256": "ff787514687d78d37925c96c70a81adaa5bc2159e412bcb1701ff18678595209",
+      "best_val_accuracy": 0.9943019943019943,
+      "model_config": {
+        "num_classes": 11,
+        "dense_hidden_sizes": [
+          64,
+          32
+        ],
+        "dropout": 0.2
+      },
+      "training_config": {
+        "image_size": 64,
+        "batch_size": 64,
+        "epochs": 24,
+        "learning_rate": 0.0005,
+        "weight_decay": 0.0001,
+        "seed": 559,
+        "dense_hidden_sizes": [
+          64,
+          32
+        ],
+        "dropout": 0.2,
+        "optimizer": "adam",
+        "regularization": "l2_penalty",
+        "head_reinitialized": true
+      }
+    },
+    {
+      "member": 4,
+      "seed": 560,
+      "initial_checkpoint": "/content/smartomr_training_inputs/models/member_seed_560.pt",
+      "initial_checkpoint_sha256": "3ebd2b66b3a4fc35537366de678a63ed206383e8469197b923f33ee34d9449ec",
+      "model_path": "omr_finetuned_member_04_seed_560.pt",
+      "metrics_path": "omr_finetuned_member_04_seed_560.metrics.json",
+      "checkpoint_sha256": "227cbc1671c494107b0f4169b57aa2d44ca9d3e91708360b1f244e1b8ec89d4f",
+      "best_val_accuracy": 0.9914529914529915,
+      "model_config": {
+        "num_classes": 11,
+        "dense_hidden_sizes": [
+          96,
+          48
+        ],
+        "dropout": 0.25
+      },
+      "training_config": {
+        "image_size": 64,
+        "batch_size": 64,
+        "epochs": 24,
+        "learning_rate": 0.0003,
+        "weight_decay": 0.0002,
+        "seed": 560,
+        "dense_hidden_sizes": [
+          96,
+          48
+        ],
+        "dropout": 0.25,
+        "optimizer": "adamw",
+        "regularization": "decoupled_weight_decay",
+        "head_reinitialized": true
+      }
+    },
+    {
+      "member": 5,
+      "seed": 561,
+      "initial_checkpoint": "/content/smartomr_training_inputs/models/member_seed_561.pt",
+      "initial_checkpoint_sha256": "7c1cb457b1d477f518ccfdf3d9c8416a30720489a5aaabfefd5a129b1078914c",
+      "model_path": "omr_finetuned_member_05_seed_561.pt",
+      "metrics_path": "omr_finetuned_member_05_seed_561.metrics.json",
+      "checkpoint_sha256": "31392aaf57fec2d50ac964ac1c965d94204d8525aefdb3c02f126695a49ac763",
+      "best_val_accuracy": 0.9943019943019943,
+      "model_config": {
+        "num_classes": 11,
+        "dense_hidden_sizes": [
+          48
+        ],
+        "dropout": 0.3
+      },
+      "training_config": {
+        "image_size": 64,
+        "batch_size": 64,
+        "epochs": 24,
+        "learning_rate": 0.0002,
+        "weight_decay": 0.0003,
+        "seed": 561,
+        "dense_hidden_sizes": [
+          48
+        ],
+        "dropout": 0.3,
+        "optimizer": "adamw",
+        "regularization": "decoupled_weight_decay",
+        "head_reinitialized": true
+      }
+    },
+    {
+      "member": 6,
+      "seed": 562,
+      "initial_checkpoint": "/content/smartomr_training_inputs/models/member_seed_562.pt",
+      "initial_checkpoint_sha256": "6d90d720ce6130d6063c848a1c4059c0e26a32e58a122a5f9f40e56b24c65ee8",
+      "model_path": "omr_finetuned_member_06_seed_562.pt",
+      "metrics_path": "omr_finetuned_member_06_seed_562.metrics.json",
+      "checkpoint_sha256": "af36d0c2a6af276981603563d58c5dc8391cf876df31f8bd403a1a17320cb595",
+      "best_val_accuracy": 0.9943019943019943,
+      "model_config": {
+        "num_classes": 11,
+        "dense_hidden_sizes": [
+          96,
+          32
+        ],
+        "dropout": 0.15
+      },
+      "training_config": {
+        "image_size": 64,
+        "batch_size": 64,
+        "epochs": 24,
+        "learning_rate": 0.0003,
+        "weight_decay": 5e-05,
+        "seed": 562,
+        "dense_hidden_sizes": [
+          96,
+          32
+        ],
+        "dropout": 0.15,
+        "optimizer": "adam",
+        "regularization": "l2_penalty",
+        "head_reinitialized": true
+      }
+    },
+    {
+      "member": 7,
+      "seed": 563,
+      "initial_checkpoint": "/content/smartomr_training_inputs/models/member_seed_563.pt",
+      "initial_checkpoint_sha256": "047f54a12858c64845b4560328244f4b87f97202d48c58811da75239883ce1c0",
+      "model_path": "omr_finetuned_member_07_seed_563.pt",
+      "metrics_path": "omr_finetuned_member_07_seed_563.metrics.json",
+      "checkpoint_sha256": "c7f07d01c05ef4aad8b9f6be7c329831a0b791a88f18c4f8b1bf06db03d8d037",
+      "best_val_accuracy": 0.9886039886039886,
+      "model_config": {
+        "num_classes": 11,
+        "dense_hidden_sizes": [],
+        "dropout": 0.0
+      },
+      "training_config": {
+        "image_size": 64,
+        "batch_size": 64,
+        "epochs": 12,
+        "learning_rate": 5e-05,
+        "weight_decay": 0.0002,
+        "seed": 563,
+        "dense_hidden_sizes": [],
+        "dropout": 0.0,
+        "optimizer": "adam",
+        "regularization": "l2_penalty",
+        "head_reinitialized": false
+      }
+    }
+  ],
+  "aggregation": "validation-weighted probability average",
+  "initial_ensemble": "/content/smartomr_training_inputs/models/ensemble_manifest.json",
+  "initial_ensemble_sha256": "5d16ccccd6aa3ac0e10a9dc676fb79be204819824dd71cbfa091beae6894be65",
+  "dataset_csv_sha256": {
+    "train.csv": "0ddd7d6716a402e98f4093a5a11e508f489cba0c5c5c0a64ea9e4b6ca3195994",
+    "val.csv": "38a3f8508cb54e3f0eb78e935d2e9a6e3a6384566bfd4931dfa9606f1b119b43"
+  },
+  "augmentation": "upright_v2: rotations within 5 degrees, mild contrast/brightness, faint ink; no flips",
+  "decision_policy": "literal ResNet prediction; roster validation never rewrites OCR",
+  "member_config_path": "/content/smartomr_training_inputs/omr/datasets/configs/roll_digit_ensemble_diverse_v1.json",
+  "member_config_sha256": "f30a7bebec654c38319968499dc934f3d65b2ac5820e23e9a5e194e402f4df49",
+  "training_config": {
+    "scope": "defaults_overridden_per_member",
+    "dense_hidden_sizes": [],
+    "dropout": 0.0,
+    "optimizer": "adamw",
+    "weight_decay": 0.0001,
+    "regularization": "decoupled_weight_decay",
+    "head_reinitialized": false
+  },
+  "publication": {
+    "source_manifest_sha256": "b73903ab4d441ae4ac4772e11b8b599107e15ec7333a40b5b1fd28a6f3ba1969",
+    "source_dataset_csv_sha256": {
+      "train.csv": "aeb4b5e40c19000d47962bd60d103735808225700f4f9f9348c546deccb6230d",
+      "val.csv": "073ba2dc27048f568b29e70c29e2c7c4825ffd6d877e8524dc185cff38ea6910"
+    },
+    "policy": "Same checkpoint bytes and crop memberships; CSVs reserialized with pseudonymous writers and no identifying metadata."
+  }
+}

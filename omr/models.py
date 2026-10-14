@@ -114,6 +114,7 @@ class WrittenCrop:
     width_mm: float
     height_mm: float
     ocr_crop_path: str | None = None
+    page_header_path: str | None = None
 
 
 __all__ = [

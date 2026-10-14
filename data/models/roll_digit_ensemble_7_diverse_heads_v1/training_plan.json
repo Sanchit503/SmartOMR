@@ -1,0 +1,117 @@
+{
+  "schema_version": 1,
+  "member_config_path": "omr\\datasets\\configs\\roll_digit_ensemble_diverse_v1.json",
+  "member_config_sha256": "f30a7bebec654c38319968499dc934f3d65b2ac5820e23e9a5e194e402f4df49",
+  "initial_ensemble": "data\\models\\roll_digit_ensemble_7\\ensemble_manifest.json",
+  "initial_ensemble_sha256": "b3ca6cc1823ce94b569860b1e0f69625b28cc7bf526feab3308564409604e38e",
+  "dataset_csv_sha256": {
+    "train.csv": "1361d0d49ef955ecee545fdacc36c107a110be017e41d01a9bb2f9a8968dbb82",
+    "val.csv": "58201042f77f7f561e2790cddbf778ae43d55946aa45d179c3d05fa9027982e2"
+  },
+  "members": [
+    {
+      "image_size": 64,
+      "batch_size": 64,
+      "epochs": 12,
+      "learning_rate": 0.0001,
+      "weight_decay": 0.0001,
+      "seed": 557,
+      "dense_hidden_sizes": [],
+      "dropout": 0.0,
+      "optimizer": "adamw",
+      "regularization": "decoupled_weight_decay",
+      "head_reinitialized": false
+    },
+    {
+      "image_size": 64,
+      "batch_size": 64,
+      "epochs": 24,
+      "learning_rate": 0.0003,
+      "weight_decay": 0.0001,
+      "seed": 558,
+      "dense_hidden_sizes": [
+        64
+      ],
+      "dropout": 0.15,
+      "optimizer": "adam",
+      "regularization": "l2_penalty",
+      "head_reinitialized": true
+    },
+    {
+      "image_size": 64,
+      "batch_size": 64,
+      "epochs": 24,
+      "learning_rate": 0.0005,
+      "weight_decay": 0.0001,
+      "seed": 559,
+      "dense_hidden_sizes": [
+        64,
+        32
+      ],
+      "dropout": 0.2,
+      "optimizer": "adam",
+      "regularization": "l2_penalty",
+      "head_reinitialized": true
+    },
+    {
+      "image_size": 64,
+      "batch_size": 64,
+      "epochs": 24,
+      "learning_rate": 0.0003,
+      "weight_decay": 0.0002,
+      "seed": 560,
+      "dense_hidden_sizes": [
+        96,
+        48
+      ],
+      "dropout": 0.25,
+      "optimizer": "adamw",
+      "regularization": "decoupled_weight_decay",
+      "head_reinitialized": true
+    },
+    {
+      "image_size": 64,
+      "batch_size": 64,
+      "epochs": 24,
+      "learning_rate": 0.0002,
+      "weight_decay": 0.0003,
+      "seed": 561,
+      "dense_hidden_sizes": [
+        48
+      ],
+      "dropout": 0.3,
+      "optimizer": "adamw",
+      "regularization": "decoupled_weight_decay",
+      "head_reinitialized": true
+    },
+    {
+      "image_size": 64,
+      "batch_size": 64,
+      "epochs": 24,
+      "learning_rate": 0.0003,
+      "weight_decay": 5e-05,
+      "seed": 562,
+      "dense_hidden_sizes": [
+        96,
+        32
+      ],
+      "dropout": 0.15,
+      "optimizer": "adam",
+      "regularization": "l2_penalty",
+      "head_reinitialized": true
+    },
+    {
+      "image_size": 64,
+      "batch_size": 64,
+      "epochs": 12,
+      "learning_rate": 5e-05,
+      "weight_decay": 0.0002,
+      "seed": 563,
+      "dense_hidden_sizes": [],
+      "dropout": 0.0,
+      "optimizer": "adam",
+      "regularization": "l2_penalty",
+      "head_reinitialized": false
+    }
+  ]
+}

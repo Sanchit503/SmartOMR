@@ -297,7 +297,8 @@ def _read_body_template(body_template: str | None, body_template_file: str | Pat
 
 
 def _load_student_details(student: dict[str, Any], parsed_root: Path) -> tuple[dict[str, Any], Path | None]:
-    details_path = _resolve_path(student.get("details_path"), parsed_root)
+    details_path = _resolve_path(student.get("grading_details_path") if student.get("grading_status") == "graded"
+                                 else student.get("details_path"), parsed_root)
     if details_path is None or not details_path.exists():
         return {}, None
     return _load_json(details_path), details_path.parent
@@ -669,6 +670,7 @@ def prepare_email_release(
         "skipped": len(skipped),
         "release_id": release_id,
         "queue_sha256": _sha256_file(queue_path),
+        "verified_index_sha256": _sha256_file(verified_path),
         "enforce_sender": False,
         "queue_csv": f"{EMAIL_RELEASE_DIR}/{EMAIL_QUEUE_CSV}",
         "skipped_csv": f"{EMAIL_RELEASE_DIR}/{EMAIL_SKIPPED_CSV}",
@@ -1143,6 +1145,13 @@ def send_email_release(
     release_dir = queue_path.parent
     parsed_root = release_dir.parent
     metadata = _release_metadata(release_dir)
+    def check_review_snapshot() -> None:
+        expected = metadata.get("verified_index_sha256")
+        path = parsed_root / VERIFIED_INDEX_NAME
+        if expected and (not path.is_file() or _sha256_file(path) != expected):
+            raise ValueError("Review decisions changed after email preparation; prepare a new release")
+
+    check_review_snapshot()
     expected_queue_hash = str(metadata.get("queue_sha256") or "")
     if expected_queue_hash and _sha256_file(queue_path) != expected_queue_hash:
         raise ValueError("email_queue.csv changed after preparation; prepare a new release")
@@ -1221,6 +1230,7 @@ def send_email_release(
         password=password,
     ) as smtp:
         for row in rows:
+            check_review_snapshot()
             actual_recipient = test_recipient or row.get("student_email", "")
             message_id = row.get("message_id") or make_msgid(
                 domain=sender.rpartition("@")[2] or None

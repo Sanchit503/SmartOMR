@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "description": "Seven experimental per-cell ResNets with mixed dense heads and regularization. Shared writer-level split and upright-only augmentation.",
+  "members": [
+    {"seed": 557, "dense_hidden_sizes": [], "dropout": 0.0, "optimizer": "adamw", "learning_rate": 0.0001, "weight_decay": 0.0001, "epochs": 12, "reset_head": false},
+    {"seed": 558, "dense_hidden_sizes": [64], "dropout": 0.15, "optimizer": "adam", "learning_rate": 0.0003, "weight_decay": 0.0001, "epochs": 24, "reset_head": true},
+    {"seed": 559, "dense_hidden_sizes": [64, 32], "dropout": 0.20, "optimizer": "adam", "learning_rate": 0.0005, "weight_decay": 0.0001, "epochs": 24, "reset_head": true},
+    {"seed": 560, "dense_hidden_sizes": [96, 48], "dropout": 0.25, "optimizer": "adamw", "learning_rate": 0.0003, "weight_decay": 0.0002, "epochs": 24, "reset_head": true},
+    {"seed": 561, "dense_hidden_sizes": [48], "dropout": 0.30, "optimizer": "adamw", "learning_rate": 0.0002, "weight_decay": 0.0003, "epochs": 24, "reset_head": true},
+    {"seed": 562, "dense_hidden_sizes": [96, 32], "dropout": 0.15, "optimizer": "adam", "learning_rate": 0.0003, "weight_decay": 0.00005, "epochs": 24, "reset_head": true},
+    {"seed": 563, "dense_hidden_sizes": [], "dropout": 0.0, "optimizer": "adam", "learning_rate": 0.00005, "weight_decay": 0.0002, "epochs": 12, "reset_head": false}
+  ]
+}

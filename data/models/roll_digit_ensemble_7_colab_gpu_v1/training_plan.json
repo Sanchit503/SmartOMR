@@ -1,0 +1,117 @@
+{
+  "schema_version": 1,
+  "member_config_path": "/content/smartomr_training_inputs/omr/datasets/configs/roll_digit_ensemble_diverse_v1.json",
+  "member_config_sha256": "f30a7bebec654c38319968499dc934f3d65b2ac5820e23e9a5e194e402f4df49",
+  "initial_ensemble": "/content/smartomr_training_inputs/models/ensemble_manifest.json",
+  "initial_ensemble_sha256": "5d16ccccd6aa3ac0e10a9dc676fb79be204819824dd71cbfa091beae6894be65",
+  "dataset_csv_sha256": {
+    "train.csv": "aeb4b5e40c19000d47962bd60d103735808225700f4f9f9348c546deccb6230d",
+    "val.csv": "073ba2dc27048f568b29e70c29e2c7c4825ffd6d877e8524dc185cff38ea6910"
+  },
+  "members": [
+    {
+      "image_size": 64,
+      "batch_size": 64,
+      "epochs": 12,
+      "learning_rate": 0.0001,
+      "weight_decay": 0.0001,
+      "seed": 557,
+      "dense_hidden_sizes": [],
+      "dropout": 0.0,
+      "optimizer": "adamw",
+      "regularization": "decoupled_weight_decay",
+      "head_reinitialized": false
+    },
+    {
+      "image_size": 64,
+      "batch_size": 64,
+      "epochs": 24,
+      "learning_rate": 0.0003,
+      "weight_decay": 0.0001,
+      "seed": 558,
+      "dense_hidden_sizes": [
+        64
+      ],
+      "dropout": 0.15,
+      "optimizer": "adam",
+      "regularization": "l2_penalty",
+      "head_reinitialized": true
+    },
+    {
+      "image_size": 64,
+      "batch_size": 64,
+      "epochs": 24,
+      "learning_rate": 0.0005,
+      "weight_decay": 0.0001,
+      "seed": 559,
+      "dense_hidden_sizes": [
+        64,
+        32
+      ],
+      "dropout": 0.2,
+      "optimizer": "adam",
+      "regularization": "l2_penalty",
+      "head_reinitialized": true
+    },
+    {
+      "image_size": 64,
+      "batch_size": 64,
+      "epochs": 24,
+      "learning_rate": 0.0003,
+      "weight_decay": 0.0002,
+      "seed": 560,
+      "dense_hidden_sizes": [
+        96,
+        48
+      ],
+      "dropout": 0.25,
+      "optimizer": "adamw",
+      "regularization": "decoupled_weight_decay",
+      "head_reinitialized": true
+    },
+    {
+      "image_size": 64,
+      "batch_size": 64,
+      "epochs": 24,
+      "learning_rate": 0.0002,
+      "weight_decay": 0.0003,
+      "seed": 561,
+      "dense_hidden_sizes": [
+        48
+      ],
+      "dropout": 0.3,
+      "optimizer": "adamw",
+      "regularization": "decoupled_weight_decay",
+      "head_reinitialized": true
+    },
+    {
+      "image_size": 64,
+      "batch_size": 64,
+      "epochs": 24,
+      "learning_rate": 0.0003,
+      "weight_decay": 5e-05,
+      "seed": 562,
+      "dense_hidden_sizes": [
+        96,
+        32
+      ],
+      "dropout": 0.15,
+      "optimizer": "adam",
+      "regularization": "l2_penalty",
+      "head_reinitialized": true
+    },
+    {
+      "image_size": 64,
+      "batch_size": 64,
+      "epochs": 12,
+      "learning_rate": 5e-05,
+      "weight_decay": 0.0002,
+      "seed": 563,
+      "dense_hidden_sizes": [],
+      "dropout": 0.0,
+      "optimizer": "adam",
+      "regularization": "l2_penalty",
+      "head_reinitialized": false
+    }
+  ]
+}

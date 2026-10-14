@@ -1,2 +1,9 @@
 # Preserve PDF fixtures byte-for-byte across platforms.
 *.pdf binary
+
+# Preserve published split/provenance bytes used by integrity checks.
+data/roll_digit_dataset/shared_quiz_midsem_v2/*.csv -text whitespace=blank-at-eol,blank-at-eof,space-before-tab,cr-at-eol
+data/roll_digit_dataset/shared_quiz_midsem_v2/*.json -text whitespace=blank-at-eol,blank-at-eof,space-before-tab,cr-at-eol
+data/models/roll_digit_ensemble_7_quiz_midsem_v2/*.json -text whitespace=blank-at-eol,blank-at-eof,space-before-tab,cr-at-eol
+data/models/roll_digit_ensemble_7_diverse_heads_v1/*.json -text whitespace=blank-at-eol,blank-at-eof,space-before-tab,cr-at-eol
+data/models/roll_digit_ensemble_7_colab_gpu_v1/*.json -text whitespace=blank-at-eol,blank-at-eof,space-before-tab,cr-at-eol

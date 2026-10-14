@@ -16,6 +16,9 @@ from omr.models import WrittenCrop
 from omr.reader.enhancement import enhance_faint_ink
 
 
+WRITTEN_CROP_LAYOUT_VERSION = 3
+
+
 def _gray_array(image: object) -> np.ndarray:
     gray = np.asarray(image)
     if gray.ndim == 3:
@@ -71,6 +74,104 @@ def _crop_box_px(entry: dict, dpi: float, padding_mm: float = 0.0) -> tuple[int,
     return x0, y0, x0 + width_px, y0 + height_px
 
 
+def _page_regions(manifest: dict, page: int) -> list[dict]:
+    """Read occupied regions from the sheet's own geometry."""
+    regions = []
+    for kind in ("written_block", "mcq_block", "numerical_block", "write_in_fields"):
+        for item in manifest.get(kind, []):
+            if item.get("page", 1) != page:
+                continue
+            if kind in {"written_block", "write_in_fields"}:
+                regions.append(item)
+            elif kind == "mcq_block":
+                radius = manifest["bubble_radius_mm"]
+                width = (len(item["options"]) - 1) * manifest["mcq_option_pitch_mm"]
+                regions.append(dict(item, x_mm=item["x_mm"]-radius, y_mm=item["y_mm"]-radius,
+                                    width_mm=width+2*radius, height_mm=2*radius))
+            else:
+                radius = manifest["bubble_radius_mm"]
+                width = (item["positions"] - 1) * item["position_pitch_mm"]
+                # Numerical rows cover every decimal digit, 0 through 9.
+                height = (len("0123456789") - 1) * item["digit_pitch_mm"]
+                if item.get("orientation") == "horizontal":
+                    width, height = height, width
+                regions.append(dict(item, x_mm=item["x_mm"]-radius, y_mm=item["y_mm"]-radius,
+                                    width_mm=width+2*radius, height_mm=height+2*radius))
+    return regions
+
+
+def _heading_top_mm(entry: dict) -> float:
+    if 'heading_top_mm' in entry:
+        return entry['heading_top_mm']
+    # Older manifests omit heading bounds; reserve one ruled-line pitch above the box.
+    if entry.get('lines') and entry.get('height_mm'):
+        return entry['y_mm'] - entry['height_mm'] / entry['lines']
+    return entry['y_mm']
+
+
+def _context_box(entry: dict, manifest: dict, padding_mm: float = 0.0) -> dict:
+    """Allocate surrounding whitespace from page and neighbouring region bounds.
+
+    The legacy padding argument is retained for callers; crop geometry comes
+    entirely from the manifest. New manifests include the printed heading.
+    """
+    x0, y0 = entry["x_mm"], entry["y_mm"]
+    x1, y1 = x0 + entry["width_mm"], y0 + entry["height_mm"]
+    page = manifest["page"]
+    safe_margin = manifest.get("printer_safe_margin_mm", 0)
+    left, top = safe_margin, safe_margin
+    right, bottom = page["width_mm"] - safe_margin, page["height_mm"] - safe_margin
+    heading_top = _heading_top_mm(entry)
+    for other in _page_regions(manifest, entry.get("page", 1)):
+        if other is entry:
+            continue
+        ox0, oy0 = other["x_mm"], other["y_mm"]
+        ox1, oy1 = ox0 + other["width_mm"], oy0 + other["height_mm"]
+        if ox0 < x1 and ox1 > x0:
+            if oy1 <= y0:
+                top = max(top, (oy1 + heading_top) / 2)
+            elif oy0 >= y1:
+                # Keep more below-answer context, reserving the last quarter of
+                # the manifest gap before the next region's heading.
+                gap = max(0, _heading_top_mm(other) - y1)
+                bottom = min(bottom, y1 + gap * 3 / 4)
+        if oy0 < y1 and oy1 > y0:
+            if ox1 <= x0:
+                left = max(left, (ox1 + x0) / 2)
+            elif ox0 >= x1:
+                right = min(right, (x1 + ox0) / 2)
+    return dict(entry, x_mm=min(left, x0), y_mm=min(top, heading_top),
+                width_mm=max(right, x1)-min(left, x0),
+                height_mm=max(bottom, y1)-min(top, heading_top))
+
+
+def _header_bottom_mm(manifest: dict, page: int) -> float:
+    question_tops = [_heading_top_mm(item)
+                     for item in _page_regions(manifest, page) if 'q_no' in item]
+    if not question_tops:
+        raise ValueError(f'No question geometry for written page {page}')
+    first_question = min(question_tops)
+    identity_bottoms = [item['y_mm'] + item['height_mm']
+                        for item in manifest.get('write_in_fields', []) if item.get('page', 1) == page]
+    radius = manifest.get('bubble_radius_mm', 0)
+    block = manifest.get('roll_number_block', {})
+    if block.get('page', 1) == page:
+        for grid in block.values():
+            if isinstance(grid, dict) and 'row_pitch_mm' in grid and 'y_mm' in grid:
+                identity_bottoms.append(grid['y_mm'] + (len('0123456789') - 1) * grid['row_pitch_mm'] + radius)
+        identity_bottoms.extend(choice['y_mm'] + radius for choice in block.get('program_selector', {}).values())
+    identity_bottoms.extend(choice['y_mm'] + choice.get('radius_mm', radius)
+                            for choice in manifest.get('continuation_program_choices', [])
+                            if choice.get('page', 1) == page)
+    if not identity_bottoms:
+        return first_question
+    last_identity = max(identity_bottoms)
+    if last_identity >= first_question:
+        raise ValueError(f'Identity and question geometry overlap on page {page}')
+    # Share the gap, then keep a bubble-radius safety margin away from body titles.
+    return last_identity + max(0, (first_question - last_identity) / 2 - radius)
+
+
 def crop_written_responses(
     images_by_page: dict[int, object],
     manifest: dict,
@@ -94,7 +195,14 @@ def crop_written_responses(
             raise KeyError(f"no canonical image provided for page {page} (needed for written Q{entry['q_no']})")
 
         image = _gray_array(images_by_page[page])
-        x0, y0, x1, y1 = _crop_box_px(entry, dpi, padding_mm=padding_mm)
+        header_path = output_dir / f"page_{page}_header.png"
+        if page not in {crop.page for crop in crops}:
+            header_height = min(image.shape[0], round(_header_bottom_mm(manifest, page) * px_per_mm(dpi)))
+            Image.fromarray(image[:header_height], mode="L").save(header_path)
+        context = _context_box(entry, manifest, padding_mm)
+        context["x_mm"] = 0
+        context["width_mm"] = image.shape[1] / px_per_mm(dpi)
+        x0, y0, x1, y1 = _crop_box_px(context, dpi)
         x0 = max(0, min(image.shape[1], x0))
         x1 = max(0, min(image.shape[1], x1))
         y0 = max(0, min(image.shape[0], y0))
@@ -109,7 +217,7 @@ def crop_written_responses(
         ocr_crop_path = output_dir / f"Q{entry['q_no']}_ink.png"
         if template_images_by_page and page in template_images_by_page:
             template = _gray_array(template_images_by_page[page])
-            tx0, ty0, tx1, ty1 = _crop_box_px(entry, dpi, padding_mm=padding_mm)
+            tx0, ty0, tx1, ty1 = _crop_box_px(context, dpi)
             tx0 = max(0, min(template.shape[1], tx0))
             tx1 = max(0, min(template.shape[1], tx1))
             ty0 = max(0, min(template.shape[0], ty0))
@@ -130,11 +238,12 @@ def crop_written_responses(
                 crop_path=str(crop_path),
                 max_marks=entry["max_marks"],
                 lines=entry["lines"],
-                x_mm=entry["x_mm"],
-                y_mm=entry["y_mm"],
-                width_mm=entry["width_mm"],
-                height_mm=entry["height_mm"],
+                x_mm=x0 / px_per_mm(dpi),
+                y_mm=y0 / px_per_mm(dpi),
+                width_mm=(x1 - x0) / px_per_mm(dpi),
+                height_mm=(y1 - y0) / px_per_mm(dpi),
                 ocr_crop_path=str(ocr_crop_path),
+                page_header_path=str(header_path),
             )
         )
 

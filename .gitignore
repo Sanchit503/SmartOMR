@@ -23,3 +23,7 @@ htmlcov/
 /training_labels.csv
 /*.pth
 /.git_diff.txt
+
+# Generated reports, mail exports and temporary scan-derived previews stay local.
+/output/
+/tmp/

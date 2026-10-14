@@ -28,6 +28,24 @@ class TrainConfig:
     learning_rate: float = 1e-3
     weight_decay: float = 1e-4
     seed: int = 557
+    dense_hidden_sizes: tuple[int, ...] = ()
+    dropout: float = 0.25
+    optimizer: str = "adamw"
+
+    def __post_init__(self) -> None:
+        if not np.isfinite(self.learning_rate) or self.learning_rate <= 0:
+            raise ValueError("learning rate must be finite and positive")
+        if any(isinstance(value, bool) or not isinstance(value, int) or value < 1
+               for value in (self.epochs, self.batch_size)):
+            raise ValueError("epochs and batch size must be positive integers")
+        if self.optimizer not in {"adam", "adamw"}:
+            raise ValueError("optimizer must be adam or adamw")
+        if not 0 <= self.dropout < 1:
+            raise ValueError("dropout must be in [0, 1)")
+        if any(isinstance(size, bool) or not isinstance(size, int) or size < 1 for size in self.dense_hidden_sizes):
+            raise ValueError("dense hidden sizes must be positive integers")
+        if not np.isfinite(self.weight_decay) or self.weight_decay < 0:
+            raise ValueError("weight decay must be finite and nonnegative")
 
 
 class RollDigitDataset(Dataset):
@@ -122,7 +140,7 @@ class KaggleDigitCsvDataset(Dataset):
 
 def _augment_image(image: Image.Image) -> Image.Image:
     angle = random.uniform(-5.0, 5.0)
-    image = image.rotate(angle, fillcolor=255)
+    image = image.rotate(angle, resample=Image.Resampling.BILINEAR, expand=True, fillcolor=255)
     if random.random() < 0.45:
         image = ImageEnhance.Contrast(image).enhance(random.uniform(0.85, 1.25))
     if random.random() < 0.35:
@@ -141,14 +159,15 @@ def _simulate_faint_pencil(image: Image.Image) -> Image.Image:
     crops, never validation data.
     """
     array = np.asarray(image.convert("L"), dtype=np.float32)
-    ink_strength = random.uniform(0.28, 0.72)
-    faded = 255.0 - (255.0 - array) * ink_strength
-    height, width = faded.shape
+    ink_strength = random.uniform(0.65, 0.95)
+    height, width = array.shape
     left = random.uniform(-7.0, 7.0)
     right = random.uniform(-7.0, 7.0)
     illumination = np.linspace(left, right, width, dtype=np.float32)[None, :]
     illumination = np.repeat(illumination, height, axis=0)
-    return Image.fromarray(np.clip(faded + illumination, 0, 255).astype(np.uint8), mode="L")
+    background = 255.0 - np.abs(illumination)
+    faded = background - (255.0 - array) * ink_strength
+    return Image.fromarray(np.clip(faded, 0, 255).astype(np.uint8), mode="L")
 
 
 class ResidualBlock(nn.Module):
@@ -168,8 +187,18 @@ class ResidualBlock(nn.Module):
 
 
 class SmallRollDigitResNet(nn.Module):
-    def __init__(self, num_classes: int = len(LABELS)) -> None:
+    def __init__(
+        self,
+        num_classes: int = len(LABELS),
+        *,
+        dense_hidden_sizes: tuple[int, ...] = (),
+        dropout: float = 0.25,
+    ) -> None:
         super().__init__()
+        TrainConfig(dense_hidden_sizes=tuple(dense_hidden_sizes), dropout=dropout)
+        self.dense_hidden_sizes = tuple(dense_hidden_sizes)
+        self.dropout = dropout if dense_hidden_sizes else 0.0
+        self.num_classes = num_classes
         self.stem = nn.Sequential(
             nn.Conv2d(1, 32, kernel_size=3, padding=1, bias=False),
             nn.BatchNorm2d(32),
@@ -188,7 +217,24 @@ class SmallRollDigitResNet(nn.Module):
             nn.ReLU(inplace=True),
         )
         self.stage3 = nn.Sequential(ResidualBlock(128), nn.AdaptiveAvgPool2d((1, 1)))
-        self.head = nn.Linear(128, num_classes)
+        if self.dense_hidden_sizes:
+            layers: list[nn.Module] = []
+            in_features = 128
+            for size in self.dense_hidden_sizes:
+                layers.extend([nn.Linear(in_features, size), nn.ReLU(), nn.Dropout(dropout)])
+                in_features = size
+            layers.append(nn.Linear(in_features, num_classes))
+            self.head = nn.Sequential(*layers)
+        else:
+            # Preserve the original head.weight/head.bias checkpoint contract.
+            self.head = nn.Linear(128, num_classes)
+
+    def model_config(self) -> dict[str, Any]:
+        return {
+            "num_classes": self.num_classes,
+            "dense_hidden_sizes": list(self.dense_hidden_sizes),
+            "dropout": self.dropout,
+        }
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.stem(x)
@@ -217,15 +263,61 @@ def _class_weights(dataset: RollDigitDataset, device: torch.device) -> torch.Ten
 
 
 def _load_checkpoint_state(path: Path) -> dict[str, torch.Tensor]:
-    payload = torch.load(path, map_location="cpu")
+    return _checkpoint_state(torch.load(path, map_location="cpu", weights_only=True))
+
+
+def _checkpoint_state(payload: object) -> dict[str, torch.Tensor]:
     if isinstance(payload, dict):
         for key in ("model_state", "model_state_dict", "state_dict"):
             state = payload.get(key)
             if isinstance(state, dict):
                 return state
-    if isinstance(payload, dict) and all(isinstance(key, str) for key in payload):
+    if isinstance(payload, dict) and all(isinstance(key, str) and isinstance(value, torch.Tensor) for key, value in payload.items()):
         return payload
-    raise ValueError(f"could not find model weights in checkpoint: {path}")
+    raise ValueError("could not find model weights in checkpoint")
+
+
+def model_from_checkpoint(payload: object) -> SmallRollDigitResNet:
+    """Load legacy or versioned classifier heads without guessing their shape."""
+    spec: dict[str, Any] = {}
+    if isinstance(payload, dict):
+        if payload.get("architecture", "SmallRollDigitResNet") != "SmallRollDigitResNet":
+            raise ValueError("unsupported roll-digit architecture")
+        if "labels" in payload and list(payload["labels"]) != LABELS:
+            raise ValueError("checkpoint label ordering does not match runtime labels")
+        if "model_config" in payload:
+            spec = payload["model_config"]
+            if not isinstance(spec, dict) or "dense_hidden_sizes" not in spec or "dropout" not in spec:
+                raise ValueError("invalid checkpoint model_config")
+            if spec.get("num_classes", len(LABELS)) != len(LABELS):
+                raise ValueError("checkpoint class count does not match runtime labels")
+    model = SmallRollDigitResNet(
+        dense_hidden_sizes=tuple(spec.get("dense_hidden_sizes", ())),
+        dropout=spec.get("dropout", 0.0),
+    )
+    model.load_state_dict(_checkpoint_state(payload), strict=True)
+    return model
+
+
+def _initialize_from_checkpoint(model: SmallRollDigitResNet, path: Path, *, reset_head: bool) -> dict[str, Any]:
+    source = model_from_checkpoint(torch.load(path, map_location="cpu", weights_only=True))
+    if not reset_head:
+        if source.dense_hidden_sizes != model.dense_hidden_sizes:
+            raise ValueError("Classifier shape changed; use --reset-head to transfer only the convolutional backbone")
+        model.load_state_dict(source.state_dict(), strict=True)
+    else:
+        state = {key: value for key, value in source.state_dict().items() if not key.startswith("head.")}
+        missing, unexpected = model.load_state_dict(state, strict=False)
+        expected = {key for key in model.state_dict() if key.startswith("head.")}
+        if set(missing) != expected or unexpected:
+            raise ValueError("checkpoint backbone is incompatible with the requested model")
+    return {"head_reinitialized": reset_head, "initial_model_config": source.model_config()}
+
+
+def _build_optimizer(model: nn.Module, config: TrainConfig) -> torch.optim.Optimizer:
+    # Adam uses an L2 gradient penalty; AdamW applies decoupled weight decay.
+    optimizer_class = torch.optim.Adam if config.optimizer == "adam" else torch.optim.AdamW
+    return optimizer_class(model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay)
 
 
 def _run_epoch(
@@ -282,6 +374,7 @@ def train(
     config: TrainConfig = TrainConfig(),
     device_name: str | None = None,
     initial_checkpoint: str | Path | None = None,
+    reset_head: bool = False,
 ) -> Path:
     _set_seed(config.seed)
     dataset_root = Path(dataset_dir)
@@ -289,6 +382,7 @@ def train(
     val_csv = dataset_root / "val.csv"
     if not train_csv.exists() or not val_csv.exists():
         raise FileNotFoundError("dataset must contain train.csv and val.csv")
+    _validate_writer_splits(train_csv, val_csv)
 
     device = torch.device(device_name or ("cuda" if torch.cuda.is_available() else "cpu"))
     train_ds = RollDigitDataset(train_csv, dataset_root, image_size=config.image_size, augment=True)
@@ -296,12 +390,17 @@ def train(
     train_loader = DataLoader(train_ds, batch_size=config.batch_size, shuffle=True, num_workers=0)
     val_loader = DataLoader(val_ds, batch_size=config.batch_size, shuffle=False, num_workers=0)
 
-    model = SmallRollDigitResNet().to(device)
+    model = SmallRollDigitResNet(dense_hidden_sizes=config.dense_hidden_sizes, dropout=config.dropout).to(device)
+    initialization: dict[str, Any] = {"head_reinitialized": False}
     if initial_checkpoint is not None:
-        model.load_state_dict(_load_checkpoint_state(Path(initial_checkpoint)))
+        initialization = _initialize_from_checkpoint(model, Path(initial_checkpoint), reset_head=reset_head)
         print(f"loaded_pretrained={initial_checkpoint}")
+        if reset_head:
+            print("classifier_head_reinitialized=True; convolutional backbone retained")
+    elif reset_head:
+        raise ValueError("--reset-head requires an initial checkpoint")
     criterion = nn.CrossEntropyLoss(weight=_class_weights(train_ds, device))
-    optimizer = torch.optim.AdamW(model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay)
+    optimizer = _build_optimizer(model, config)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(1, config.epochs))
 
     output_path = Path(model_out) if model_out is not None else dataset_root / "roll_digit_resnet.pt"
@@ -329,6 +428,9 @@ def train(
                 "best_val_accuracy": best_val,
                 "val_metrics": val_metrics,
                 "architecture": "SmallRollDigitResNet",
+                "model_config": model.model_config(),
+                "initialization": initialization,
+                "augmentation": "upright_v2: +/-5 degrees, contrast 0.85-1.25, brightness 0.90-1.10, ink 0.65-0.95; no flips",
             }
             output_path.parent.mkdir(parents=True, exist_ok=True)
             torch.save(best_payload, output_path)
@@ -344,6 +446,9 @@ def train(
                 "best_val_accuracy": best_val,
                 "history": history,
                 "labels": LABELS,
+                "model_config": model.model_config(),
+                "config": asdict(config),
+                "initialization": initialization,
             },
             indent=2,
         ),
@@ -354,6 +459,18 @@ def train(
     print(f"saved_model={output_path}")
     print(f"metrics={metrics_path}")
     return output_path
+
+
+def _validate_writer_splits(train_csv: Path, val_csv: Path) -> None:
+    writers = []
+    for path in (train_csv, val_csv):
+        with path.open(encoding="utf-8-sig", newline="") as handle:
+            rows = list(csv.DictReader(handle))
+        writers.append({row.get("writer_id") or row.get("roll_no") for row in rows
+                        if row.get("writer_id") or row.get("roll_no")})
+    overlap = writers[0] & writers[1]
+    if overlap:
+        raise ValueError(f"Students occur in both train and validation: {sorted(overlap)[:10]}")
 
 
 def pretrain_kaggle(
@@ -392,9 +509,9 @@ def pretrain_kaggle(
     train_loader = DataLoader(train_ds, batch_size=config.batch_size, shuffle=True, num_workers=0)
     val_loader = DataLoader(val_ds, batch_size=config.batch_size, shuffle=False, num_workers=0)
 
-    model = SmallRollDigitResNet().to(device)
+    model = SmallRollDigitResNet(dense_hidden_sizes=config.dense_hidden_sizes, dropout=config.dropout).to(device)
     criterion = nn.CrossEntropyLoss(weight=_class_weights(train_ds, device))
-    optimizer = torch.optim.AdamW(model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay)
+    optimizer = _build_optimizer(model, config)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(1, config.epochs))
 
     output_path = Path(model_out)
@@ -422,6 +539,7 @@ def pretrain_kaggle(
                 "best_val_accuracy": best_val,
                 "val_metrics": val_metrics,
                 "architecture": "SmallRollDigitResNet",
+                "model_config": model.model_config(),
                 "pretrain_source": "kaggle_digit_recognizer",
             }
             output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -437,6 +555,8 @@ def pretrain_kaggle(
                 "best_val_accuracy": best_val,
                 "history": history,
                 "labels": LABELS,
+                "model_config": model.model_config(),
+                "config": asdict(config),
                 "val_fraction": val_fraction,
                 "limit": limit,
             },
@@ -460,7 +580,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--lr", type=float, default=1e-3)
-    parser.add_argument("--weight-decay", type=float, default=1e-4)
+    parser.add_argument("--weight-decay", type=float, default=1e-4, help="L2 coefficient for Adam; decoupled decay for AdamW")
+    parser.add_argument("--optimizer", choices=("adam", "adamw"), default="adamw")
+    parser.add_argument("--dense-hidden-sizes", type=int, nargs="+", default=(), help="For example: 64 32 adds two hidden dense layers")
+    parser.add_argument("--dropout", type=float, default=0.25, help="Dropout after each hidden dense layer")
+    parser.add_argument("--reset-head", action="store_true", help="Keep checkpoint backbone but initialize a new classifier head")
     parser.add_argument("--image-size", type=int, default=64)
     parser.add_argument("--seed", type=int, default=557)
     parser.add_argument("--val-fraction", type=float, default=0.10, help="Validation fraction for Kaggle CSV pretraining")
@@ -473,6 +597,8 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("use either --kaggle-train-csv or --dataset-dir in one command, not both")
     if args.kaggle_train_csv is not None and args.pretrained is not None:
         parser.error("--pretrained is for OMR fine-tuning with --dataset-dir, not Kaggle pretraining")
+    if args.reset_head and args.pretrained is None:
+        parser.error("--reset-head requires --pretrained")
     config = TrainConfig(
         image_size=args.image_size,
         batch_size=args.batch_size,
@@ -480,6 +606,9 @@ def main(argv: list[str] | None = None) -> int:
         learning_rate=args.lr,
         weight_decay=args.weight_decay,
         seed=args.seed,
+        dense_hidden_sizes=tuple(args.dense_hidden_sizes),
+        dropout=args.dropout,
+        optimizer=args.optimizer,
     )
     if args.kaggle_train_csv is not None:
         if args.model_out is None:
@@ -499,6 +628,7 @@ def main(argv: list[str] | None = None) -> int:
             config=config,
             device_name=args.device,
             initial_checkpoint=args.pretrained,
+            reset_head=args.reset_head,
         )
     return 0
 

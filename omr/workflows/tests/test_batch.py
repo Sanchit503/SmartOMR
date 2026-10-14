@@ -44,7 +44,7 @@ class FakeOcr:
         self.roll_text = roll_text
 
     def read_roll(self, crop_path: Path, program: str | None = None, valid_rolls: set[str] | None = None) -> RollOcrResult:
-        return RollOcrResult(self.roll_text, confidence=0.95)
+        raise AssertionError("Batch pipeline must not call whole-roll OCR")
 
     def read_digit(self, crop_path: Path) -> RollOcrResult:
         digit = self.digits.pop(0) if self.digits else ""
@@ -62,7 +62,7 @@ class PageAwareFakeOcr:
         return 1 if "page_1_" in crop_path.name else 2
 
     def read_roll(self, crop_path: Path, program: str | None = None, valid_rolls: set[str] | None = None) -> RollOcrResult:
-        return RollOcrResult(self.page_rolls[self._page_index(crop_path)], confidence=0.95)
+        raise AssertionError("Batch pipeline must not call whole-roll OCR")
 
     def read_digit(self, crop_path: Path) -> RollOcrResult:
         page_index = self._page_index(crop_path)
@@ -82,7 +82,7 @@ class SourceAwareFakeOcr:
         return self.source_rolls[source_index]
 
     def read_roll(self, crop_path: Path, program: str | None = None, valid_rolls: set[str] | None = None) -> RollOcrResult:
-        return RollOcrResult(self._roll(crop_path), confidence=0.95)
+        raise AssertionError("Batch pipeline must not call whole-roll OCR")
 
     def read_digit(self, crop_path: Path) -> RollOcrResult:
         cell_index = int(crop_path.stem.rsplit("_", 1)[-1]) - 1
@@ -98,7 +98,9 @@ def _record(source_index: int, page_index: int, roll_no: str, confidence: str) -
         roll_no=roll_no,
         program="BTECH",
         confidence=confidence,
-        identity_payload={},
+        identity_payload=({"write_in_roll_read": _cell_read(roll_no, .95),
+                           "ratios": {"program_selector": {"BTECH": {"fill": .8, "ink": .8}}}}
+                          if page_index == 1 else _cell_read(roll_no, .95)),
         review_flags=[],
     )
 
@@ -125,6 +127,7 @@ def _cell_read(roll_no: str, selected_probability: float) -> dict:
         "roll_no": roll_no,
         "confidence": "high",
         "ocr_results": {
+            "_program_selector": {"signals": {"BTECH": {"fill": .8, "ink": .8}}},
             "BTECH": {
                 "cells": {
                     "text": roll_no,
@@ -136,7 +139,7 @@ def _cell_read(roll_no: str, selected_probability: float) -> dict:
     }
 
 
-def test_auto_order_inference_recovers_sheet_major_bundle_with_one_failed_page():
+def test_auto_order_inference_cannot_attach_unreadable_continuations():
     manifest = {"num_pages": 2}
     records = []
     valid_rolls = {f"20240{index:02d}" for index in range(1, 7)}
@@ -159,12 +162,8 @@ def test_auto_order_inference_recovers_sheet_major_bundle_with_one_failed_page()
         valid_rolls=valid_rolls,
     )
     assert len(grouped) == 5
-    assert all({page.aligned_page.page_index for page in pages} == {1, 2} for pages in grouped.values())
-    assert [page.source_index for page in unmatched] == [6]
-    assert all(
-        any("handwritten roll was not independently readable" in flag for flag in pages[1].review_flags)
-        for pages in grouped.values()
-    )
+    assert all({page.aligned_page.page_index for page in pages} == {1} for pages in grouped.values())
+    assert [page.source_index for page in unmatched] == [2, 4, 6, 8, 10, 12]
 
 
 def test_inferred_order_refuses_duplicate_page_one_roll_claims():
@@ -185,14 +184,15 @@ def test_inferred_order_refuses_duplicate_page_one_roll_claims():
     assert set(grouped) == {"2024003", "2024004"}
     assert {record.source_index for record in unmatched} == {1, 2, 3, 4}
     assert all(
-        any("duplicate page-1 ownership claim" in flag for flag in record.review_flags)
+        any(flag["code"] in {"DUPLICATE_AGREED_CLAIM", "NO_ANCHOR_FOR_ROLL"}
+            for flag in record.identity_payload["ownership_evidence_flags"])
         for record in unmatched
     )
 
 
 def test_path_a_near_neighbour_guard_holds_uncertain_automatic_attachment():
     page_one = _record(1, 1, "2023478", "high")
-    page_one.identity_payload = {"write_in_roll_read": _cell_read("2023478", 0.95)}
+    page_one.identity_payload["write_in_roll_read"] = _cell_read("2023478", 0.95)
     page_two = _record(2, 2, "2023478", "high")
     page_two.identity_payload = _cell_read("2023478", 0.84)
 
@@ -207,13 +207,13 @@ def test_path_a_near_neighbour_guard_holds_uncertain_automatic_attachment():
     assert [record.source_index for record in unmatched] == [2]
     assert any(
         flag.get("code") == NEAR_NEIGHBOUR_HOLD
-        for flag in page_two.identity_payload["evidence_flags"]
+        for flag in page_two.identity_payload["ownership_evidence_flags"]
     )
 
 
 def test_path_a_near_neighbour_guard_accepts_strong_automatic_attachment():
     page_one = _record(1, 1, "2023478", "high")
-    page_one.identity_payload = {"write_in_roll_read": _cell_read("2023478", 0.95)}
+    page_one.identity_payload["write_in_roll_read"] = _cell_read("2023478", 0.95)
     page_two = _record(2, 2, "2023478", "high")
     page_two.identity_payload = _cell_read("2023478", 0.90)
 
@@ -230,9 +230,6 @@ def test_path_a_near_neighbour_guard_accepts_strong_automatic_attachment():
 
 def test_exact_cross_page_roll_pair_is_recovered_only_with_roster_match():
     page_one = _record(11, 1, "2023011", "medium")
-    page_one.identity_payload = {
-        "write_in_roll_read": {"roll_no": "2023011", "confidence": "medium"}
-    }
     page_two = _record(47, 2, "2023011", "medium")
 
     grouped, unmatched = _reconcile_exact_cross_page_roll_pairs(
@@ -245,8 +242,7 @@ def test_exact_cross_page_roll_pair_is_recovered_only_with_roster_match():
 
     assert unmatched == []
     assert [record.source_index for record in grouped["2023011"]] == [11, 47]
-    assert grouped["2023011"][1].identity_kind == "exact_cross_page_roll"
-    assert "source order was not used" in grouped["2023011"][1].review_flags[0]
+    assert grouped["2023011"][1].identity_kind == "handwritten"
 
     _, unmatched = _reconcile_exact_cross_page_roll_pairs(
         [page_one, page_two],
@@ -258,7 +254,7 @@ def test_exact_cross_page_roll_pair_is_recovered_only_with_roster_match():
     assert {record.source_index for record in unmatched} == {11, 47}
 
 
-def test_exact_cross_page_recovery_does_not_reject_a_strong_page_two_for_weak_anchor_cells():
+def test_exact_cross_page_recovery_holds_a_weak_anchor_with_a_plausible_neighbour():
     page_one = _record(11, 1, "2023478", "medium")
     page_one_read = _cell_read("2023478", 0.90)
     weak_anchor_digit = page_one_read["ocr_results"]["BTECH"]["cells"]["raw"]["cells"][-1]["raw"]
@@ -278,18 +274,13 @@ def test_exact_cross_page_recovery_does_not_reject_a_strong_page_two_for_weak_an
         program_by_roll={"2023478": "BTECH", "2023473": "BTECH"},
     )
 
-    assert unmatched == []
-    assert [record.source_index for record in grouped["2023478"]] == [11, 47]
-    assert PAGE2_LOW_CONF in {
-        flag["code"] for flag in grouped["2023478"][1].identity_payload["evidence_flags"]
-    }
+    assert grouped == {}
+    assert {record.source_index for record in unmatched} == {11, 47}
+    assert any("neighbour" in flag for flag in page_one.review_flags)
 
 
 def test_exact_cross_page_recovery_supports_all_unique_continuation_slots():
     page_one = _record(11, 1, "2023011", "medium")
-    page_one.identity_payload = {
-        "write_in_roll_read": {"roll_no": "2023011", "confidence": "medium"}
-    }
     page_two = _record(47, 2, "2023011", "medium")
     page_three = _record(9, 3, "2023011", "medium")
 
@@ -310,9 +301,6 @@ def test_exact_cross_page_recovery_supports_all_unique_continuation_slots():
 
 def test_exact_cross_page_recovery_refuses_duplicate_continuation_claims():
     page_one = _record(11, 1, "2023011", "medium")
-    page_one.identity_payload = {
-        "write_in_roll_read": {"roll_no": "2023011", "confidence": "medium"}
-    }
     first_page_two = _record(47, 2, "2023011", "medium")
     second_page_two = _record(48, 2, "2023011", "medium")
 
@@ -324,15 +312,12 @@ def test_exact_cross_page_recovery_refuses_duplicate_continuation_claims():
         valid_rolls={"2023011"},
     )
 
-    assert grouped == {}
-    assert {record.source_index for record in unmatched} == {11, 47, 48}
+    assert grouped == {"2023011": [page_one]}
+    assert {record.source_index for record in unmatched} == {47, 48}
 
 
 def test_identity_grouping_refuses_continuation_program_mismatch():
     page_one = _record(11, 1, "2023011", "high")
-    page_one.identity_payload = {
-        "write_in_roll_read": {"roll_no": "2023011", "confidence": "high"}
-    }
     page_two = _record(47, 2, "2023011", "high")
     page_two.program = "MTECH"
 
@@ -344,16 +329,14 @@ def test_identity_grouping_refuses_continuation_program_mismatch():
 
     assert [record.source_index for record in grouped["2023011"]] == [11]
     assert unmatched == [page_two]
-    assert any("does not match" in flag for flag in page_two.review_flags)
+    assert any(flag["severity"] == BLOCK for flag in page_two.identity_payload["ownership_evidence_flags"])
 
 
 def test_exact_cross_page_recovery_allows_blank_btech_selector_with_exact_roll():
     page_one = _record(11, 1, "2023011", "medium")
-    page_one.identity_payload = {
-        "write_in_roll_read": {"roll_no": "2023011", "confidence": "medium"}
-    }
     page_two = _record(47, 2, "2023011", "medium")
     page_two.review_flags.append("page 2 continuation program selector is blank")
+    page_two.identity_payload["ocr_results"]["_program_selector"]["signals"]["BTECH"] = {"fill": .02, "ink": .02}
 
     grouped, unmatched = _group_records_by_identity(
         [page_one, page_two], "high", valid_rolls={"2023011"}
@@ -374,7 +357,8 @@ def test_exact_cross_page_recovery_refuses_blank_mtech_selector():
     page_one = _record(11, 1, "MT25007", "medium")
     page_one.program = "MTECH"
     page_one.identity_payload = {
-        "write_in_roll_read": {"roll_no": "MT25007", "confidence": "medium"}
+        "ratios": {"program_selector": {"MTECH": {"fill": .8, "ink": .8}}},
+        "write_in_roll_read": {"program": "MTECH", "ocr_results": {"MTECH": {"cells": {"text": "25007", "confidence": .95}}}},
     }
     page_two = _record(47, 2, "MT25007", "medium")
     page_two.program = "MTECH"
@@ -402,10 +386,6 @@ def test_exact_cross_page_recovery_refuses_blank_mtech_selector():
 def test_identity_grouping_refuses_duplicate_page_one_claims():
     first = _record(11, 1, "2023011", "high")
     second = _record(12, 1, "2023011", "high")
-    for record in (first, second):
-        record.identity_payload = {
-            "write_in_roll_read": {"roll_no": "2023011", "confidence": "high"}
-        }
 
     grouped, unmatched = _group_records_by_identity(
         [first, second], "high", valid_rolls={"2023011"},
@@ -413,14 +393,11 @@ def test_identity_grouping_refuses_duplicate_page_one_claims():
 
     assert grouped == {}
     assert {record.source_index for record in unmatched} == {11, 12}
-    assert all("duplicate page-1 ownership claim" in record.review_flags[-1] for record in unmatched)
+    assert all(any(flag["code"] == "DUPLICATE_AGREED_CLAIM" for flag in record.identity_payload["ownership_evidence_flags"]) for record in unmatched)
 
 
 def test_identity_grouping_refuses_duplicate_continuation_claims():
     page_one = _record(11, 1, "2023011", "high")
-    page_one.identity_payload = {
-        "write_in_roll_read": {"roll_no": "2023011", "confidence": "high"}
-    }
     first = _record(47, 2, "2023011", "high")
     second = _record(48, 2, "2023011", "high")
 
@@ -430,7 +407,7 @@ def test_identity_grouping_refuses_duplicate_continuation_claims():
 
     assert [record.source_index for record in grouped["2023011"]] == [11]
     assert {record.source_index for record in unmatched} == {47, 48}
-    assert all("duplicate page-2 ownership claim" in record.review_flags[-1] for record in unmatched)
+    assert all(any(flag["code"] == "DUPLICATE_AGREED_CLAIM" for flag in record.identity_payload["ownership_evidence_flags"]) for record in unmatched)
 
 
 @pytest.mark.parametrize("reuse_identity", [False, True])
@@ -484,7 +461,7 @@ def test_batch_consumes_inspected_alignment_without_realigning(tmp_path: Path, m
     assert index["status_counts"]["unmatched_pages"] == 1
 
 
-def test_clear_inferred_program_roll_creates_reviewable_page_one_group():
+def test_inferred_program_without_cell_evidence_cannot_create_owned_group():
     page_one = _record(11, 1, "2023011", "low")
     page_one.identity_payload = {
         "evidence_flags": [
@@ -503,8 +480,8 @@ def test_clear_inferred_program_roll_creates_reviewable_page_one_group():
         "high",
         valid_rolls={"2023011"},
     )
-    assert list(grouped) == ["2023011"]
-    assert unmatched == []
+    assert grouped == {}
+    assert unmatched == [page_one]
 
     grouped, unmatched = _group_records_by_identity(
         [page_one],
@@ -738,17 +715,10 @@ def test_batch_flags_first_page_write_in_roll_conflict(tmp_path: Path):
         ocr_backend=FakeOcr(digits="20249992024999", roll_text="2024999"),
     )
 
-    assert len(students) == 1
-    student = students[0]
-    assert student["student"]["roll_no"] == "2024587"
-    assert student["status"] == "needs_review"
-    assert student["roll_read"]["write_in_roll_read"]["roll_no"] == "2024999"
-    assert any(
-        "page-1 write-in roll 2024999 conflicts with grouped roll 2024587" in flag
-        for flag in student["review_flags"]
-    )
+    assert students == []
     payload = json.loads(index_path.read_text(encoding="utf-8"))
-    assert payload["status_counts"]["needs_review"] == 1
+    assert payload["status_counts"]["unmatched_pages"] == 1
+    assert any("conflicts" in flag for flag in payload["unmatched_pages"][0]["review_flags"])
 
 
 def test_page_one_write_in_conflict_blocks_continuation_attachment(tmp_path: Path):
@@ -783,16 +753,11 @@ def test_page_one_write_in_conflict_blocks_continuation_attachment(tmp_path: Pat
         min_group_confidence="medium",
     )
 
-    assert len(students) == 1
-    assert students[0]["student"]["roll_no"] == "2024587"
-    assert {page["page_index"] for page in students[0]["pages"]} == {1}
+    assert students == []
     payload = json.loads(index_path.read_text(encoding="utf-8"))
-    assert payload["status_counts"]["unmatched_pages"] == 1
+    assert payload["status_counts"]["unmatched_pages"] == 2
     assert payload["unmatched_pages"][0]["page_index"] == 2
-    assert any(
-        "no page-1 sheet has the same roll confirmed by both bubbles and handwriting" in flag
-        for flag in payload["unmatched_pages"][0]["review_flags"]
-    )
+    assert any(flag["code"] == "NO_ANCHOR_FOR_ROLL" for flag in payload["unmatched_pages"][0]["identity"]["ownership_evidence_flags"])
 
 
 def test_batch_flags_unreadable_first_page_write_in_roll(tmp_path: Path):
@@ -815,7 +780,7 @@ def test_batch_flags_unreadable_first_page_write_in_roll(tmp_path: Path):
     bundle_path = tmp_path / "roll_unreadable_bundle.pdf"
     pages[1].save(bundle_path, resolution=DPI)
 
-    students, _index_path = parse_exam_bundle(
+    students, index_path = parse_exam_bundle(
         bundle_path,
         result["manifest_path"],
         output_root=tmp_path / "parsed",
@@ -823,15 +788,15 @@ def test_batch_flags_unreadable_first_page_write_in_roll(tmp_path: Path):
         ocr_backend=FakeOcr(digits="", roll_text=""),
     )
 
-    assert len(students) == 1
-    assert students[0]["status"] == "needs_review"
+    assert students == []
+    payload = json.loads(index_path.read_text(encoding="utf-8"))
     assert any(
         "page-1 write-in roll OCR could not be decoded confidently" in flag
-        for flag in students[0]["review_flags"]
+        for flag in payload["unmatched_pages"][0]["review_flags"]
     )
 
 
-def test_batch_explicitly_groups_page_major_scanner_order_without_continuation_ocr(tmp_path: Path):
+def test_batch_page_major_order_without_ocr_remains_suggested(tmp_path: Path):
     result = generate_exam(
         ExamConfig(
             exam_id="PAGE_MAJOR_BATCH_TEST",
@@ -873,22 +838,19 @@ def test_batch_explicitly_groups_page_major_scanner_order_without_continuation_o
         grouping_mode="page-major",
     )
 
-    assert {student["student"]["roll_no"] for student in students} == {"2024001", "2024002"}
-    for student in students:
-        assert {page["page_index"] for page in student["pages"]} == {1, 2}
-        assert len(student["source_pages"]) == 2
-        assert any(read["kind"] == "page_major_order" and read["page_index"] == 2 for read in student["identity_reads"])
-        identity_dir = Path(student["details_path"]).parent / "identity"
-        assert (identity_dir / "page_2_btech_roll_crop.png").exists()
+    assert students == []
 
     payload = json.loads(index_path.read_text(encoding="utf-8"))
     assert payload["requested_grouping_mode"] == "page-major"
-    assert payload["grouping_mode"] == "page-major"
-    assert payload["status_counts"]["unmatched_pages"] == 0
+    assert payload["grouping_mode"] == "identity"
+    assert payload["status_counts"]["unmatched_pages"] == 4
+    resolution = json.loads((index_path.parent / "identity_resolution.json").read_text())
+    assert len(resolution["candidates"]) == 2
+    assert all(item["path"] == "Order" and item["blocked"] for item in resolution["candidates"])
     assert payload["status_counts"]["page_errors"] == 0
 
 
-def test_batch_explicitly_groups_sheet_major_scanner_order_without_continuation_ocr(tmp_path: Path):
+def test_batch_sheet_major_order_without_ocr_remains_suggested(tmp_path: Path):
     result = generate_exam(
         ExamConfig(
             exam_id="SHEET_MAJOR_BATCH_TEST",
@@ -930,16 +892,12 @@ def test_batch_explicitly_groups_sheet_major_scanner_order_without_continuation_
         grouping_mode="sheet-major",
     )
 
-    assert {student["student"]["roll_no"] for student in students} == {"2024003", "2024004"}
-    for student in students:
-        assert {page["page_index"] for page in student["pages"]} == {1, 2}
-        assert len(student["source_pages"]) == 2
-        assert any(read["kind"] == "sheet_major_order" and read["page_index"] == 2 for read in student["identity_reads"])
+    assert students == []
 
     payload = json.loads(index_path.read_text(encoding="utf-8"))
     assert payload["requested_grouping_mode"] == "sheet-major"
-    assert payload["grouping_mode"] == "sheet-major"
-    assert payload["status_counts"]["unmatched_pages"] == 0
+    assert payload["grouping_mode"] == "identity"
+    assert payload["status_counts"]["unmatched_pages"] == 4
     assert payload["status_counts"]["page_errors"] == 0
 
 
@@ -988,11 +946,10 @@ def test_batch_auto_does_not_guess_irregular_order_from_write_in_similarity(tmp_
         min_group_confidence="high",
     )
 
-    assert {student["student"]["roll_no"] for student in auto_students} == {"2024503", "2024544"}
-    assert all({page["page_index"] for page in student["pages"]} == {1} for student in auto_students)
+    assert auto_students == []
     auto_payload = json.loads(auto_index_path.read_text(encoding="utf-8"))
     assert auto_payload["grouping_mode"] == "identity"
-    assert auto_payload["status_counts"]["unmatched_pages"] == 2
+    assert auto_payload["status_counts"]["unmatched_pages"] == 4
 
 
 def test_batch_auto_leaves_unreadable_three_page_arbitrary_order_unmatched(tmp_path: Path):
@@ -1049,23 +1006,14 @@ def test_batch_auto_leaves_unreadable_three_page_arbitrary_order_unmatched(tmp_p
         min_group_confidence="high",
     )
 
-    assert {student["student"]["roll_no"] for student in parsed_students} == {
-        "2024503",
-        "2037618",
-        "2048921",
-    }
-    for student in parsed_students:
-        assert {page["page_index"] for page in student["pages"]} == {1}
-        sheet_pdf_path = Path(student["details_path"]).parent / student["sheet_pdf_path"]
-        with pymupdf.open(sheet_pdf_path) as doc:
-            assert len(doc) == 1
+    assert parsed_students == []
 
     payload = json.loads(index_path.read_text(encoding="utf-8"))
     assert payload["requested_grouping_mode"] == "auto"
     assert payload["grouping_mode"] == "identity"
     assert payload["expected_pages"] == 3
     assert payload["detected_page_sequence"] == [2, 3, 1, 3, 2, 1, 1, 3, 2]
-    assert payload["status_counts"]["unmatched_pages"] == 6
+    assert payload["status_counts"]["unmatched_pages"] == 9
     assert payload["status_counts"]["page_errors"] == 0
 
 
@@ -1249,3 +1197,54 @@ def test_batch_unmatched_late_page_saves_written_crops(tmp_path: Path):
     for written in unmatched["written_responses"]:
         assert (details_dir / written["crop_path"]).exists()
         assert (details_dir / written["ocr_crop_path"]).exists()
+
+
+def test_grouping_only_skips_answers_and_does_not_load_answer_key(tmp_path: Path, monkeypatch):
+    import omr.workflows.batch as batch
+
+    result = generate_exam(
+        ExamConfig(
+            exam_id="GROUPING_ONLY_TEST",
+            course_code="CSE202",
+            exam_name="Quiz",
+            exam_type="quiz",
+            num_mcq=1,
+            mcq_options=4,
+            marks_per_mcq=1,
+            written_questions=[WrittenQuestionConfig(q_no=2, max_marks=2, lines=2)],
+        ),
+        tmp_path / "exam",
+    )
+    assert result["manifest"]["num_pages"] == 1
+    page = _render_pages(result["pdf_path"])[1]
+    _fill_btech_roll(page, result["manifest"], "2024503")
+    _write_btech_roll_boxes(page, result["manifest"], 1, "2024503")
+    scans = tmp_path / "scans.pdf"
+    page.save(scans, resolution=DPI)
+    invalid_key = tmp_path / "invalid_key.csv"
+    invalid_key.write_text("not an answer key\n", encoding="utf-8")
+
+    def unexpected_answer_work(*args, **kwargs):
+        pytest.fail("Grouping-only must not extract or grade answers")
+
+    monkeypatch.setattr(batch, "read_mcq_responses", unexpected_answer_work)
+    monkeypatch.setattr(batch, "_numerical_payload", unexpected_answer_work)
+    monkeypatch.setattr(batch, "crop_written_responses", unexpected_answer_work)
+    monkeypatch.setattr(batch, "load_answer_key", unexpected_answer_work)
+    students, index_path = parse_exam_bundle(
+        scans,
+        result["manifest_path"],
+        output_root=tmp_path / "parsed",
+        answer_key_path=invalid_key,
+        grouping_only=True,
+        dpi=DPI,
+        ocr_backend=SourceAwareFakeOcr({1: "2024503"}),
+    )
+
+    assert len(students) == 1
+    assert students[0]["student"]["roll_no"] == "2024503"
+    assert students[0]["grouping_only"] is True
+    assert students[0]["answer_review_flags"] == []
+    for field in ("mcq_responses", "numerical_responses", "written_responses"):
+        assert students[0][field] == []
+    assert json.loads(index_path.read_text(encoding="utf-8"))["grouping_only"] is True

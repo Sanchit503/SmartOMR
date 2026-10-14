@@ -3,7 +3,7 @@
   const status = document.getElementById("review-sync");
   if (!status) return;
   const forms = [...document.querySelectorAll("form")];
-  const signature = (form) => JSON.stringify([...form.elements].filter((field) => field.name).map((field) =>
+  const signature = (form) => JSON.stringify([...form.elements].filter((field) => field.name && !field.hasAttribute("data-sync-ignore")).map((field) =>
     [field.name, field.value, field.checked, [...(field.files || [])].map((file) => [file.name, file.size, file.lastModified])]));
   const originals = forms.map(signature);
   const dirty = () => forms.some((form, index) => signature(form) !== originals[index]);
@@ -18,12 +18,14 @@
   }
   function refresh() {
     sessionStorage.setItem(scrollKey, String(window.scrollY));
+    window.dispatchEvent(new Event("review-view-refresh"));
     location.reload();
   }
   status.querySelector("button").addEventListener("click", () => {
     if (!dirty() || confirm("Discard unsaved edits and load the latest review state?")) refresh();
   });
   for (const form of forms) form.addEventListener("submit", () => { submitting = true; });
+  window.addEventListener("review-submission-failed", () => { queueMicrotask(() => { submitting = false; }); });
   async function check() {
     if (busy || submitting || document.hidden) return;
     busy = true;

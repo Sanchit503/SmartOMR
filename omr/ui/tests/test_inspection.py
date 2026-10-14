@@ -437,7 +437,7 @@ def test_student_view_uses_current_manual_selection_and_verified_pdf(tmp_path):
             assert len(doc) == 2
             pix = doc[1].get_pixmap(colorspace=pymupdf.csGRAY)
             assert abs(pix.pixel(pix.width // 2, pix.height // 2)[0] - 170) <= 2
-        assert b"MANUALLY_CHECKED" in body
+        assert b'>Manually checked</span>' in body
         assert b"Regrading required" in body
 
 

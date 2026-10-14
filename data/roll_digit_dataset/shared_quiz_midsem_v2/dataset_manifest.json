@@ -1,0 +1,117 @@
+{
+  "schema_version": 1,
+  "counts": {
+    "labels": 4051,
+    "train": 3200,
+    "val": 351,
+    "test": 500,
+    "local_fit_train": 3230,
+    "local_fit_val": 821
+  },
+  "writer_counts": {
+    "labels": 185,
+    "train": 149,
+    "val": 16,
+    "test": 20,
+    "local_fit_train": 147,
+    "local_fit_val": 38
+  },
+  "class_counts": {
+    "labels": {
+      "2": 1240,
+      "0": 759,
+      "3": 528,
+      "1": 282,
+      "9": 111,
+      "4": 291,
+      "5": 229,
+      "6": 246,
+      "7": 100,
+      "8": 108,
+      "blank": 157
+    },
+    "train": {
+      "2": 994,
+      "0": 590,
+      "3": 409,
+      "1": 221,
+      "9": 84,
+      "4": 220,
+      "5": 177,
+      "6": 210,
+      "7": 72,
+      "8": 92,
+      "blank": 131
+    },
+    "val": {
+      "2": 100,
+      "0": 66,
+      "3": 44,
+      "1": 22,
+      "5": 32,
+      "9": 16,
+      "6": 16,
+      "7": 8,
+      "4": 20,
+      "8": 8,
+      "blank": 19
+    },
+    "test": {
+      "2": 146,
+      "0": 103,
+      "3": 75,
+      "1": 39,
+      "4": 51,
+      "5": 20,
+      "9": 11,
+      "8": 8,
+      "6": 20,
+      "7": 20,
+      "blank": 7
+    },
+    "local_fit_train": {
+      "2": 991,
+      "0": 613,
+      "3": 420,
+      "1": 216,
+      "5": 175,
+      "9": 101,
+      "4": 234,
+      "6": 184,
+      "7": 84,
+      "8": 88,
+      "blank": 124
+    },
+    "local_fit_val": {
+      "2": 249,
+      "0": 146,
+      "3": 108,
+      "1": 66,
+      "4": 57,
+      "6": 62,
+      "7": 16,
+      "8": 20,
+      "9": 10,
+      "5": 54,
+      "blank": 33
+    }
+  },
+  "source_csv_sha256": {
+    "labels.csv": "01d5c7614695c7ce6ff504fe954f20caf747f24505b5ca8a33f613539f53816d",
+    "train.csv": "31b5696922e41818ddc636bdeb0119005ef30d541e439a247cb76d4bde972359",
+    "val.csv": "76b03606abab7e8ef24ddc9245c42b61330fb95951b3a8ed6fa7127115443b27",
+    "test.csv": "78242ce0528ec5a835a37382ea4dfd106a378198ac789a4dbdf7791db71aa12d",
+    "local_fit_train.csv": "1361d0d49ef955ecee545fdacc36c107a110be017e41d01a9bb2f9a8968dbb82",
+    "local_fit_val.csv": "58201042f77f7f561e2790cddbf778ae43d55946aa45d179c3d05fa9027982e2"
+  },
+  "csv_sha256": {
+    "labels.csv": "a71c8c5eb57f70116b7f95183f9971fb57ab64f8767451f494356df07ae724b3",
+    "train.csv": "0ddd7d6716a402e98f4093a5a11e508f489cba0c5c5c0a64ea9e4b6ca3195994",
+    "val.csv": "38a3f8508cb54e3f0eb78e935d2e9a6e3a6384566bfd4931dfa9606f1b119b43",
+    "test.csv": "88520e38eb37f2a8811e06454963966ccef380bdd9d69c89f5c7632c2e7ec2b8",
+    "local_fit_train.csv": "4babb1920b73064b4a3daac63f110e8f3016492c2f404512b5c4ad3dec74cb25",
+    "local_fit_val.csv": "d784ca9d41ffb6c0199994bcf7597936099ec3bc4e40e18a04cde6c405ad5eca"
+  },
+  "privacy": "Digit cells only; no roll numbers, roster, scan paths, cell positions or writer lookup key. Writer IDs are pseudonymous, not a guarantee of anonymity. Labels and pixels are unchanged.",
+  "split_note": "Colab train/val/test are writer-disjoint. Local-fit train/val reflect earlier training; the local models have exposure to much of the Colab test set. Not a fair shared holdout."
+}

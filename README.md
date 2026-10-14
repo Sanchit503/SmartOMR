@@ -22,22 +22,33 @@ Per the roadmap in PROJECT_SPEC.md Section 12:
 
 ## Professor UI
 
+For the shared digit dataset, completed laptop/Colab ensembles and fresh-clone
+commands, see [GitHub Handoff](docs/GITHUB_HANDOFF.md). TA question ranges,
+editable emails and marking imports are covered in
+[TA Marking Workflow](docs/TA_MARKING_WORKFLOW.md).
+
 ```bash
 python -m omr.ui.app
 ```
 
 Open `http://127.0.0.1:8765`, then upload the scanned PDF and matching manifest.
-The first step is **Scan Inspection**: every source page remains in the inventory, with
-original/aligned/overlay views, alignment checks, failures, progress, and retry/resume.
-This step does not read roll numbers, group students, grade, or send email.
-The answer key and student roster are optional uploads. CSV/XLSX rosters are normalized into the canonical
+Click **1. Detect Rolls & Group Sheets**. One background job aligns pages, reads literal
+roll evidence once, and groups independently matching pages into student bundles.
+The source-page workspace remains available for diagnostics, progress, and corrections;
+there is no separate inspection or roll-preview click in a new UI run.
+No answer key is needed for grouping. The student roster is optional. CSV/XLSX rosters are normalized into the canonical
 `roll_no,name,email,program` shape. The IIITD portal export is supported even when it contains a
 blank row, `Roll No.`/`Student Name` headers, `Lecture` in `Class Type`, and an email column whose
 header is blank.
 
-After inspection, **Run OCR & Grouping** starts the existing evaluation workflow separately.
-Only that step requires local roll-number OCR. Inspection does not require Tesseract.
-Run this preflight before evaluation:
+After grouping and any needed ownership corrections, choose **2. Grade Answers**.
+Enter the objective answer key or upload CSV/XLSX, including dropped questions.
+Grading uses current selected aligned images without repeating roll OCR or changing
+ownership. Unresolved/incomplete selections are skipped and counted explicitly.
+Written answers are cropped for professor marking, not automatically scored.
+Changed page selections invalidate previous grades and block their release until regraded.
+Only the identity-reading step requires local roll-number OCR.
+Run this preflight before matching:
 
 ```powershell
 .\.venv\Scripts\python.exe -m omr.health --check-handwriting-ocr
@@ -47,7 +58,19 @@ It must report `handwriting_ocr: ready`. On Windows, SmartOMR discovers the norm
 `C:\Program Files\Tesseract-OCR\tesseract.exe` installation automatically; a custom location can be
 set through `SMARTOMR_TESSERACT_CMD`.
 
-After processing, resolve unmatched pages and verify every student from the Review page. Check
+After matching, choose **Review Student Sheets** on the dashboard or Review page. The workspace
+has a searchable student queue, status filters, page thumbnails, zoom, and original/aligned/overlay
+views. It shows the current selected source pages and saved OCR evidence. **Open Current Preview
+PDF** assembles the current selection without approving it or rerunning OCR. **Open Verified PDF**
+is available after an explicit manual check.
+
+Use **Verify & Next** to approve the current selection and move through the filtered queue, or
+**Keep for Review & Next** to defer it. Incomplete sheets require explicit acknowledgement and
+remain ineligible for email. Duplicate ownership blocks verification. Corrections made in another
+tab invalidate a stale decision; refresh before approving the changed selection. Unsaved notes
+are preserved until you choose to discard them. Saved review changes synchronize across views.
+
+Resolve unmatched source pages and verify each student's selection before release. Check
 the `Missing Sheets` count against the roster before preparing email. Prepare and inspect the
 email queue using **Sheet Verification - no marks** when returning scanned answer sheets. Use
 **Evaluated Sheet + Marks** only after grading data has been checked and finalized. Run a dry run,
@@ -294,8 +317,16 @@ python -m omr.workflows.batch \
 
 Source order does not matter: page 2 may appear before page 1. Missing, unreadable, conflicting,
 duplicate, or non-roster identities remain in the review queue instead of being guessed. Explicit
-`--grouping-mode page-major` and `--grouping-mode sheet-major` overrides remain available only for
-controlled scanner workflows whose physical page order has been independently verified.
+`--grouping-mode page-major` and `--grouping-mode sheet-major` select order-based
+suggestions only. They cannot attach a page automatically. Clean ownership requires
+cell confidence >= 0.80 and the exact-identity checks, with a 0.85 near-neighbour guard.
+Use `--grouping-only` to match sheets without reading/grading answers.
+
+The UI provides **Reassess Saved Evidence** for an existing completed run and
+**Approve Clean Matches** for explicit batch release approval. Existing manual
+decisions are preserved, and no OCR rerun is needed for reassessment. See
+[Exact Ownership Workflow](docs/EXACT_OWNERSHIP_WORKFLOW.md) for decisions, statuses,
+legacy-run handling, and validation limits.
 
 Output is written under `data/parsed/<exam_id>/students/<roll_no>/`:
 
@@ -478,9 +509,23 @@ python -m omr.workflows.batch \
   --digit-model data/models/roll_digit_knn.npz
 ```
 
-The local handwritten reader crops both the full roll strip and every digit cell using manifest
-geometry, cleans the cell borders/noise with OpenCV, prefers cell-by-cell agreement, and rejects
-conflicting or non-roster roll numbers instead of attaching a page to the wrong student.
+The local handwritten reader classifies only individual digit cells at exact manifest
+positions. Whole-roll strip inference and equal-width strip segmentation are removed;
+full-field images are saved only for human inspection. Missing cell geometry never
+falls back to strip OCR. Exact-roll, roster-validation, confidence and ownership
+checks remain in place. Written-answer strips for TA grading are unaffected.
+
+The local default is the completed seven-member quiz/midsem fine-tuning ensemble
+at `data/models/roll_digit_ensemble_7_quiz_midsem_v2/ensemble_manifest.json`.
+The original ensemble is preserved and the three-dense-layer experiment is not
+selected. Override the selection with `SMARTOMR_ROLL_ENSEMBLE_MANIFEST`.
+
+After updating, restart the UI. Open Inspect Source Pages and use Re-run Grouping
+to replace recognition results using the existing inspected images. Model and
+reader fingerprints prevent reuse of stale OCR caches; a separate preview is
+not required. Historical reports and manual reviews are archived, not applied
+to the new grouping. Two-step runs offer Re-run Grouping too; review the new
+groups, then use 2. Grade Answers to regenerate marks.
 
 To train the optional digit model, label saved identity cell crops in a CSV:
 
@@ -663,10 +708,9 @@ sits nearest is the true top-left, at any rotation and any scale.
 ### Identity on every page
 
 A multi-page sheet is scanned as a loose batch, so every page has to say who it belongs to and
-which page it is. The default parser groups by roll identity. Separate page-major and sheet-major
-scanner modes are available only when the operator knows the scan order; in those modes, the
-page-index bars must confirm the exact selected sequence before continuation pages are attached by
-position.
+which page it is. All parser modes group by exact roll identity. Page-major and
+sheet-major scanner order may produce human-reviewed suggestions, never automatic
+positional attachment.
 
 | On every page | Read by | What it's for |
 |---|---|---|

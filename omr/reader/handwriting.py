@@ -1,9 +1,9 @@
 """Continuation-page handwritten roll-number support.
 
 Handwriting is treated as an identity-risk signal, not a guaranteed truth.
-The reader crops the roll strip declared in the manifest, optionally sends
-that crop to a configured OCR backend, validates the text against the
-expected roll format, and returns low confidence when evidence is weak.
+The reader classifies exact digit cells declared in the manifest, validates
+the text against the expected roll format, and returns low confidence when
+evidence is weak. Whole-field images are saved only for human inspection.
 """
 from __future__ import annotations
 
@@ -26,12 +26,10 @@ from omr.identity_evidence import (
     BLOCK,
     CELL_ROLL_UNREADABLE,
     EMPTY_FIELD,
-    INFO,
     LOW_CELL_CONFIDENCE,
     PROGRAM_SELECTOR_AMBIGUOUS,
     PROGRAM_SELECTOR_BLANK,
     ROLL_NOT_IN_ROSTER,
-    STRIP_DISAGREES,
     WARN,
     evidence,
 )
@@ -40,7 +38,7 @@ from omr.reader.enhancement import enhance_faint_ink
 
 
 DEFAULT_RESNET_ROLL_MODEL = Path("data/models/roll_digit_resnet_omr_finetuned.pt")
-DEFAULT_RESNET_ROLL_ENSEMBLE_MANIFEST = Path("data/models/roll_digit_ensemble_7/ensemble_manifest.json")
+DEFAULT_RESNET_ROLL_ENSEMBLE_MANIFEST = Path("data/models/roll_digit_ensemble_7_quiz_midsem_v2/ensemble_manifest.json")
 # Cell crops contain 1.5 mm context around the printed box. A 20% inset of
 # that padded crop corresponds to about a 12% inset of the actual cell.
 BLANK_CELL_INSET_FRACTION = 0.20
@@ -58,7 +56,7 @@ class RollOcrResult:
 class RollOcrBackend(Protocol):
     provider: str
 
-    def read_roll(self, crop_path: Path, program: str | None = None, valid_rolls: set[str] | None = None) -> RollOcrResult:
+    def read_digit(self, crop_path: Path) -> RollOcrResult:
         ...
 
 
@@ -71,34 +69,6 @@ class LocalDigitModelRollOcr:
         from omr.reader.digit_model import OpenCVDigitKnn
 
         self.model = OpenCVDigitKnn(model_path)
-
-    def read_roll(self, crop_path: Path, program: str | None = None, valid_rolls: set[str] | None = None) -> RollOcrResult:
-        expected_digits = _expected_digit_count(program)
-        if expected_digits is None:
-            return RollOcrResult("", confidence=0.0, raw={"reason": "program_required_for_digit_model"})
-
-        image = Image.open(crop_path).convert("L")
-        digits = ""
-        confidences: list[float] = []
-        payloads: list[dict[str, object]] = []
-        for cell in _segment_digit_cells(image, expected_digits):
-            read = self.read_digit_image(cell)
-            digit = _first_digit(read.text)
-            digits += digit or "?"
-            confidences.append(float(read.confidence or 0.0))
-            payloads.append(_ocr_result_payload(read))
-
-        text = _format_roll_digits(program, digits)
-        confidence = min(confidences) if "?" not in digits and confidences else 0.0
-        return RollOcrResult(
-            text=text,
-            confidence=confidence,
-            raw={
-                "provider": self.provider,
-                "model_path": str(self.model.model_path),
-                "cells": payloads,
-            },
-        )
 
     def read_digit(self, crop_path: Path) -> RollOcrResult:
         return self.read_digit_image(Image.open(crop_path).convert("L"))
@@ -121,33 +91,17 @@ class LocalResnetRollOcr:
     def __init__(self, model_path: str | Path) -> None:
         try:
             import torch
-            from omr.datasets.train_roll_digit_resnet import LABELS, SmallRollDigitResNet
+            from omr.datasets.train_roll_digit_resnet import LABELS, model_from_checkpoint
         except ImportError as exc:
             raise RuntimeError("PyTorch is required to use the fine-tuned roll digit model") from exc
         self.model_path = Path(model_path)
         if not self.model_path.is_file():
             raise FileNotFoundError(f"fine-tuned roll digit model not found: {self.model_path}")
-        payload = torch.load(self.model_path, map_location="cpu")
-        state = payload.get("model_state", payload) if isinstance(payload, dict) else payload
-        self.model = SmallRollDigitResNet(num_classes=len(LABELS))
-        self.model.load_state_dict(state)
+        payload = torch.load(self.model_path, map_location="cpu", weights_only=True)
+        self.model = model_from_checkpoint(payload)
         self.model.eval()
         self.torch = torch
         self.labels = LABELS
-
-    def read_roll(self, crop_path: Path, program: str | None = None, valid_rolls: set[str] | None = None) -> RollOcrResult:
-        expected_digits = _expected_digit_count(program)
-        if expected_digits is None:
-            return RollOcrResult("", confidence=0.0, raw={"reason": "program_required_for_resnet"})
-        image = Image.open(crop_path).convert("L")
-        reads = [self.read_digit_image(cell) for cell in _segment_digit_cells(image, expected_digits)]
-        digits = "".join(_first_digit(read.text) or "?" for read in reads)
-        confidence = min((float(read.confidence or 0.0) for read in reads), default=0.0) if "?" not in digits else 0.0
-        return RollOcrResult(
-            _format_roll_digits(program, digits),
-            confidence=confidence,
-            raw={"provider": self.provider, "model_path": str(self.model_path), "cells": [_ocr_result_payload(read) for read in reads]},
-        )
 
     def read_digit(self, crop_path: Path) -> RollOcrResult:
         return self.read_digit_image(Image.open(crop_path).convert("L"))
@@ -174,14 +128,13 @@ class LocalResnetProbabilityEnsembleRollOcr:
     """Validation-weighted probability ensemble of fine-tuned roll-digit ResNets."""
 
     provider = "local_resnet_probability_ensemble"
-    # Exact manifest cell crops are the primary ResNet input. Whole-strip
-    # segmentation is retained only when the cells are not independently strong.
+    # Only exact manifest cell crops are accepted by the page reader.
     fast_cell_first = True
 
     def __init__(self, manifest_path: str | Path) -> None:
         try:
             import torch
-            from omr.datasets.train_roll_digit_resnet import LABELS, SmallRollDigitResNet
+            from omr.datasets.train_roll_digit_resnet import LABELS, model_from_checkpoint
         except ImportError as exc:
             raise RuntimeError("PyTorch is required to use the roll-digit ensemble") from exc
 
@@ -207,13 +160,11 @@ class LocalResnetProbabilityEnsembleRollOcr:
             expected_hash = str(member.get("checkpoint_sha256") or "")
             if expected_hash and actual_hash != expected_hash:
                 raise ValueError(f"roll-digit checkpoint hash mismatch: {model_path}")
-            payload = torch.load(model_path, map_location="cpu")
+            payload = torch.load(model_path, map_location="cpu", weights_only=True)
             checkpoint_labels = payload.get("labels") if isinstance(payload, dict) else None
             if checkpoint_labels is not None and list(checkpoint_labels) != list(LABELS):
                 raise ValueError(f"roll-digit checkpoint labels do not match runtime labels: {model_path}")
-            state = payload.get("model_state", payload) if isinstance(payload, dict) else payload
-            model = SmallRollDigitResNet(num_classes=len(LABELS))
-            model.load_state_dict(state)
+            model = model_from_checkpoint(payload)
             model.eval()
             self.models.append(model)
             self.member_paths.append(str(model_path))
@@ -226,6 +177,7 @@ class LocalResnetProbabilityEnsembleRollOcr:
                     "best_val_accuracy": accuracy,
                     "checkpoint_path": str(model_path),
                     "checkpoint_sha256": actual_hash,
+                    "model_config": model.model_config(),
                 }
             )
         if not any(weights):
@@ -243,26 +195,6 @@ class LocalResnetProbabilityEnsembleRollOcr:
             "aggregation": self.aggregation,
             "members": self.members,
         }
-
-    def read_roll(self, crop_path: Path, program: str | None = None, valid_rolls: set[str] | None = None) -> RollOcrResult:
-        expected_digits = _expected_digit_count(program)
-        if expected_digits is None:
-            return RollOcrResult("", confidence=0.0, raw={"reason": "program_required_for_resnet_ensemble"})
-        image = Image.open(crop_path).convert("L")
-        reads = self._read_digit_images(_segment_digit_cells(image, expected_digits))
-        digits = "".join(_first_digit(read.text) or "?" for read in reads)
-        confidence = min((float(read.confidence or 0.0) for read in reads), default=0.0) if "?" not in digits else 0.0
-        return RollOcrResult(
-            _format_roll_digits(program, digits),
-            confidence=confidence,
-            raw={
-                "provider": self.provider,
-                "ensemble_manifest": str(self.manifest_path),
-                "member_count": len(self.models),
-                "aggregation": self.aggregation,
-                "cells": [_ocr_result_payload(read) for read in reads],
-            },
-        )
 
     def read_digit(self, crop_path: Path) -> RollOcrResult:
         return self.read_digit_image(Image.open(crop_path).convert("L"))
@@ -366,37 +298,8 @@ class LocalEnsembleRollOcr:
         self.backends = backends
         self.warnings = warnings or []
 
-    def read_roll(self, crop_path: Path, program: str | None = None, valid_rolls: set[str] | None = None) -> RollOcrResult:
-        results = [backend.read_roll(crop_path, program=program) for backend in self.backends]
-        candidates: list[dict[str, object]] = []
-        for result in results:
-            candidates.append(
-                {
-                    "text": result.text,
-                    "confidence": result.confidence,
-                    "provider": _provider_from_raw(result),
-                    "raw": result.raw,
-                }
-            )
-        best = _best_ocr_candidate(candidates, program)
-        confidence = _ensemble_confidence(candidates, str(best.get("text", "")), program)
-        return RollOcrResult(
-            text=str(best.get("text", "")),
-            confidence=confidence,
-            raw={
-                "provider": self.provider,
-                "warnings": self.warnings,
-                "candidates": candidates,
-            },
-        )
-
     def read_digit(self, crop_path: Path) -> RollOcrResult:
-        results: list[RollOcrResult] = []
-        for backend in self.backends:
-            if hasattr(backend, "read_digit"):
-                results.append(backend.read_digit(crop_path))  # type: ignore[attr-defined]
-            else:
-                results.append(backend.read_roll(crop_path, program=None))
+        results = [backend.read_digit(crop_path) for backend in self.backends]
         return _choose_digit_result(results, warnings=self.warnings)
 
 
@@ -438,32 +341,6 @@ class LocalTesseractRollOcr:
             raise RuntimeError(
                 "Tesseract OCR binary is not available. Install Tesseract or set SMARTOMR_TESSERACT_CMD."
             ) from exc
-
-    def read_roll(self, crop_path: Path, program: str | None = None, valid_rolls: set[str] | None = None) -> RollOcrResult:
-        image = Image.open(crop_path).convert("L")
-        candidates: list[dict[str, object]] = []
-
-        prepared = dict(_prepare_ocr_variants(image))
-        variant_names = [name for name in ("gray_clean", "otsu_clean") if name in prepared]
-        if not variant_names:
-            variant_names = list(prepared)[:1]
-        variants = [(name, prepared[name]) for name in variant_names]
-        with ThreadPoolExecutor(max_workers=len(variants)) as executor:
-            reads = list(
-                executor.map(
-                    lambda item: self._read_image(item[1], "--psm 7", whitelist="0123456789MTPHDSP"),
-                    variants,
-                )
-            )
-        for (variant_name, _variant), whole in zip(variants, reads):
-            candidates.append({"kind": "whole-strip", "variant": variant_name, "psm": "--psm 7", **whole})
-
-        best = _best_ocr_candidate(candidates, program)
-        return RollOcrResult(
-            text=str(best.get("text", "")),
-            confidence=_clamp_confidence(best.get("confidence")),
-            raw={"provider": self.provider, "version": self.version, "candidates": candidates},
-        )
 
     def read_digit(self, crop_path: Path) -> RollOcrResult:
         return self.read_digit_image(Image.open(crop_path).convert("L"))
@@ -633,7 +510,7 @@ def save_roll_number_crop_sets(
     padding_mm: float = 1.5,
     cell_padding_mm: float = 1.5,
 ) -> tuple[dict[str, str], dict[str, list[str]]]:
-    """Save whole roll strips and exact per-cell crops from manifest geometry."""
+    """Save review-only field images and manifest-position digit inference crops."""
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     gray = _gray_array(image)
@@ -780,32 +657,23 @@ def _read_write_in_roll_number(
             review_flags.append("continuation selector unresolved; read BTECH field only")
     else:
         programs_to_read = list(crop_paths)
-    candidates: list[tuple[str, str, float | None, str, str]] = []
+    candidates: list[tuple[str, str, float | None, str]] = []
     empty_field = False
     for program in programs_to_read:
-        crop_path = Path(crop_paths[program])
         cell_result = _read_roll_from_cells(ocr_backend, [Path(path) for path in cell_crop_paths.get(program, [])], program)
         cell_normalized = normalize_handwritten_roll_text(cell_result.text, program=program)
         cell_raw = cell_result.raw if isinstance(cell_result.raw, dict) else {}
         empty_field = empty_field or bool(cell_raw.get("empty_field"))
-        # Strip segmentation is deliberately diagnostic only. It may be useful
-        # to a reviewer, but it cannot veto a literal exact-cell result.
-        strip_result = ocr_backend.read_roll(crop_path, program=program, valid_rolls=valid_rolls)
-        strip_normalized = normalize_handwritten_roll_text(strip_result.text, program=program)
         ocr_results[program] = {
-            "strip": _ocr_result_payload(strip_result),
             "cells": _ocr_result_payload(cell_result),
-            "text": cell_result.text or strip_result.text,
-            "normalized_roll": cell_normalized or strip_normalized,
-            "confidence": _combined_confidence(cell_result.confidence, strip_result.confidence),
+            "text": cell_result.text,
+            "normalized_roll": cell_normalized,
+            "confidence": cell_result.confidence,
+            "recognition_policy": "manifest_cells_only",
             "cell_crop_paths": cell_crop_paths.get(program, []),
         }
         if cell_normalized:
-            candidates.append((program, cell_normalized, cell_result.confidence, cell_result.text, "cells"))
-        if cell_normalized and strip_normalized and cell_normalized != strip_normalized:
-            review_flags.append(f"STRIP_DISAGREES: {program} cells={cell_normalized}, strip={strip_normalized}")
-        if not cell_normalized and strip_normalized:
-            candidates.append((program, strip_normalized, strip_result.confidence, strip_result.text, "strip"))
+            candidates.append((program, cell_normalized, cell_result.confidence, cell_result.text))
 
     if empty_field:
         review_flags.append("EMPTY_FIELD: handwritten roll field has blank digit cells")
@@ -818,7 +686,7 @@ def _read_write_in_roll_number(
         suggestion = _roster_suggestion_from_cell_probabilities(ocr_results, valid_rolls)
         if suggestion is not None and not empty_field:
             ocr_results["_roster_suggestion"] = suggestion
-            literal_rolls = {roll for _program, roll, _confidence, _text, _source in candidates}
+            literal_rolls = {roll for _program, roll, _confidence, _text in candidates}
             if bool(suggestion["clear"]) and suggestion["roll_no"] not in literal_rolls:
                 review_flags.append(
                     "roster suggests "
@@ -842,7 +710,7 @@ def _read_write_in_roll_number(
             review_flags=review_flags,
         )
 
-    unique_rolls = sorted({roll for _program, roll, _confidence, _text, _source in candidates})
+    unique_rolls = sorted({roll for _program, roll, _confidence, _text in candidates})
     if len(unique_rolls) > 1:
         review_flags.append(f"handwritten roll OCR produced conflicting candidates: {', '.join(unique_rolls)}")
         return HandwrittenRollRead(
@@ -858,9 +726,9 @@ def _read_write_in_roll_number(
             review_flags=review_flags,
         )
 
-    program, roll_no, confidence_value, raw_text, source = max(
+    program, roll_no, confidence_value, raw_text = max(
         candidates,
-        key=lambda item: ((item[2] if item[2] is not None else 0.65), 1 if item[4] == "cells" else 0),
+        key=lambda item: item[2] if item[2] is not None else 0.65,
     )
     if selected_program is not None and selected_program != program:
         review_flags.append(
@@ -871,9 +739,6 @@ def _read_write_in_roll_number(
     if valid_rolls is not None and roll_no not in valid_rolls:
         review_flags.append(f"handwritten roll OCR read {roll_no}, which is not present in the roster")
         confidence = "low"
-    if source == "strip":
-        confidence = "medium" if confidence == "high" else confidence
-        review_flags.append("handwritten roll was read from whole-strip OCR without full cell confirmation")
     return HandwrittenRollRead(
         page_index=page_index,
         program=selected_program or program,
@@ -917,24 +782,11 @@ def _structured_handwritten_evidence(
         if str(program).startswith("_") or not isinstance(payload, dict):
             continue
         cells = payload.get("cells")
-        strip = payload.get("strip")
         cells = cells if isinstance(cells, dict) else {}
-        strip = strip if isinstance(strip, dict) else {}
         cell_raw = cells.get("raw") if isinstance(cells.get("raw"), dict) else {}
         cell_roll = normalize_handwritten_roll_text(str(cells.get("text") or ""), program=program)
-        strip_roll = normalize_handwritten_roll_text(str(strip.get("text") or ""), program=program)
         if bool(cell_raw.get("empty_field")):
             items.append(evidence(EMPTY_FIELD, BLOCK, program=program))
-        if cell_roll and strip_roll and cell_roll != strip_roll:
-            items.append(
-                evidence(
-                    STRIP_DISAGREES,
-                    INFO,
-                    program=program,
-                    cell_roll=cell_roll,
-                    strip_roll=strip_roll,
-                )
-            )
         try:
             cell_confidence = float(cells.get("confidence") or 0.0)
         except (TypeError, ValueError):
@@ -1048,6 +900,34 @@ def _relative_cell_ink(cell_path: Path) -> float:
     inset_y = max(1, round(height * BLANK_CELL_INSET_FRACTION))
     inset_x = max(1, round(width * BLANK_CELL_INSET_FRACTION))
     interior = gray[inset_y : height - inset_y, inset_x : width - inset_x]
+    # A locally shifted printed frame can survive the fixed crop inset. Locate
+    # all four frame edges before measuring ink; recognition crops are unchanged.
+    paper = float(np.percentile(gray, 90))
+    dark = gray <= paper - BLANK_CELL_DARKNESS_DELTA
+    rows = np.mean(dark, axis=1)
+    columns = np.mean(dark, axis=0)
+    top = np.flatnonzero(rows[:max(1, round(height * .35))] >= .55)
+    bottom = np.flatnonzero(rows[min(height - 1, round(height * .65)):] >= .55)
+    left = np.flatnonzero(columns[:max(1, round(width * .35))] >= .55)
+    right = np.flatnonzero(columns[min(width - 1, round(width * .65)):] >= .55)
+    if all(len(edges) for edges in (top, bottom, left, right)):
+        # Use the outermost contiguous bands, not a digit's inner horizontal
+        # stroke (notably 7) or vertical stroke (notably 1).
+        top_edge, left_edge = int(top[0]), int(left[0])
+        bottom_edge = int(bottom[-1]) + round(height * .65)
+        right_edge = int(right[-1]) + round(width * .65)
+        while top_edge + 1 < height and rows[top_edge + 1] >= .55:
+            top_edge += 1
+        while left_edge + 1 < width and columns[left_edge + 1] >= .55:
+            left_edge += 1
+        while bottom_edge > 0 and rows[bottom_edge - 1] >= .55:
+            bottom_edge -= 1
+        while right_edge > 0 and columns[right_edge - 1] >= .55:
+            right_edge -= 1
+        y0, y1 = top_edge + 2, bottom_edge - 1
+        x0, x1 = left_edge + 2, right_edge - 1
+        if y1 - y0 >= height * .30 and x1 - x0 >= width * .30:
+            interior = gray[y0:y1, x0:x1]
     if interior.size == 0:
         return 0.0
     paper_level = float(np.percentile(interior, 90))
@@ -1063,6 +943,8 @@ def _read_roll_from_cells(
     expected_count = _expected_digit_count(program)
     if expected_count is None or len(cell_paths) != expected_count:
         return RollOcrResult("", confidence=0.0, raw={"reason": "missing exact cell geometry"})
+    if not callable(getattr(backend, "read_digit", None)):
+        return RollOcrResult("", confidence=0.0, raw={"reason": "digit-cell backend required"})
 
     def read_cell(cell_path: Path) -> RollOcrResult:
         relative_ink = _relative_cell_ink(cell_path)
@@ -1072,10 +954,7 @@ def _read_roll_from_cells(
                 confidence=1.0,
                 raw={"blank_cell": True, "relative_ink": relative_ink},
             )
-        if hasattr(backend, "read_digit"):
-            read = backend.read_digit(cell_path)  # type: ignore[attr-defined]
-        else:
-            read = backend.read_roll(cell_path, program=program)
+        read = backend.read_digit(cell_path)
         raw = dict(read.raw) if isinstance(read.raw, dict) else {}
         raw["blank_cell"] = False
         raw["relative_ink"] = relative_ink
@@ -1179,39 +1058,6 @@ def _choose_digit_result(results: list[RollOcrResult], warnings: list[str] | Non
     )
 
 
-def _ensemble_confidence(
-    candidates: list[dict[str, object]],
-    selected_text: str,
-    program: str | None,
-) -> float:
-    selected_roll = normalize_handwritten_roll_text(selected_text, program)
-    if selected_roll is None:
-        return 0.0
-    agreeing = [
-        _clamp_confidence(candidate.get("confidence")) or 0.0
-        for candidate in candidates
-        if normalize_handwritten_roll_text(str(candidate.get("text", "")), program) == selected_roll
-    ]
-    conflicting = [
-        candidate
-        for candidate in candidates
-        if normalize_handwritten_roll_text(str(candidate.get("text", "")), program) not in {None, selected_roll}
-    ]
-    if not agreeing:
-        return 0.0
-    confidence = max(agreeing)
-    if len(agreeing) > 1:
-        confidence = min(0.99, 0.08 + confidence)
-    return confidence
-
-
-def _combined_confidence(first: float | None, second: float | None) -> float | None:
-    values = [value for value in (first, second) if value is not None]
-    if not values:
-        return None
-    return max(values)
-
-
 def _digit_vote_confidence(confidences: list[float], total_attempts: int) -> float:
     vote_fraction = len(confidences) / max(total_attempts, 1)
     median_confidence = float(np.median(confidences)) if confidences else 0.0
@@ -1311,27 +1157,6 @@ def _format_roll_digits(program: str | None, digits: str) -> str:
     return digits
 
 
-def _segment_digit_cells(image: Image.Image, count: int) -> list[Image.Image]:
-    width, height = image.size
-    cells: list[Image.Image] = []
-    for index in range(count):
-        x0 = round(index * width / count)
-        x1 = round((index + 1) * width / count)
-        cell = image.crop((x0, 0, x1, height))
-        cw, ch = cell.size
-        cells.append(
-            cell.crop(
-                (
-                    round(cw * 0.13),
-                    round(ch * 0.10),
-                    round(cw * 0.87),
-                    round(ch * 0.90),
-                )
-            )
-        )
-    return cells
-
-
 def _cell_crop_boxes_px(
     field: dict,
     image_shape: tuple[int, ...],
@@ -1355,16 +1180,6 @@ def _cell_crop_boxes_px(
 def _first_digit(text: object) -> str | None:
     match = re.search(r"\d", str(text))
     return match.group(0) if match else None
-
-
-def _best_ocr_candidate(candidates: list[dict[str, object]], program: str | None) -> dict[str, object]:
-    def score(candidate: dict[str, object]) -> tuple[int, float, int]:
-        text = str(candidate.get("text", ""))
-        normalized = normalize_handwritten_roll_text(text, program)
-        confidence = _clamp_confidence(candidate.get("confidence")) or 0.0
-        return (1 if normalized else 0, confidence, len(text))
-
-    return max(candidates, key=score) if candidates else {"text": "", "confidence": 0.0}
 
 
 def _roll_write_in_fields(manifest: dict, page_index: int) -> list[dict]:

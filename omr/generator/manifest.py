@@ -49,6 +49,7 @@ from .metrics import (
     PAGE_HEIGHT_MM,
     PAGE_WIDTH_MM,
     PRINTER_SAFE_MARGIN_MM,
+    WRITTEN_HEADER_MM,
     corner_keepouts,
     orientation_keepout,
 )
@@ -188,6 +189,7 @@ def build_manifest(layout: SheetLayout) -> dict:
                 "y_mm": e.y_mm,
                 "width_mm": e.width_mm,
                 "height_mm": e.height_mm,
+                "heading_top_mm": e.y_mm - WRITTEN_HEADER_MM,
                 "max_marks": e.max_marks,
                 "lines": e.lines,
             }

@@ -4,6 +4,7 @@ from pathlib import Path
 
 import numpy as np
 import pymupdf
+import pytest
 from PIL import Image, ImageDraw
 
 from omr.contracts.geometry import mm_to_px, px_per_mm
@@ -11,12 +12,44 @@ from omr.generator.config import ExamConfig, WrittenQuestionConfig
 from omr.generator.generate import generate_exam
 from omr.reader.digit_model import train_digit_model
 from omr.reader.handwriting import (
+    LocalDigitModelRollOcr,
+    LocalEnsembleRollOcr,
+    LocalResnetProbabilityEnsembleRollOcr,
+    LocalResnetRollOcr,
+    LocalTesseractRollOcr,
     RollOcrResult,
+    _read_roll_from_cells,
     _roster_suggestion_from_cell_probabilities,
+    _relative_cell_ink,
     build_roll_ocr_backend,
     normalize_handwritten_roll_text,
     read_continuation_roll_number,
+    read_write_in_roll_number,
 )
+
+
+@pytest.mark.parametrize("offset", [10, 20, 30])
+def test_shifted_box_frame_is_not_handwritten_ink(tmp_path, offset):
+    path = tmp_path / "cell.png"
+    image = Image.new("L", (100, 100), 245)
+    ImageDraw.Draw(image).rectangle((offset, 12, 92, 87), outline=30, width=2)
+    image.save(path)
+    assert _relative_cell_ink(path) < .008
+
+
+@pytest.mark.parametrize("digit", ["1", "7"])
+def test_thin_faint_digits_are_not_removed_with_box_frame(tmp_path, digit):
+    path = tmp_path / "cell.png"
+    image = Image.new("L", (100, 100), 245)
+    draw = ImageDraw.Draw(image)
+    draw.rectangle((20, 12, 92, 87), outline=30, width=2)
+    if digit == "7":
+        draw.line((40, 35, 68, 35), fill=190, width=2)
+        draw.line((68, 35, 45, 72), fill=190, width=2)
+    else:
+        draw.line((55, 33, 55, 72), fill=190, width=2)
+    image.save(path)
+    assert _relative_cell_ink(path) >= .008
 
 
 def test_roster_probability_suggestion_is_review_only():
@@ -45,6 +78,32 @@ def test_roster_probability_suggestion_is_review_only():
 DPI = 200
 
 
+@pytest.mark.parametrize("backend_class", [
+    LocalDigitModelRollOcr,
+    LocalResnetRollOcr,
+    LocalResnetProbabilityEnsembleRollOcr,
+    LocalEnsembleRollOcr,
+    LocalTesseractRollOcr,
+])
+def test_supported_backends_expose_only_digit_inference(backend_class):
+    assert callable(backend_class.read_digit)
+    assert not hasattr(backend_class, "read_roll")
+
+
+def test_roll_only_backend_is_rejected_without_strip_fallback(tmp_path):
+    class RollOnlyBackend:
+        provider = "obsolete_roll_only"
+
+        def read_roll(self, *args, **kwargs):
+            raise AssertionError("Whole-roll fallback must not run")
+
+    paths = [tmp_path / f"cell_{index}.png" for index in range(7)]
+    result = _read_roll_from_cells(RollOnlyBackend(), paths, "BTECH")
+    assert result.text == ""
+    assert result.confidence == 0.0
+    assert result.raw["reason"] == "digit-cell backend required"
+
+
 class FakeOcr:
     provider = "fake"
 
@@ -54,7 +113,7 @@ class FakeOcr:
         self.digits = list(digits or text)
 
     def read_roll(self, crop_path: Path, program: str | None = None, valid_rolls: set[str] | None = None) -> RollOcrResult:
-        return RollOcrResult(self.text, self.confidence)
+        raise AssertionError("Whole-roll strip OCR must not be called")
 
     def read_digit(self, crop_path: Path) -> RollOcrResult:
         digit = self.digits.pop(0) if self.digits else ""
@@ -117,6 +176,24 @@ def test_handwritten_roll_normalization_is_format_aware():
 
 def test_no_ocr_backend_is_default():
     assert build_roll_ocr_backend("none") is None
+
+
+def test_local_default_uses_completed_quiz_midsem_ensemble(monkeypatch):
+    from omr.reader import handwriting
+
+    for name in ("SMARTOMR_ROLL_ENSEMBLE_MANIFEST", "SMARTOMR_ROLL_RESNET_MODEL", "SMARTOMR_DIGIT_MODEL"):
+        monkeypatch.delenv(name, raising=False)
+    expected = Path("data/models/roll_digit_ensemble_7_quiz_midsem_v2/ensemble_manifest.json")
+    loaded = []
+    backend = object()
+    monkeypatch.setattr(Path, "is_file", lambda path: path == expected)
+    def load(path):
+        loaded.append(path)
+        return backend
+    monkeypatch.setattr(handwriting, "LocalResnetProbabilityEnsembleRollOcr", load)
+
+    assert build_roll_ocr_backend("local") is backend
+    assert loaded == [expected]
 
 
 def test_local_digit_model_backend_reads_isolated_digit(tmp_path: Path):
@@ -183,7 +260,7 @@ def test_phd_continuation_roll_uses_shared_five_cell_crop(tmp_path: Path):
     assert len(result.cell_crop_paths["PHD"]) == 5
 
 
-def test_strip_disagreement_is_diagnostic_when_cells_are_valid(tmp_path: Path):
+def test_whole_strip_is_not_read_when_cells_are_valid(tmp_path: Path):
     manifest, page = _sheet(tmp_path)
     draw = ImageDraw.Draw(page)
     _fill_continuation_program(draw, manifest, "BTECH")
@@ -199,7 +276,10 @@ def test_strip_disagreement_is_diagnostic_when_cells_are_valid(tmp_path: Path):
 
     assert result.roll_no == "2024587"
     assert result.confidence == "high"
-    assert any(flag.startswith("STRIP_DISAGREES") for flag in result.review_flags)
+    assert "strip" not in result.ocr_results["BTECH"]
+    assert result.ocr_results["BTECH"]["confidence"] == .93
+    assert not any("STRIP" in flag.upper() for flag in result.review_flags)
+    assert not any(flag["code"] == "STRIP_DISAGREES" for flag in result.evidence_flags)
 
 
 def test_blank_continuation_selector_reads_btech_field_only(tmp_path: Path):
@@ -238,7 +318,7 @@ def test_empty_roll_field_is_not_sent_to_resnet_candidates(tmp_path: Path):
     assert any(flag.startswith("EMPTY_FIELD") for flag in result.review_flags)
 
 
-def test_sp_roll_can_be_read_from_whole_strip_when_in_roster(tmp_path: Path):
+def test_whole_strip_cannot_establish_identity_when_cells_are_incomplete(tmp_path: Path):
     manifest, page = _sheet(tmp_path)
     draw = ImageDraw.Draw(page)
     _fill_continuation_program(draw, manifest, "BTECH")
@@ -253,9 +333,23 @@ def test_sp_roll_can_be_read_from_whole_strip_when_in_roster(tmp_path: Path):
         valid_rolls={"SP24ABC"},
     )
 
-    assert result.roll_no == "SP24ABC"
-    assert result.confidence == "medium"
-    assert any("whole-strip OCR" in flag for flag in result.review_flags)
+    assert result.roll_no is None
+    assert result.confidence == "low"
+    assert "strip" not in result.ocr_results["BTECH"]
+    assert not any("STRIP" in flag.upper() for flag in result.review_flags)
+
+
+@pytest.mark.parametrize("program,digits", [("BTECH", "2024587"), ("MTECH", "25035"), ("PHD", "25111")])
+def test_write_in_reader_uses_only_cells_for_every_program(tmp_path, program, digits):
+    manifest, page = _sheet(tmp_path)
+    result = read_write_in_roll_number(
+        np.asarray(page), manifest, DPI, 2, tmp_path / "identity",
+        ocr_backend=FakeOcr("wrong-strip-text", digits=digits), selected_program=program,
+    )
+    prefix = {"BTECH": "", "MTECH": "MT", "PHD": "PHD"}[program]
+    assert result.roll_no == prefix + digits
+    assert result.ocr_results[program]["recognition_policy"] == "manifest_cells_only"
+    assert "strip" not in result.ocr_results[program]
 
 
 def test_handwritten_roll_not_in_roster_is_preserved_for_review(tmp_path: Path):
